@@ -191,17 +191,83 @@ function newEventForm(){
 }
 
 async function loadEventOps(){
-  const [{data:event},{data:deps},{data:units},{data:incidents},{data:pois},{data:eventMap}]=await Promise.all([
+  const [
+    eventRes,
+    depsRes,
+    unitsRes,
+    incidentsRes,
+    poisRes,
+    eventMapRes
+  ] = await Promise.all([
     supabase.from("events").select("*").eq("id",S.eventId).single(),
     supabase.from("event_departments").select("*").eq("event_id",S.eventId).order("sort_order"),
     supabase.from("units").select("*,event_departments(name,short_name)").eq("event_id",S.eventId).eq("active",true).order("name"),
+    // Keep the incident query deliberately simple. Related department/unit
+    // records are loaded separately below so a relationship/embed error
+    // can never make the entire incident list disappear.
     supabase.from("incidents")
-      .select("*,incident_departments(department_id,event_departments(name,short_name)),incident_units(unit_id,cleared_at,units(name))")
-      .eq("event_id",S.eventId).neq("status","CLOSED").order("created_at",{ascending:false}),
+      .select("*")
+      .eq("event_id",S.eventId)
+      .neq("status","CLOSED")
+      .order("created_at",{ascending:false}),
     supabase.from("event_pois").select("*,poi_aliases(alias)").eq("event_id",S.eventId).eq("active",true).order("name"),
     supabase.from("event_maps").select("*").eq("event_id",S.eventId).maybeSingle()
   ]);
-  S.event=event;S.departments=deps||[];S.units=units||[];S.incidents=incidents||[];S.pois=pois||[];S.eventMap=eventMap||null;
+
+  const baseResults = {
+    event: eventRes,
+    departments: depsRes,
+    units: unitsRes,
+    incidents: incidentsRes,
+    pois: poisRes,
+    eventMap: eventMapRes
+  };
+
+  const failed = Object.entries(baseResults).filter(([,res])=>res.error);
+  if(failed.length){
+    for(const [name,res] of failed) console.error(`CommCenter Pro load error: ${name}`, res.error);
+    throw new Error(
+      "CommCenter Pro could not load event data: " +
+      failed.map(([name,res])=>`${name}: ${res.error.message}${res.error.hint?` (${res.error.hint})`:""}`).join(" | ")
+    );
+  }
+
+  let incidents = incidentsRes.data || [];
+  const incidentIds = incidents.map(i=>i.id);
+
+  if(incidentIds.length){
+    const [deptLinksRes, unitLinksRes] = await Promise.all([
+      supabase.from("incident_departments")
+        .select("incident_id,department_id,event_departments(name,short_name)")
+        .in("incident_id",incidentIds),
+      supabase.from("incident_units")
+        .select("incident_id,unit_id,cleared_at,units(name)")
+        .in("incident_id",incidentIds)
+    ]);
+
+    if(deptLinksRes.error){
+      console.error("CommCenter Pro incident department load error", deptLinksRes.error);
+    }
+    if(unitLinksRes.error){
+      console.error("CommCenter Pro incident unit load error", unitLinksRes.error);
+    }
+
+    const deptLinks = deptLinksRes.data || [];
+    const unitLinks = unitLinksRes.data || [];
+
+    incidents = incidents.map(i=>({
+      ...i,
+      incident_departments: deptLinks.filter(x=>x.incident_id===i.id),
+      incident_units: unitLinks.filter(x=>x.incident_id===i.id)
+    }));
+  }
+
+  S.event=eventRes.data;
+  S.departments=depsRes.data||[];
+  S.units=unitsRes.data||[];
+  S.incidents=incidents;
+  S.pois=poisRes.data||[];
+  S.eventMap=eventMapRes.data||null;
 }
 
 async function storageSigned(path,seconds=3600){
@@ -214,7 +280,25 @@ async function storageSigned(path,seconds=3600){
 /* ---------------- DISPATCH ---------------- */
 
 async function dispatchPage(){
-  await loadEventOps();
+  // Prevent detached Leaflet maps and duplicate realtime subscriptions from
+  // accumulating every time the CAD refreshes.
+  cleanupRealtime();
+
+  try{
+    await loadEventOps();
+  }catch(err){
+    console.error("CommCenter Pro dispatch load failed",err);
+    app.innerHTML=`<div class="shell">${header("Dispatch Load Error")}
+      <div class="wrap"><div class="notice error">
+        <strong>CommCenter Pro could not load the incident board.</strong><br>
+        ${esc(err.message)}
+      </div>
+      <button class="btn" id="retryDispatch" style="margin-top:12px">Retry</button>
+      </div></div>`;
+    document.querySelector("#retryDispatch").onclick=()=>dispatchPage();
+    return;
+  }
+
   app.innerHTML=`<div class="shell">${header(`${esc(S.event?.name||"Event")} · Unified Dispatch`)}
     <div class="cad-grid">
       <aside class="panel left">
@@ -356,8 +440,21 @@ function incidentForm(loc){
       p_landmark:document.querySelector("#landmark").value.trim(),p_notes:document.querySelector("#notes").value.trim(),
       p_poi_id:chosen.poi_id||null
     });
-    if(error)return alert(error.message);
-    await dispatchPage();if(data)setTimeout(()=>selectIncident(data),50);
+    if(error){
+      console.error("CommCenter Pro create incident error",error);
+      return alert(`Incident was NOT created.\n\n${error.message}${error.hint?`\n\nHint: ${error.hint}`:""}`);
+    }
+
+    const createdId=data;
+    await dispatchPage();
+
+    if(createdId){
+      setTimeout(()=>{
+        selectIncident(createdId);
+        const created=S.incidents.find(i=>i.id===createdId);
+        if(created) console.info(`CommCenter Pro: ${created.incident_number} created successfully.`);
+      },50);
+    }
   };
 }
 
