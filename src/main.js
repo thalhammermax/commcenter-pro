@@ -1321,7 +1321,8 @@ function activityTitle(action){
     EMS_CUSTODY_SET:"EMS custody recorded",
     UNIT_ARRIVED_TREATMENT_AREA:"Unit arrived at treatment area",
     EMS_TRANSPORT_STARTED:"Transport started",
-    EMS_TRANSPORT_COMPLETED:"Transport completed",
+    EMS_TRANSPORT_COMPLETED:"Patient delivered",
+    EMS_TRANSPORT_REFUSAL:"Transport ended with refusal",
     INCIDENT_CLOSED:"Incident closed"
   };
   return labels[action]||String(action||"Activity").replaceAll("_"," ").toLowerCase().replace(/^\w/,c=>c.toUpperCase());
@@ -1357,6 +1358,12 @@ function activitySummary(row){
   }
   if(row.action==="UNIT_ARRIVED_TREATMENT_AREA"){
     return d.treatment_area_name?`Patient received at ${d.treatment_area_name}`:"Patient received at treatment area";
+  }
+  if(row.action==="EMS_TRANSPORT_COMPLETED"){
+    return d.destination?`Delivered to ${d.destination}`:"Patient delivered to destination facility";
+  }
+  if(row.action==="EMS_TRANSPORT_REFUSAL"){
+    return d.destination?`Patient refusal · transport had been en route to ${d.destination}`:"Patient refusal obtained";
   }
   if(d.incident_number)return d.incident_number;
   if(d.status)return String(d.status).replaceAll("_"," ");
@@ -1541,6 +1548,139 @@ function updateDispatcherUnitStatusUI(unitId,status){
 
   const currentLabel=document.querySelector(`[data-unit-current-status="${unitId}"]`);
   if(currentLabel)currentLabel.textContent=String(status||"").replaceAll("_"," ");
+}
+
+
+async function getActiveAmbulanceTransport(unitId,incidentId=null){
+  let q=supabase.from("ems_encounters")
+    .select("id,incident_id,current_status,transport_destination,created_at")
+    .eq("event_id",S.eventId)
+    .eq("current_unit_id",unitId)
+    .eq("current_status","TRANSPORTING")
+    .order("created_at",{ascending:false})
+    .limit(1);
+
+  if(incidentId)q=q.eq("incident_id",incidentId);
+
+  const {data,error}=await q.maybeSingle();
+  if(error)throw error;
+  return data||null;
+}
+
+function showAmbulanceTransportOutcomeModal({
+  unitId,
+  incidentId,
+  unitName,
+  incidentNumber,
+  encounter,
+  onComplete,
+  onCancel
+}){
+  const destination=encounter?.transport_destination
+    ||S.units.find(u=>u.id===unitId)?.current_transport_destination_text
+    ||"Destination facility";
+
+  S.incidentModalMode="transport-outcome";
+  const content=openIncidentModalShell();
+
+  content.innerHTML=`<div class="incident-modal-header">
+    <div>
+      <div class="incident-modal-eyebrow">AMBULANCE TRANSPORT</div>
+      <div class="incident-modal-title-row"><h2 id="incidentModalTitle">Complete Transport</h2></div>
+      <div class="incident-modal-nature">${esc(unitName||"Ambulance")}${incidentNumber?` · ${esc(incidentNumber)}`:""}</div>
+    </div>
+    <button class="incident-modal-close" id="closeIncidentModal" aria-label="Cancel transport outcome">×</button>
+  </div>
+
+  <div class="transport-outcome-modal stack">
+    <div class="notice">
+      <strong>Destination facility</strong><br>
+      ${esc(destination)}
+    </div>
+
+    <p>Before this ambulance returns to <strong>AVAILABLE</strong>, confirm how the patient transport ended.</p>
+
+    <div class="transport-outcome-options">
+      <button class="transport-outcome-card delivered" id="transportDelivered">
+        <strong>Patient Delivered</strong>
+        <span>Patient was delivered to the destination facility.</span>
+      </button>
+
+      <button class="transport-outcome-card refusal" id="transportRefusal">
+        <strong>Patient Refusal</strong>
+        <span>The transport unit obtained a patient refusal.</span>
+      </button>
+    </div>
+
+    <div class="small muted">
+      Either selection closes the EMS patient flow, clears the ambulance from the CAD incident, and returns the ambulance to AVAILABLE. The incident itself remains open.
+    </div>
+  </div>
+
+  <div class="incident-modal-footer">
+    <button class="btn secondary" id="cancelTransportOutcome">Cancel</button>
+  </div>`;
+
+  const cancel=()=>{
+    closeIncidentModal();
+    if(onCancel)onCancel();
+  };
+
+  document.querySelector("#closeIncidentModal").onclick=cancel;
+  document.querySelector("#cancelTransportOutcome").onclick=cancel;
+
+  const finish=async(outcome)=>{
+    const delivered=document.querySelector("#transportDelivered");
+    const refusal=document.querySelector("#transportRefusal");
+    delivered.disabled=true;
+    refusal.disabled=true;
+
+    const {error}=await supabase.rpc("ems_finish_ambulance_transport",{
+      p_unit_id:unitId,
+      p_incident_id:incidentId,
+      p_outcome:outcome
+    });
+
+    if(error){
+      delivered.disabled=false;
+      refusal.disabled=false;
+      return alert(error.message);
+    }
+
+    closeIncidentModal();
+    if(onComplete)await onComplete(outcome);
+  };
+
+  document.querySelector("#transportDelivered").onclick=()=>finish("DELIVERED");
+  document.querySelector("#transportRefusal").onclick=()=>finish("REFUSAL");
+}
+
+async function maybePromptAmbulanceTransportOutcome({
+  unitId,
+  incidentId,
+  unitName,
+  incidentNumber,
+  onComplete,
+  onCancel
+}){
+  try{
+    const encounter=await getActiveAmbulanceTransport(unitId,incidentId);
+    if(!encounter)return false;
+
+    showAmbulanceTransportOutcomeModal({
+      unitId,
+      incidentId:encounter.incident_id,
+      unitName,
+      incidentNumber,
+      encounter,
+      onComplete,
+      onCancel
+    });
+    return true;
+  }catch(error){
+    alert(error.message);
+    return true;
+  }
 }
 
 async function dispatcherSetUnitStatus(unitId,status,incidentId=null,{destinationText=null,treatmentAreaId=null}={}){
@@ -1946,6 +2086,26 @@ function selectUnit(unitId){
       document.querySelector("#unitTransportDestinationPanel")?.classList.remove("hidden");
       document.querySelector(isAmbulanceUnit(u)?"#unitTransportFacility":"#unitTransportTreatmentArea")?.focus();
       return;
+    }
+
+    if(
+      status==="AVAILABLE"
+      &&isAmbulanceUnit(u)
+      &&active?.incident?.id
+    ){
+      const handled=await maybePromptAmbulanceTransportOutcome({
+        unitId,
+        incidentId:active.incident.id,
+        unitName:u.name,
+        incidentNumber:active.incident.incident_number,
+        onComplete:async()=>{
+          await loadEventOps();
+          refreshDispatchBoards();
+          selectUnit(unitId);
+        },
+        onCancel:()=>selectUnit(unitId)
+      });
+      if(handled)return;
     }
 
     if(status===u.status)return;
@@ -3214,6 +3374,18 @@ async function fieldUnitCad(){
       document.querySelector("#fieldTransportDestinationPanel")?.classList.remove("hidden");
       document.querySelector(fieldIsAmbulance?"#fieldTransportFacility":"#fieldTransportTreatmentArea")?.focus();
       return;
+    }
+
+    if(requested==="AVAILABLE"&&fieldIsAmbulance&&incident?.id){
+      const handled=await maybePromptAmbulanceTransportOutcome({
+        unitId:fs.unit_id,
+        incidentId:incident.id,
+        unitName:fs.units?.name,
+        incidentNumber:incident.incident_number,
+        onComplete:async()=>fieldUnitCad(),
+        onCancel:()=>{}
+      });
+      if(handled)return;
     }
 
     if(requested===fs.units.status)return;

@@ -1397,3 +1397,56 @@ body.modal-open{
 .field-treatment-arrival{
   margin-top:14px;
 }
+
+
+/* v0.7.6 — ambulance transport outcome confirmation */
+.transport-outcome-modal{
+  padding:20px;
+}
+.transport-outcome-options{
+  display:grid;
+  grid-template-columns:repeat(2,minmax(0,1fr));
+  gap:12px;
+}
+.transport-outcome-card{
+  display:grid;
+  gap:6px;
+  min-height:130px;
+  padding:18px;
+  border:2px solid #334155;
+  border-radius:12px;
+  background:#0b1324;
+  color:#e5e7eb;
+  text-align:left;
+  cursor:pointer;
+}
+.transport-outcome-card strong{
+  font-size:20px;
+}
+.transport-outcome-card span{
+  color:#a9b7ca;
+  line-height:1.35;
+}
+.transport-outcome-card.delivered{
+  border-color:#166534;
+}
+.transport-outcome-card.delivered:hover{
+  background:#0b1f16;
+  border-color:#22c55e;
+}
+.transport-outcome-card.refusal{
+  border-color:#a16207;
+}
+.transport-outcome-card.refusal:hover{
+  background:#241806;
+  border-color:#f59e0b;
+}
+.transport-outcome-card:disabled{
+  opacity:.55;
+  cursor:wait;
+}
+@media(max-width:650px){
+  .transport-outcome-options{
+    grid-template-columns:1fr;
+  }
+}

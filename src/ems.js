@@ -543,7 +543,7 @@ function fieldEncounterActions(e,state){
     if(e.current_status==="TRANSPORTING"){
       return `<div class="stack">
         ${e.transport_destination?`<div class="notice"><strong>Destination</strong><br>${esc(e.transport_destination)}</div>`:""}
-        <button class="btn good" data-complete-transport="${e.id}">Complete Transport</button>
+        <div class="small muted">When the transport is finished, choose AVAILABLE in Unit Status. CommCenter Pro will ask whether the patient was delivered or the transport ended in a refusal.</div>
       </div>`;
     }
     return `<div class="stack">
@@ -649,11 +649,6 @@ export function bindFieldEmsPanel(state,{eventId,unitId,incident,refresh}){
   });
 
 
-  document.querySelectorAll("[data-complete-transport]").forEach(b=>b.onclick=async()=>{
-    if(!confirm("Mark transport complete and close this EMS flow?"))return;
-    const {error}=await supabase.rpc("ems_complete_transport",{p_encounter_id:b.dataset.completeTransport,p_destination:null});
-    if(error)alert(error.message);else await refresh();
-  });
 }
 
 /* ============================================================
