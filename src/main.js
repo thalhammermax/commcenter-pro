@@ -398,6 +398,28 @@ function incidentInDispatchScope(i){
 function unitInDispatchScope(u){
   return S.dispatchDepartmentIds.includes(u.department_id);
 }
+
+function emsEnabledDepartmentIds(){
+  const ids=new Set();
+
+  for(const area of S.treatmentAreas||[]){
+    if(area.active!==false&&area.department_id)ids.add(area.department_id);
+  }
+
+  for(const config of S.emsUnitConfigs||[]){
+    if(!config.active)continue;
+    const unit=S.units.find(u=>u.id===config.unit_id);
+    if(unit?.department_id)ids.add(unit.department_id);
+  }
+
+  return ids;
+}
+
+function dispatchHasEmsEnabled(){
+  const emsDepartments=emsEnabledDepartmentIds();
+  return S.dispatchDepartmentIds.some(id=>emsDepartments.has(id));
+}
+
 function scopeLabel(ids=S.dispatchDepartmentIds){
   const selected=S.departments.filter(d=>ids.includes(d.id));
   if(!selected.length)return "None";
@@ -482,6 +504,9 @@ function renderDispatchScopeModal(){
 function updateDispatchScopeUi(){
   const button=document.querySelector("#dispatchScopeBtn");
   if(button)button.textContent=`Dispatching: ${scopeLabel()}`;
+
+  const walkInButton=document.querySelector("#newWalkInPatient");
+  if(walkInButton)walkInButton.classList.toggle("hidden",!dispatchHasEmsEnabled());
 }
 
 const NAV_STATE_KEY="commcenter-pro-navigation-v1";
@@ -1202,7 +1227,7 @@ async function dispatchPage(){
     >
       <aside class="panel calls-panel">
         <button class="btn block" id="newIncident">+ New Incident</button>
-        <button class="btn secondary block" id="newWalkInPatient">+ Walk-In Patient</button>
+        <button class="btn secondary block ${dispatchHasEmsEnabled()?"":"hidden"}" id="newWalkInPatient">+ Walk-In Patient</button>
         <button class="btn secondary block dispatch-scope-button" id="dispatchScopeBtn">Dispatching: ${esc(scopeLabel())}</button>
         <div class="section-title">Active incidents</div><div id="incidentList">${incidentList()}</div>
       </aside>
@@ -2008,7 +2033,7 @@ async function selectIncident(id){
 
   <div class="incident-modal-actions">
     <button class="btn" id="editIncident">Edit Call Details</button>
-    <button class="btn secondary" id="emsTreatmentHandoff">EMS Handoff / Custody</button>
+    <button class="btn secondary" id="emsPatientFlow">EMS Patient Flow</button>
     <button class="btn secondary" id="showIncidentMap">Show on Map</button>
     <button class="btn danger" id="closeIncident">Close Incident</button>
   </div>
@@ -2093,7 +2118,7 @@ async function selectIncident(id){
   document.querySelector("#closeIncidentModal").onclick=()=>closeIncidentModal();
   document.querySelector("#editIncident").onclick=()=>editIncidentForm(current.id);
 
-  document.querySelector("#emsTreatmentHandoff").onclick=()=>{
+  document.querySelector("#emsPatientFlow").onclick=()=>{
     S.incidentModalMode="ems";
     renderDispatchIncidentTreatmentPanel(
       document.querySelector("#incidentModalContent"),

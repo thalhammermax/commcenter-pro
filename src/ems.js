@@ -280,7 +280,7 @@ export async function renderDispatchIncidentTreatmentPanel(container,{eventId,in
     container.innerHTML=`<div class="card stack treatment-dispatch-panel">
       <div class="row">
         <div>
-          <div class="section-title">EMS Handoff / Custody</div>
+          <div class="section-title">EMS Patient Flow</div>
           <strong>${esc(incident.incident_number)} · ${esc(incident.call_type)}</strong>
         </div>
         <button class="btn secondary" id="emsTreatmentBack">Back</button>
@@ -313,7 +313,7 @@ export async function renderDispatchIncidentTreatmentPanel(container,{eventId,in
 
       <div><label>Operational note</label><input id="dispatchCustodyNote" placeholder="Optional note"></div>
 
-      <div class="small muted">Handoffs take effect immediately. The receiving resource does not need to accept a request.</div>
+      <div class="small muted">Patient-flow changes take effect immediately. Direct handoffs do not require the receiving resource to accept a request.</div>
     </div>`;
 
     document.querySelector("#emsTreatmentBack").onclick=onBack;
