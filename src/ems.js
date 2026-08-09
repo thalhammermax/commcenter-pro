@@ -359,7 +359,7 @@ export async function renderDispatchIncidentTreatmentPanel(container,{eventId,in
    ============================================================ */
 
 export async function renderEmsAdmin(container,ctx,onRefresh){
-  const {eventId,event,units,pois,departments}=ctx;
+  const {eventId,event,units,pois,departments,confirmDestructive}=ctx;
   const [areasRes,configRes]=await Promise.all([
     supabase.from("ems_treatment_areas").select("*").eq("event_id",eventId).eq("active",true).order("name"),
     supabase.from("ems_unit_config").select("*")
@@ -370,12 +370,17 @@ export async function renderEmsAdmin(container,ctx,onRefresh){
   const configs=configRes.data||[];
 
   container.innerHTML=`<div class="stack">
+    <div class="notice">
+      <strong>Dispatcher EMS controls use the department EMS Enabled setting.</strong><br>
+      Enable EMS on the appropriate department in Event Admin → Setup → Edit Department. EMS unit roles or treatment areas alone do not make a dispatch console EMS-enabled.
+    </div>
+
     <div class="card">
       <h2>EMS Treatment Areas</h2>
       <p class="muted">Treatment areas are stationary EMS receiving locations. Their tablets use the event ID/PIN and then select a treatment area.</p>
       ${areas.map(a=>`<div class="ems-admin-row">
         <div><strong>${esc(a.name)}</strong><div class="small muted">Capacity ${a.capacity} · ${esc(a.status)} · ${a.accepting_patients?"Accepting":"Not accepting"}${a.poi_id?` · POI ${esc(pois.find(p=>p.id===a.poi_id)?.name||"")}`:""}</div></div>
-        <button class="btn secondary" data-disable-area="${a.id}">Disable</button>
+        <button class="btn danger compact" data-remove-area="${a.id}">Remove</button>
       </div>`).join("")||`<div class="muted">No treatment areas configured.</div>`}
       <hr>
       <div class="grid2">
@@ -393,7 +398,7 @@ export async function renderEmsAdmin(container,ctx,onRefresh){
       <p class="muted">Classify existing CAD units as field teams, ambulances, or EMS command. Only transport-capable units appear as ambulance handoff destinations.</p>
       <div class="table-wrap"><table><thead><tr><th>Unit</th><th>EMS Role</th><th>Transport</th><th>Level</th><th></th></tr></thead><tbody>
         ${units.map(u=>{
-          const c=configs.find(x=>x.unit_id===u.id);
+          const c=configs.find(x=>x.unit_id===u.id&&x.active);
           return `<tr><td><strong>${esc(u.name)}</strong></td>
             <td><select id="role-${u.id}"><option value="">Not EMS-tracked</option><option value="field_team" ${c?.ems_role==="field_team"?"selected":""}>Field Team</option><option value="ambulance" ${c?.ems_role==="ambulance"?"selected":""}>Ambulance</option><option value="command" ${c?.ems_role==="command"?"selected":""}>EMS Command</option></select></td>
             <td><input id="transport-${u.id}" type="checkbox" ${c?.transport_capable?"checked":""}></td>
@@ -424,18 +429,72 @@ export async function renderEmsAdmin(container,ctx,onRefresh){
     await onRefresh();
   };
 
-  document.querySelectorAll("[data-disable-area]").forEach(b=>b.onclick=async()=>{
-    if(!confirm("Disable this treatment area? Existing encounter history will be preserved."))return;
-    const {error}=await supabase.from("ems_treatment_areas").update({active:false,accepting_patients:false,status:"CLOSED"}).eq("id",b.dataset.disableArea);
-    if(error)alert(error.message);else await onRefresh();
+  document.querySelectorAll("[data-remove-area]").forEach(b=>b.onclick=()=>{
+    const area=areas.find(a=>a.id===b.dataset.removeArea);
+    if(!area)return;
+
+    if(!confirmDestructive){
+      return alert("The administrative confirmation workflow is unavailable. Reload CommCenter Pro and try again.");
+    }
+
+    confirmDestructive({
+      eyebrow:"EVENT ADMIN · EMS",
+      title:"Remove Treatment Area",
+      objectLabel:area.name,
+      confirmationText:area.name,
+      warning:"The treatment area will be archived and removed from active patient-flow choices. Existing encounter and handoff history will be preserved.",
+      details:[
+        {label:"Capacity",value:String(area.capacity)},
+        {label:"Status",value:area.status},
+        {label:"History",value:"Preserved"}
+      ],
+      confirmLabel:"Archive Treatment Area",
+      onConfirm:async confirmation=>{
+        const {error}=await supabase.rpc("admin_archive_treatment_area",{
+          p_treatment_area_id:area.id,
+          p_confirmation:confirmation
+        });
+        if(error)throw error;
+        await onRefresh();
+      }
+    });
   });
 
   document.querySelectorAll("[data-save-ems-unit]").forEach(b=>b.onclick=async()=>{
     const unitId=b.dataset.saveEmsUnit;
     const role=document.querySelector(`#role-${unitId}`).value;
     if(!role){
-      const {error}=await supabase.from("ems_unit_config").delete().eq("unit_id",unitId);
-      if(error)alert(error.message);else await onRefresh();
+      const existing=configs.find(x=>x.unit_id===unitId&&x.active);
+      if(!existing){
+        await onRefresh();
+        return;
+      }
+
+      const unit=units.find(u=>u.id===unitId);
+      if(!confirmDestructive){
+        return alert("The administrative confirmation workflow is unavailable. Reload CommCenter Pro and try again.");
+      }
+
+      confirmDestructive({
+        eyebrow:"EVENT ADMIN · EMS",
+        title:"Remove EMS Role",
+        objectLabel:unit?.name||"Unit",
+        confirmationText:unit?.name||"",
+        warning:"This removes the unit from active EMS patient-flow roles but does not delete the CAD unit. The prior EMS configuration is retained as inactive for historical context.",
+        details:[
+          {label:"Current EMS Role",value:existing.ems_role},
+          {label:"Transport Capable",value:existing.transport_capable?"Yes":"No"},
+          {label:"CAD Unit",value:"Preserved"}
+        ],
+        confirmLabel:"Remove EMS Role",
+        onConfirm:async()=>{
+          const {error}=await supabase.from("ems_unit_config")
+            .update({active:false})
+            .eq("unit_id",unitId);
+          if(error)throw error;
+          await onRefresh();
+        }
+      });
       return;
     }
     const {error}=await supabase.from("ems_unit_config").upsert({

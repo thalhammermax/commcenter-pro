@@ -400,19 +400,11 @@ function unitInDispatchScope(u){
 }
 
 function emsEnabledDepartmentIds(){
-  const ids=new Set();
-
-  for(const area of S.treatmentAreas||[]){
-    if(area.active!==false&&area.department_id)ids.add(area.department_id);
-  }
-
-  for(const config of S.emsUnitConfigs||[]){
-    if(!config.active)continue;
-    const unit=S.units.find(u=>u.id===config.unit_id);
-    if(unit?.department_id)ids.add(unit.department_id);
-  }
-
-  return ids;
+  return new Set(
+    (S.departments||[])
+      .filter(d=>d.active!==false&&d.ems_enabled===true)
+      .map(d=>d.id)
+  );
 }
 
 function dispatchHasEmsEnabled(){
@@ -711,7 +703,7 @@ function eventPicker(){
   app.innerHTML=`<div class="shell">${header(org?.organizations?.name||"Events")}
     <div class="wrap stack">
       <div class="row"><h2>Events</h2><div class="nav">
-        <button class="btn" id="newEvent">+ Create Event</button><button class="btn secondary" id="venueLibrary">Venue Library</button><button class="btn secondary" id="orgSettings">Organization Staff</button><button class="btn secondary" id="changeOrg">Organizations</button><button class="btn secondary" id="logout">Sign out</button>
+        <button class="btn" id="newEvent">+ Create Event</button><button class="btn secondary" id="venueLibrary">Venue Library</button><button class="btn secondary" id="archivedEvents">Archived Events</button><button class="btn secondary" id="orgSettings">Organization Staff</button><button class="btn secondary" id="changeOrg">Organizations</button><button class="btn secondary" id="logout">Sign out</button>
       </div></div>
       ${S.events.map(e=>`<button class="choice" data-event="${e.id}">
         <strong>${esc(e.name)}</strong><br><span class="muted">${esc(e.event_code)} · ${esc(e.staff_role)}</span>
@@ -721,10 +713,58 @@ function eventPicker(){
   document.querySelector("#changeOrg").onclick=()=>{S.orgId=null;S.eventId=null;saveNavigationState();orgPicker();};
   document.querySelector("#orgSettings").onclick=()=>organizationStaffPage();
   document.querySelector("#venueLibrary").onclick=()=>venueLibraryPage();
+  document.querySelector("#archivedEvents").onclick=()=>archivedEventsPage();
   document.querySelector("#newEvent").onclick=()=>newEventForm();
   document.querySelectorAll("[data-event]").forEach(b=>b.onclick=()=>{S.eventId=b.dataset.event;saveNavigationState();commandViewRequested()?commandDisplayPage():dispatchPage();});
 }
 
+
+
+async function archivedEventsPage(){
+  const org=S.orgs.find(o=>o.organization_id===S.orgId);
+  const {data,error}=await supabase.rpc("staff_archived_events_for_org",{p_organization_id:S.orgId});
+
+  if(error){
+    alert(error.message);
+    return eventPicker();
+  }
+
+  const archived=data||[];
+
+  app.innerHTML=`<div class="shell">${header(`${esc(org?.organizations?.name||"Organization")} · Archived Events`)}
+    <div class="wrap stack">
+      <div class="row">
+        <div>
+          <h2>Archived Events</h2>
+          <div class="small muted">Archived events are removed from normal operations but retain their CAD, EMS, map, and report history.</div>
+        </div>
+        <button class="btn secondary" id="backActiveEvents">Back to Events</button>
+      </div>
+
+      ${archived.map(e=>`<div class="card archived-resource-row">
+        <div>
+          <strong>${esc(e.name)}</strong>
+          <div class="small muted">${esc(e.event_code)} · ${esc(e.staff_role||"")}</div>
+        </div>
+        <button class="btn secondary" data-restore-event="${e.id}">Restore Event</button>
+      </div>`).join("")||`<div class="card"><div class="muted">No archived events are available to this account.</div></div>`}
+    </div>
+  </div>`;
+
+  document.querySelector("#backActiveEvents").onclick=()=>eventPicker();
+
+  document.querySelectorAll("[data-restore-event]").forEach(button=>button.onclick=async()=>{
+    button.disabled=true;
+    button.textContent="Restoring…";
+    const {error}=await supabase.rpc("admin_restore_event",{p_event_id:button.dataset.restoreEvent});
+    if(error){
+      button.disabled=false;
+      button.textContent="Restore Event";
+      return alert(error.message);
+    }
+    await staffFlow();
+  });
+}
 
 async function venueLibraryPage(){
   const org=S.orgs.find(o=>o.organization_id===S.orgId);
@@ -853,7 +893,7 @@ async function loadEventOps(){
     treatmentAreasRes
   ] = await Promise.all([
     supabase.from("events").select("*").eq("id",S.eventId).single(),
-    supabase.from("event_departments").select("*").eq("event_id",S.eventId).order("sort_order"),
+    supabase.from("event_departments").select("*").eq("event_id",S.eventId).eq("active",true).order("sort_order"),
     supabase.from("units").select("*,event_departments(name,short_name)").eq("event_id",S.eventId).eq("active",true).order("name"),
     // Keep the incident query deliberately simple. Related department/unit
     // records are loaded separately below so a relationship/embed error
@@ -1543,6 +1583,93 @@ function closeIncidentModal(){
   S.openIncidentId=null;
   S.openUnitId=null;
   S.incidentModalMode=null;
+}
+
+function openDestructiveConfirmation({
+  eyebrow="ADMINISTRATION",
+  title,
+  objectLabel,
+  confirmationText,
+  warning,
+  details=[],
+  confirmLabel="Remove",
+  onConfirm
+}){
+  S.incidentModalMode="destructive-confirmation";
+  const content=openIncidentModalShell();
+
+  content.innerHTML=`<div class="incident-modal-header destructive-modal-header">
+    <div>
+      <div class="incident-modal-eyebrow">${esc(eyebrow)}</div>
+      <div class="incident-modal-title-row"><h2 id="incidentModalTitle">${esc(title)}</h2></div>
+      <div class="incident-modal-nature">${esc(objectLabel||"")}</div>
+    </div>
+    <button class="incident-modal-close" id="closeIncidentModal" aria-label="Cancel">×</button>
+  </div>
+
+  <div class="destructive-confirmation stack">
+    <div class="notice error">
+      <strong>This is an administrative removal action.</strong><br>
+      ${esc(warning)}
+    </div>
+
+    ${details.length?`<div class="destructive-detail-list">
+      ${details.map(item=>`<div><span>${esc(item.label)}</span><strong>${esc(item.value)}</strong></div>`).join("")}
+    </div>`:""}
+
+    <label class="destructive-ack">
+      <input type="checkbox" id="destructiveAcknowledge">
+      <span>I understand this resource will be removed from active operations and its historical records will be preserved.</span>
+    </label>
+
+    <div>
+      <label>Type <span class="mono destructive-confirm-token">${esc(confirmationText)}</span> to confirm</label>
+      <input id="destructiveConfirmationText" autocomplete="off" spellcheck="false">
+    </div>
+
+    <div id="destructiveError" class="small destructive-error" role="alert" aria-live="polite"></div>
+  </div>
+
+  <div class="incident-modal-footer">
+    <button class="btn secondary" id="cancelDestructiveAction">Cancel</button>
+    <button class="btn danger" id="confirmDestructiveAction" disabled>${esc(confirmLabel)}</button>
+  </div>`;
+
+  const typed=document.querySelector("#destructiveConfirmationText");
+  const ack=document.querySelector("#destructiveAcknowledge");
+  const confirmButton=document.querySelector("#confirmDestructiveAction");
+  const errorHost=document.querySelector("#destructiveError");
+
+  const update=()=>{
+    confirmButton.disabled=!(ack.checked&&typed.value===confirmationText);
+  };
+
+  typed.addEventListener("input",update);
+  ack.addEventListener("change",update);
+
+  const cancel=()=>closeIncidentModal();
+  document.querySelector("#closeIncidentModal").onclick=cancel;
+  document.querySelector("#cancelDestructiveAction").onclick=cancel;
+
+  confirmButton.onclick=async()=>{
+    if(confirmButton.disabled)return;
+    confirmButton.disabled=true;
+    confirmButton.textContent="Working…";
+    errorHost.textContent="";
+
+    try{
+      await onConfirm(typed.value);
+      if(document.querySelector("#incidentModal.open")&&S.incidentModalMode==="destructive-confirmation"){
+        closeIncidentModal();
+      }
+    }catch(error){
+      errorHost.textContent=error?.message||String(error);
+      confirmButton.textContent=confirmLabel;
+      update();
+    }
+  };
+
+  setTimeout(()=>typed.focus(),0);
 }
 
 document.addEventListener("keydown",event=>{
@@ -3363,6 +3490,126 @@ async function commandDisplayPage(){
 
 /* ---------------- EVENT ADMIN ---------------- */
 
+
+function currentUserCanAdminEventUi(){
+  const eventRow=(S.events||[]).find(e=>e.id===S.eventId);
+  const orgRow=(S.orgs||[]).find(o=>o.organization_id===S.orgId);
+  return S.isPlatformAdmin
+    ||["owner","admin"].includes(orgRow?.role)
+    ||eventRow?.staff_role==="event_admin";
+}
+
+function adminUnitListHtml(){
+  return (S.units||[]).map(u=>{
+    const dep=S.departments.find(d=>d.id===u.department_id);
+    const ems=S.emsUnitConfigs.find(c=>c.unit_id===u.id&&c.active);
+    return `<div class="admin-resource-row">
+      <div class="admin-resource-main">
+        <div class="row start">
+          <strong>${esc(u.name)}</strong>
+          <span class="badge status-${esc(u.status)}">${esc(statusLabel(u.status))}</span>
+          ${ems?`<span class="badge">${esc(ems.ems_role==="ambulance"?"EMS Ambulance":ems.ems_role==="field_team"?"EMS Field Team":"EMS Command")}</span>`:""}
+        </div>
+        <div class="small muted">${esc(dep?.name||"No department")}</div>
+      </div>
+      ${currentUserCanAdminEventUi()?`<button class="btn danger compact" data-archive-unit="${u.id}">Remove</button>`:""}
+    </div>`;
+  }).join("")||`<div class="small muted">No active units configured.</div>`;
+}
+
+async function renderArchivedResourcesModal(){
+  const [deptRes,unitRes,areaRes]=await Promise.all([
+    supabase.from("event_departments").select("id,name,short_name,ems_enabled").eq("event_id",S.eventId).eq("active",false).order("name"),
+    supabase.from("units").select("id,name,status,department_id").eq("event_id",S.eventId).eq("active",false).order("name"),
+    supabase.from("ems_treatment_areas").select("id,name,status,department_id").eq("event_id",S.eventId).eq("active",false).order("name")
+  ]);
+
+  for(const result of [deptRes,unitRes,areaRes]){
+    if(result.error)return alert(result.error.message);
+  }
+
+  const departments=deptRes.data||[];
+  const units=unitRes.data||[];
+  const areas=areaRes.data||[];
+
+  S.incidentModalMode="archived-resources";
+  const content=openIncidentModalShell();
+  content.innerHTML=`<div class="incident-modal-header">
+    <div>
+      <div class="incident-modal-eyebrow">EVENT ADMIN</div>
+      <div class="incident-modal-title-row"><h2 id="incidentModalTitle">Archived Resources</h2></div>
+      <div class="incident-modal-nature">Restore resources that were previously removed from active operations.</div>
+    </div>
+    <button class="incident-modal-close" id="closeIncidentModal" aria-label="Close archived resources">×</button>
+  </div>
+
+  <div class="archived-resources-modal stack">
+    <section class="incident-info-section">
+      <div class="section-title">Departments</div>
+      ${departments.map(d=>`<div class="archived-resource-row">
+        <div><strong>${esc(d.name)}</strong><div class="small muted">${esc(d.short_name||"")}</div></div>
+        <button class="btn secondary compact" data-restore-department="${d.id}">Restore</button>
+      </div>`).join("")||`<div class="small muted">No archived departments.</div>`}
+    </section>
+
+    <section class="incident-info-section">
+      <div class="section-title">Units</div>
+      ${units.map(u=>`<div class="archived-resource-row">
+        <div><strong>${esc(u.name)}</strong><div class="small muted">${esc(u.status||"")}</div></div>
+        <button class="btn secondary compact" data-restore-unit="${u.id}">Restore</button>
+      </div>`).join("")||`<div class="small muted">No archived units.</div>`}
+    </section>
+
+    <section class="incident-info-section">
+      <div class="section-title">EMS Treatment Areas</div>
+      ${areas.map(a=>`<div class="archived-resource-row">
+        <div><strong>${esc(a.name)}</strong><div class="small muted">${esc(a.status||"")}</div></div>
+        <button class="btn secondary compact" data-restore-treatment-area="${a.id}">Restore</button>
+      </div>`).join("")||`<div class="small muted">No archived treatment areas.</div>`}
+    </section>
+  </div>
+
+  <div class="incident-modal-footer">
+    <button class="btn secondary" id="closeArchivedResources">Close</button>
+  </div>`;
+
+  const close=()=>closeIncidentModal();
+  document.querySelector("#closeIncidentModal").onclick=close;
+  document.querySelector("#closeArchivedResources").onclick=close;
+
+  const restore=async(rpc,args,button)=>{
+    button.disabled=true;
+    const original=button.textContent;
+    button.textContent="Restoring…";
+    const {error}=await supabase.rpc(rpc,args);
+    if(error){
+      button.disabled=false;
+      button.textContent=original;
+      return alert(error.message);
+    }
+    await loadEventOps();
+    await renderArchivedResourcesModal();
+  };
+
+  document.querySelectorAll("[data-restore-department]").forEach(button=>button.onclick=()=>restore(
+    "admin_restore_department",
+    {p_department_id:button.dataset.restoreDepartment},
+    button
+  ));
+
+  document.querySelectorAll("[data-restore-unit]").forEach(button=>button.onclick=()=>restore(
+    "admin_restore_unit",
+    {p_unit_id:button.dataset.restoreUnit},
+    button
+  ));
+
+  document.querySelectorAll("[data-restore-treatment-area]").forEach(button=>button.onclick=()=>restore(
+    "admin_restore_treatment_area",
+    {p_treatment_area_id:button.dataset.restoreTreatmentArea},
+    button
+  ));
+}
+
 async function eventAdmin(initialTab="setup"){
   closeIncidentModal();
   await loadEventOps();
@@ -3386,7 +3633,14 @@ async function eventAdmin(initialTab="setup"){
     await loadEventOps();
     await renderEmsAdmin(
       document.querySelector("#adminContent"),
-      {eventId:S.eventId,event:S.event,units:S.units,pois:S.pois,departments:S.departments},
+      {
+        eventId:S.eventId,
+        event:S.event,
+        units:S.units,
+        pois:S.pois,
+        departments:S.departments,
+        confirmDestructive:openDestructiveConfirmation
+      },
       showEmsAdmin
     );
   };
@@ -3415,8 +3669,14 @@ function renderEventSetup(){
       <h2>Departments</h2>
       <div id="deptList">${S.departments.map(d=>`<div class="poi-row department-row">
         <div class="row">
-          <div><strong>${esc(d.name)}</strong> <span class="muted">${esc(d.short_name||"")}</span></div>
-          <button class="btn secondary" data-edit-dept-statuses="${d.id}">Edit Statuses</button>
+          <div>
+            <strong>${esc(d.name)}</strong> <span class="muted">${esc(d.short_name||"")}</span>
+            ${d.ems_enabled?`<span class="badge ems-enabled-badge">EMS ENABLED</span>`:""}
+          </div>
+          <div class="nav">
+            <button class="btn secondary compact" data-edit-dept-statuses="${d.id}">Edit Department</button>
+            ${currentUserCanAdminEventUi()?`<button class="btn danger compact" data-archive-department="${d.id}">Remove</button>`:""}
+          </div>
         </div>
         <div class="department-status-badges">
           ${(Array.isArray(d.status_profile)?d.status_profile:[]).map(st=>`<span class="badge status-choice-badge">${esc(statusLabel(st))}</span>`).join("")||`<span class="small muted">No field statuses configured</span>`}
@@ -3431,6 +3691,14 @@ function renderEventSetup(){
         <div><label>Short Name</label><input id="deptShort" placeholder="Short name"></div>
       </div>
 
+      <label class="ems-department-toggle">
+        <input id="newDeptEmsEnabled" type="checkbox">
+        <span>
+          <strong>EMS Enabled Department</strong>
+          <small>Enables EMS-specific dispatcher workflows such as + Walk-In Patient when this department is in the Dispatch Scope.</small>
+        </span>
+      </label>
+
       <div style="margin-top:12px">
         <label>Field Unit Status Options</label>
         <div class="small muted" style="margin-bottom:8px">Select the buttons field units in this department should have available. ASSIGNED is handled automatically by Dispatch.</div>
@@ -3441,14 +3709,28 @@ function renderEventSetup(){
     </div>
 
     <div class="card">
-      <h2>Units</h2>
-      <div id="adminUnits">${unitList()}</div>
+      <div class="row">
+        <h2>Units</h2>
+        ${currentUserCanAdminEventUi()?`<button class="btn secondary compact" id="archivedResources">Archived Resources</button>`:""}
+      </div>
+      <div id="adminUnits" class="admin-resource-list">${adminUnitListHtml()}</div>
       <div class="grid2">
         <select id="unitDept"><option value="">Department</option>${S.departments.map(d=>`<option value="${d.id}">${esc(d.name)}</option>`).join("")}</select>
         <input id="unitName" placeholder="Unit name">
       </div>
       <button class="btn" id="addUnit">Add Unit</button>
     </div>
+
+    ${currentUserCanAdminEventUi()?`<div class="card danger-zone-card">
+      <div class="row">
+        <div>
+          <div class="section-title danger-zone-title">Danger Zone</div>
+          <h2>Remove Event</h2>
+          <p class="muted">Archiving removes this event from active operations while preserving CAD, EMS, map, and reporting history.</p>
+        </div>
+        <button class="btn danger" id="archiveEvent">Archive Event</button>
+      </div>
+    </div>`:""}
 
     <div class="card">
       <div class="row">
@@ -3483,6 +3765,98 @@ function renderEventSetup(){
     btn.onclick=()=>renderDepartmentStatusEditor(btn.dataset.editDeptStatuses);
   });
 
+  document.querySelectorAll("[data-archive-department]").forEach(btn=>btn.onclick=()=>{
+    const dep=S.departments.find(d=>d.id===btn.dataset.archiveDepartment);
+    if(!dep)return;
+
+    const activeUnits=S.units.filter(u=>u.department_id===dep.id);
+    const activeAreas=S.treatmentAreas.filter(a=>a.department_id===dep.id&&a.active!==false);
+
+    openDestructiveConfirmation({
+      eyebrow:"EVENT ADMIN · DEPARTMENT",
+      title:"Remove Department",
+      objectLabel:dep.name,
+      confirmationText:dep.name,
+      warning:"The department will be archived and removed from Dispatch, new-call selection, and active administration. Historical incident records will be preserved.",
+      details:[
+        {label:"Active Units",value:String(activeUnits.length)},
+        {label:"Active Treatment Areas",value:String(activeAreas.length)},
+        {label:"History",value:"Preserved"}
+      ],
+      confirmLabel:"Archive Department",
+      onConfirm:async confirmation=>{
+        const {error}=await supabase.rpc("admin_archive_department",{
+          p_department_id:dep.id,
+          p_confirmation:confirmation
+        });
+        if(error)throw error;
+        closeIncidentModal();
+        await loadEventOps();
+        renderEventSetup();
+      }
+    });
+  });
+
+  document.querySelectorAll("[data-archive-unit]").forEach(btn=>btn.onclick=()=>{
+    const unit=S.units.find(u=>u.id===btn.dataset.archiveUnit);
+    if(!unit)return;
+    const dep=S.departments.find(d=>d.id===unit.department_id);
+    const active=activeAssignmentForUnit(unit.id);
+
+    openDestructiveConfirmation({
+      eyebrow:"EVENT ADMIN · UNIT",
+      title:"Remove Unit",
+      objectLabel:unit.name,
+      confirmationText:unit.name,
+      warning:"The unit will be archived, removed from active CAD/field selection, and placed Out of Service. Its assignment, status, and EMS history will be preserved.",
+      details:[
+        {label:"Department",value:dep?.name||"Unknown"},
+        {label:"Current Status",value:statusLabel(unit.status)},
+        {label:"Open Assignment",value:active?active.incident.incident_number:"None"}
+      ],
+      confirmLabel:"Archive Unit",
+      onConfirm:async confirmation=>{
+        const {error}=await supabase.rpc("admin_archive_unit",{
+          p_unit_id:unit.id,
+          p_confirmation:confirmation
+        });
+        if(error)throw error;
+        closeIncidentModal();
+        await loadEventOps();
+        renderEventSetup();
+      }
+    });
+  });
+
+  document.querySelector("#archivedResources")?.addEventListener("click",()=>renderArchivedResourcesModal());
+
+  document.querySelector("#archiveEvent")?.addEventListener("click",()=>{
+    openDestructiveConfirmation({
+      eyebrow:"EVENT ADMIN · EVENT",
+      title:"Archive Event",
+      objectLabel:`${S.event.name} · ${S.event.event_code}`,
+      confirmationText:S.event.event_code,
+      warning:"The event will disappear from active event selection and all field/treatment sessions will be ended. All CAD, EMS, map, and reporting history will remain available for restoration.",
+      details:[
+        {label:"Open Incidents",value:String(S.incidents.length)},
+        {label:"Active Units",value:String(S.units.length)},
+        {label:"Event ID",value:S.event.event_code}
+      ],
+      confirmLabel:"Archive Event",
+      onConfirm:async confirmation=>{
+        const {error}=await supabase.rpc("admin_archive_event",{
+          p_event_id:S.eventId,
+          p_confirmation:confirmation
+        });
+        if(error)throw error;
+        closeIncidentModal();
+        S.eventId=null;
+        saveNavigationState();
+        await staffFlow();
+      }
+    });
+  });
+
   document.querySelector("#addDept").onclick=async()=>{
     const name=document.querySelector("#deptName").value.trim();
     const shortName=document.querySelector("#deptShort").value.trim().toUpperCase();
@@ -3495,13 +3869,19 @@ function renderEventSetup(){
       event_id:S.eventId,
       name,
       short_name:shortName,
-      status_profile:statuses
+      status_profile:statuses,
+      ems_enabled:document.querySelector("#newDeptEmsEnabled").checked
     });
     if(error)alert(error.message);else{await loadEventOps();renderEventSetup();}
   };
   document.querySelector("#addUnit").onclick=async()=>{
+    const departmentId=document.querySelector("#unitDept").value;
+    const name=document.querySelector("#unitName").value.trim();
+    if(!departmentId)return alert("Choose a department.");
+    if(!name)return alert("Enter a unit name.");
+
     const {error}=await supabase.from("units").insert({
-      event_id:S.eventId,department_id:document.querySelector("#unitDept").value,name:document.querySelector("#unitName").value.trim()
+      event_id:S.eventId,department_id:departmentId,name
     });
     if(error)alert(error.message);else{await loadEventOps();renderEventSetup();}
   };
@@ -3590,14 +3970,23 @@ function renderDepartmentStatusEditor(departmentId){
   host.innerHTML=`<div class="department-status-editor">
     <div class="row">
       <div>
-        <div class="section-title">Edit Field Statuses</div>
+        <div class="section-title">Edit Department</div>
         <strong>${esc(dep.name)}</strong>
       </div>
       <button class="btn secondary" id="cancelDeptStatusEdit">Cancel</button>
     </div>
+
+    <label class="ems-department-toggle">
+      <input id="editDeptEmsEnabled" type="checkbox" ${dep.ems_enabled?"checked":""}>
+      <span>
+        <strong>EMS Enabled Department</strong>
+        <small>When this department is included in a dispatcher's active scope, EMS-specific actions such as + Walk-In Patient are available.</small>
+      </span>
+    </label>
+
     <p class="small muted">These become the selectable status buttons on field devices assigned to ${esc(dep.name)}.</p>
     ${departmentStatusPicker("editDeptStatuses",dep.status_profile)}
-    <button class="btn" id="saveDeptStatuses">Save Status Options</button>
+    <button class="btn" id="saveDeptStatuses">Save Department</button>
   </div>`;
 
   document.querySelector("#cancelDeptStatusEdit").onclick=()=>{host.innerHTML="";};
@@ -3606,7 +3995,10 @@ function renderDepartmentStatusEditor(departmentId){
     if(!statuses.length)return alert("Select at least one field unit status.");
 
     const {error}=await supabase.from("event_departments")
-      .update({status_profile:statuses})
+      .update({
+        status_profile:statuses,
+        ems_enabled:document.querySelector("#editDeptEmsEnabled").checked
+      })
       .eq("id",departmentId)
       .eq("event_id",S.eventId);
 

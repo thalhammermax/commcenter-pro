@@ -2182,3 +2182,159 @@ body.modal-open{
   outline-offset:2px;
 }
 
+
+
+/* ============================================================
+   v0.8.7 — SAFE ADMIN REMOVAL + EXPLICIT EMS DEPARTMENT FLAG
+   ============================================================ */
+
+.ems-enabled-badge{
+  margin-left:6px;
+  background:#123e5e;
+  color:#67baff;
+  border-color:#24658e;
+}
+
+.ems-department-toggle{
+  display:flex;
+  gap:10px;
+  align-items:flex-start;
+  margin-top:12px;
+  padding:11px 12px;
+  border:1px solid #31465f;
+  border-radius:10px;
+  background:#0b1727;
+  cursor:pointer;
+}
+
+.ems-department-toggle input{
+  width:auto;
+  margin-top:3px;
+}
+
+.ems-department-toggle span{
+  display:grid;
+  gap:3px;
+}
+
+.ems-department-toggle small{
+  color:var(--cc-muted);
+  font-weight:500;
+  line-height:1.35;
+}
+
+.admin-resource-list{
+  display:grid;
+  gap:8px;
+  margin-bottom:14px;
+}
+
+.admin-resource-row,
+.archived-resource-row{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  gap:12px;
+  padding:10px 11px;
+  border:1px solid var(--cc-line);
+  border-radius:10px;
+  background:#0c1928;
+}
+
+.admin-resource-main{
+  min-width:0;
+}
+
+.btn.compact{
+  padding:7px 10px;
+  font-size:12px;
+}
+
+.danger-zone-card{
+  border-color:#6f3038!important;
+  background:linear-gradient(180deg,#28161b,#1b1115)!important;
+}
+
+.danger-zone-title{
+  color:#ff8b92;
+}
+
+.destructive-modal-header{
+  border-bottom-color:#6f3038;
+}
+
+.destructive-confirmation{
+  padding:20px;
+}
+
+.destructive-detail-list{
+  display:grid;
+  gap:0;
+  border:1px solid var(--cc-line);
+  border-radius:10px;
+  overflow:hidden;
+}
+
+.destructive-detail-list>div{
+  display:grid;
+  grid-template-columns:minmax(130px,.8fr) minmax(0,1.2fr);
+  gap:12px;
+  padding:9px 11px;
+  border-bottom:1px solid var(--cc-line);
+  background:#0c1928;
+}
+
+.destructive-detail-list>div:last-child{
+  border-bottom:0;
+}
+
+.destructive-detail-list span{
+  color:var(--cc-muted);
+  font-size:12px;
+}
+
+.destructive-confirm-token{
+  color:#ff9aa1;
+  font-weight:900;
+}
+
+.destructive-ack{
+  display:flex;
+  align-items:flex-start;
+  gap:10px;
+  padding:10px 12px;
+  border:1px solid #6f3038;
+  border-radius:10px;
+  background:#25151a;
+}
+
+.destructive-ack input{
+  width:auto;
+  margin-top:3px;
+}
+
+.destructive-error{
+  min-height:18px;
+  color:#ff9aa1;
+}
+
+.archived-resources-modal{
+  padding:20px;
+}
+
+.archived-resources-modal .incident-info-section{
+  background:#0c1928;
+}
+
+@media(max-width:650px){
+  .admin-resource-row,
+  .archived-resource-row{
+    align-items:flex-start;
+    flex-direction:column;
+  }
+
+  .destructive-detail-list>div{
+    grid-template-columns:1fr;
+    gap:3px;
+  }
+}
