@@ -1,4 +1,4 @@
-# CommCenter Pro Cloud v0.2
+# CommCenter Pro v0.3.1
 
 CommCenter Pro is a cloud-hosted, multi-tenant, multi-department event operations CAD/PWA.
 
@@ -43,3 +43,13 @@ CommCenter Pro stores/uses W3W square records you import. It does not reproduce 
 ## Operational note
 
 This is development software. Do not use it as the sole dispatch path until you validate security, roles, connectivity behavior, backups, incident concurrency, audit logs, reporting and fallback procedures.
+
+
+## v0.3.1
+
+Adds full dispatcher unit assignment controls plus the v0.3.0 EMS treatment-area/handoff workflow. See `UPGRADE-TO-0.3.1.md`.
+
+
+## v0.4.0
+
+Dark command-center UI and multi-level venue/stadium mapping. See `UPGRADE-TO-0.4.0.md`.

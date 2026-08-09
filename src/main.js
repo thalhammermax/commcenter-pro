@@ -434,6 +434,137 @@ function activeMapLayer(){return S.mapLayers.find(l=>l.id===S.activeMapLayerId)|
 function zoneName(id){return S.zones.find(z=>z.id===id)?.name||"";}
 function layerName(id){return S.mapLayers.find(l=>l.id===id)?.name||"";}
 
+
+function poiSearchText(p){
+  return [
+    p.name,
+    p.category,
+    p.w3w,
+    layerName(p.map_layer_id),
+    zoneName(p.zone_id),
+    ...(p.poi_aliases||[]).map(a=>a.alias)
+  ].filter(Boolean).join(" ").toLowerCase();
+}
+
+function searchPois(query,limit=12){
+  const q=String(query||"").trim().toLowerCase();
+  const rows=q
+    ? S.pois.filter(p=>poiSearchText(p).includes(q))
+    : S.pois;
+  return rows.slice(0,limit);
+}
+
+function poiResultLabel(p){
+  const aliases=(p.poi_aliases||[]).map(a=>a.alias).filter(Boolean);
+  return `${p.name}${p.category?` · ${p.category}`:""}${layerName(p.map_layer_id)?` · ${layerName(p.map_layer_id)}`:""}${p.zone_id?` / ${zoneName(p.zone_id)}`:""}${aliases.length?` · aka ${aliases.slice(0,2).join(", ")}`:""}`;
+}
+
+function poiLocationObject(p){
+  return {
+    poi_id:p.id,
+    map_x:p.map_x,
+    map_y:p.map_y,
+    latitude:p.latitude,
+    longitude:p.longitude,
+    w3w:p.w3w,
+    landmark:p.name,
+    map_layer_id:p.map_layer_id||null,
+    zone_id:p.zone_id||null
+  };
+}
+
+function poiSearchResultsHtml(query){
+  const rows=searchPois(query);
+  return rows.map(p=>`<button type="button" class="poi-search-result" data-poi-search-result="${p.id}">
+    <strong>${esc(p.name)}</strong>
+    <span>${esc([p.category,layerName(p.map_layer_id),p.zone_id?zoneName(p.zone_id):""].filter(Boolean).join(" · "))}</span>
+    ${(p.poi_aliases||[]).length?`<small>Aliases: ${esc((p.poi_aliases||[]).map(a=>a.alias).join(", "))}</small>`:""}
+    ${p.w3w?`<small>///${esc(p.w3w)}</small>`:""}
+  </button>`).join("")||`<div class="small muted poi-no-results">No POIs match that search.</div>`;
+}
+
+function bindPoiSearch({inputId,resultsId,onSelect}){
+  const input=document.querySelector(`#${inputId}`);
+  const results=document.querySelector(`#${resultsId}`);
+  if(!input||!results)return;
+
+  const render=()=>{
+    results.innerHTML=poiSearchResultsHtml(input.value);
+    results.querySelectorAll("[data-poi-search-result]").forEach(btn=>{
+      btn.onclick=()=>{
+        const p=S.pois.find(x=>x.id===btn.dataset.poiSearchResult);
+        if(!p)return;
+        input.value=p.name;
+        results.innerHTML="";
+        onSelect(p);
+      };
+    });
+  };
+
+  input.addEventListener("input",render);
+  input.addEventListener("focus",render);
+  input.addEventListener("keydown",e=>{
+    if(e.key==="Escape")results.innerHTML="";
+  });
+}
+
+async function focusPoiOnMap(p){
+  if(!p)return;
+  if(p.map_layer_id && p.map_layer_id!==S.activeMapLayerId){
+    S.activeMapLayerId=p.map_layer_id;
+    saveNavigationState();
+    const selector=document.querySelector("#dispatchLayerSelect");
+    if(selector)selector.value=p.map_layer_id;
+    await setupDispatchMap();
+  }
+  const layer=activeMapLayer();
+  if(S.map&&layer&&p.map_x!=null&&p.map_y!=null){
+    const point=pixelToLeaflet(p.map_x,p.map_y,layer.image_height);
+    S.map.setView(point,Math.max(S.map.getZoom(),1));
+    L.popup().setLatLng(point).setContent(
+      `<strong>${esc(p.name)}</strong><br>${esc(layerName(p.map_layer_id)||"")}${p.zone_id?` · ${esc(zoneName(p.zone_id))}`:""}${p.w3w?`<br>///${esc(p.w3w)}`:""}`
+    ).openOn(S.map);
+  }
+}
+
+function showPoiFinder(){
+  const detail=document.querySelector("#detail");
+  if(!detail)return;
+  detail.innerHTML=`<div class="card stack" data-dispatch-editor="poi-search">
+    <div class="row"><strong>Find POI</strong><span class="badge">${S.pois.length} locations</span></div>
+    <div>
+      <label>Search name, alias, category, level, zone or W3W</label>
+      <input id="dispatcherPoiSearch" autocomplete="off" placeholder="e.g. Main Medical, Section 312, Gate 4…">
+      <div id="dispatcherPoiResults" class="poi-search-results"></div>
+    </div>
+    <div id="dispatcherPoiSelected" class="small muted">Start typing to search event POIs.</div>
+  </div>`;
+
+  bindPoiSearch({
+    inputId:"dispatcherPoiSearch",
+    resultsId:"dispatcherPoiResults",
+    onSelect:async p=>{
+      document.querySelector("#dispatcherPoiSelected").innerHTML=`
+        <div class="poi-selected-card">
+          <strong>${esc(p.name)}</strong><br>
+          ${esc([p.category,layerName(p.map_layer_id),p.zone_id?zoneName(p.zone_id):""].filter(Boolean).join(" · "))}
+          ${p.w3w?`<br><strong>///${esc(p.w3w)}</strong>`:""}
+          ${(p.poi_aliases||[]).length?`<br><span class="muted">Aliases: ${esc((p.poi_aliases||[]).map(a=>a.alias).join(", "))}</span>`:""}
+          <div class="grid2" style="margin-top:10px">
+            <button class="btn secondary" id="showPoiOnMap">Show on Map</button>
+            <button class="btn" id="createAtPoi">Create Incident Here</button>
+          </div>
+        </div>`;
+      document.querySelector("#showPoiOnMap").onclick=()=>focusPoiOnMap(p);
+      document.querySelector("#createAtPoi").onclick=()=>{
+        focusPoiOnMap(p);
+        incidentForm(poiLocationObject(p));
+      };
+      await focusPoiOnMap(p);
+    }
+  });
+}
+
 async function storageSigned(path,seconds=3600){
   if(!path)return null;
   const {data,error}=await supabase.storage.from("event-assets").createSignedUrl(path,seconds);
@@ -481,18 +612,20 @@ async function dispatchPage(){
       </aside>
     </div></div>`;
   document.querySelector("#topActions").innerHTML=`
+    <button class="btn secondary" id="poiFinderBtn">Find POI</button>
     <button class="btn secondary" id="emsOpsBtn">EMS Ops</button>
     <button class="btn secondary" id="adminBtn">Event Admin</button>
     <button class="btn secondary" id="reportsBtn">Reports</button>
     <button class="btn secondary" id="eventsBtn">Events</button>
     <button class="btn secondary" id="logoutBtn">Sign out</button>`;
+  document.querySelector("#poiFinderBtn").onclick=()=>showPoiFinder();
   document.querySelector("#emsOpsBtn").onclick=()=>renderEmsOps(app,{eventId:S.eventId,event:S.event,header,onBack:()=>dispatchPage(),onAdmin:()=>eventAdmin("ems")});
   document.querySelector("#adminBtn").onclick=()=>eventAdmin();
   document.querySelector("#reportsBtn").onclick=()=>reportsPage();
   document.querySelector("#eventsBtn").onclick=()=>{S.eventId=null;staffFlow();};
   document.querySelector("#logoutBtn").onclick=async()=>{await supabase.auth.signOut();S.mode=null;reset();clearNavigationState();route();};
   document.querySelector("#newIncident").onclick=()=>incidentForm(null);
-  document.querySelector("#dispatchLayerSelect")?.addEventListener("change",e=>{S.activeMapLayerId=e.target.value;setupDispatchMap();});
+  document.querySelector("#dispatchLayerSelect")?.addEventListener("change",e=>{S.activeMapLayerId=e.target.value;saveNavigationState();setupDispatchMap();});
   bindIncidentClicks();
   ensureCallTimerTicker();
   await setupDispatchMap();
@@ -657,10 +790,12 @@ function selectIncident(id){
       </select>
     </div>
     <button class="btn" id="dispatchUnit">Assign Unit</button>
+    <button class="btn secondary" id="editIncident">Edit Call Details</button>
     <button class="btn secondary" id="closeIncident">Close Incident</button>
   </div>`;
 
   document.querySelector("#dispatchUnit").onclick=()=>dispatcherAssign(i.id,document.querySelector("#assignUnit").value);
+  document.querySelector("#editIncident").onclick=()=>editIncidentForm(i.id);
 
   document.querySelectorAll("[data-apply-status]").forEach(b=>b.onclick=()=>{
     const unitId=b.dataset.applyStatus;
@@ -777,10 +912,12 @@ async function setupDispatchMap(){
 function incidentForm(loc){
   const detail=document.querySelector("#detail");
 
-  detail.innerHTML=`<div class="card stack"><strong>New Incident</strong>
-    <div><label>Use a POI</label><select id="poiSelect"><option value="">-- Map location / none --</option>
-      ${S.pois.map(p=>`<option value="${p.id}">${esc(layerName(p.map_layer_id)||"Unlayered")} · ${esc(p.name)}${p.w3w?` · ///${esc(p.w3w)}`:""}</option>`).join("")}
-    </select></div>
+  detail.innerHTML=`<div class="card stack" data-dispatch-editor="new"><strong>New Incident</strong>
+    <div>
+      <label>Search POI / Common Name</label>
+      <input id="poiSearchNew" autocomplete="off" placeholder="Search name, alias, section, gate, category…">
+      <div id="poiSearchNewResults" class="poi-search-results"></div>
+    </div>
 
     <div><label>Departments</label>${S.departments.map(d=>`<label style="font-weight:500"><input type="checkbox" name="dept" value="${d.id}"> ${esc(d.name)}</label>`).join("")}</div>
     <div><label>Call type</label><input id="callType" placeholder="Medical, disturbance, power issue…"></div>
@@ -812,13 +949,16 @@ function incidentForm(loc){
 
   let chosen=loc?{...loc}:null;
 
-  document.querySelector("#poiSelect").onchange=()=>{
-    const p=S.pois.find(x=>x.id===document.querySelector("#poiSelect").value);
-    if(!p)return;
-    chosen={poi_id:p.id,map_x:p.map_x,map_y:p.map_y,latitude:p.latitude,longitude:p.longitude,w3w:p.w3w,landmark:p.name,map_layer_id:p.map_layer_id||null,zone_id:p.zone_id||null};
-    document.querySelector("#landmark").value=p.name;
-    document.querySelector("#locSummary").textContent=`${layerName(p.map_layer_id)||"Unlayered"}${p.zone_id?` / ${zoneName(p.zone_id)}`:""} · ${p.w3w?`///${p.w3w} · `:""}${Number(p.latitude).toFixed(6)}, ${Number(p.longitude).toFixed(6)}`;
-  };
+  bindPoiSearch({
+    inputId:"poiSearchNew",
+    resultsId:"poiSearchNewResults",
+    onSelect:p=>{
+      chosen=poiLocationObject(p);
+      document.querySelector("#landmark").value=p.name;
+      document.querySelector("#locSummary").textContent=`${layerName(p.map_layer_id)||"Unlayered"}${p.zone_id?` / ${zoneName(p.zone_id)}`:""} · ${p.w3w?`///${p.w3w} · `:""}${Number(p.latitude).toFixed(6)}, ${Number(p.longitude).toFixed(6)}`;
+      focusPoiOnMap(p);
+    }
+  });
 
   const create=async(assignSelected)=>{
     if(!chosen)return alert("Choose a POI or click the map to set the incident location.");
@@ -869,6 +1009,118 @@ function incidentForm(loc){
 
   document.querySelector("#saveIncidentOnly").onclick=()=>create(false);
   document.querySelector("#saveAndDispatch").onclick=()=>create(true);
+}
+
+
+function editIncidentForm(incidentId){
+  const i=S.incidents.find(x=>x.id===incidentId);
+  if(!i)return;
+
+  let chosen={
+    poi_id:i.poi_id||null,
+    map_x:i.map_x,
+    map_y:i.map_y,
+    latitude:i.latitude,
+    longitude:i.longitude,
+    w3w:i.w3w,
+    landmark:i.landmark,
+    map_layer_id:i.map_layer_id||null,
+    zone_id:i.zone_id||null
+  };
+
+  const selectedDepartments=new Set((i.incident_departments||[]).map(d=>d.department_id));
+  const detail=document.querySelector("#detail");
+
+  detail.innerHTML=`<div class="card stack" data-dispatch-editor="edit">
+    <div class="row">
+      <div><div class="section-title">Edit Incident</div><strong>${esc(i.incident_number)}</strong></div>
+      <span class="call-timer" data-call-start="${esc(i.created_at)}">00:00</span>
+    </div>
+
+    <div>
+      <label>Departments</label>
+      <div class="incident-department-picker">
+        ${S.departments.map(d=>`<label class="status-select-option">
+          <input type="checkbox" name="editDept" value="${d.id}" ${selectedDepartments.has(d.id)?"checked":""}>
+          <span>${esc(d.name)}</span>
+        </label>`).join("")}
+      </div>
+    </div>
+
+    <div><label>Call Type / Nature</label><input id="editCallType" value="${esc(i.call_type)}"></div>
+
+    <div><label>Priority</label><select id="editPriority">
+      ${["Standard","Urgent","Critical"].map(p=>`<option ${i.priority===p?"selected":""}>${p}</option>`).join("")}
+    </select></div>
+
+    <div>
+      <label>Change Location Using POI</label>
+      <input id="poiSearchEdit" autocomplete="off" placeholder="Search POIs; leave unchanged to keep current location">
+      <div id="poiSearchEditResults" class="poi-search-results"></div>
+    </div>
+
+    <div class="notice">
+      <strong>Current selected location</strong><br>
+      <span id="editLocationSummary">${esc(layerName(i.map_layer_id)||"Unlayered")}${i.zone_id?` / ${esc(zoneName(i.zone_id))}`:""} · ${esc(i.landmark||"")}${i.w3w?` · ///${esc(i.w3w)}`:""}</span>
+    </div>
+
+    <div><label>Location Description</label><input id="editLandmark" value="${esc(i.landmark||"")}"></div>
+    <div><label>Dispatch Notes</label><textarea id="editNotes" rows="5">${esc(i.notes||"")}</textarea></div>
+
+    <div class="grid2">
+      <button class="btn secondary" id="cancelIncidentEdit">Cancel</button>
+      <button class="btn" id="saveIncidentEdit">Save Changes</button>
+    </div>
+  </div>`;
+
+  ensureCallTimerTicker();
+
+  bindPoiSearch({
+    inputId:"poiSearchEdit",
+    resultsId:"poiSearchEditResults",
+    onSelect:p=>{
+      chosen=poiLocationObject(p);
+      document.querySelector("#editLandmark").value=p.name;
+      document.querySelector("#editLocationSummary").textContent=`${layerName(p.map_layer_id)||"Unlayered"}${p.zone_id?` / ${zoneName(p.zone_id)}`:""} · ${p.name}${p.w3w?` · ///${p.w3w}`:""}`;
+      focusPoiOnMap(p);
+    }
+  });
+
+  document.querySelector("#cancelIncidentEdit").onclick=()=>selectIncident(incidentId);
+
+  document.querySelector("#saveIncidentEdit").onclick=async()=>{
+    const departments=[...document.querySelectorAll('input[name="editDept"]:checked')].map(x=>x.value);
+    if(!departments.length)return alert("Choose at least one department.");
+
+    const callType=document.querySelector("#editCallType").value.trim();
+    if(!callType)return alert("Enter a call type / nature.");
+
+    const {error}=await supabase.rpc("update_incident_v2",{
+      p_incident_id:incidentId,
+      p_department_ids:departments,
+      p_call_type:callType,
+      p_priority:document.querySelector("#editPriority").value,
+      p_latitude:chosen.latitude,
+      p_longitude:chosen.longitude,
+      p_map_x:chosen.map_x,
+      p_map_y:chosen.map_y,
+      p_w3w:chosen.w3w,
+      p_landmark:document.querySelector("#editLandmark").value.trim(),
+      p_notes:document.querySelector("#editNotes").value.trim(),
+      p_poi_id:chosen.poi_id||null,
+      p_map_layer_id:chosen.map_layer_id||null,
+      p_zone_id:chosen.zone_id||null
+    });
+
+    if(error)return alert(`Call was not updated.\n\n${error.message}`);
+
+    // Reload data without rebuilding the entire application shell.
+    await loadEventOps();
+    document.querySelector("#incidentList").innerHTML=incidentList();
+    document.querySelector("#unitList").innerHTML=unitList();
+    bindIncidentClicks();
+    selectIncident(incidentId);
+  };
 }
 
 /* ---------------- EVENT ADMIN ---------------- */

@@ -330,3 +330,52 @@ input:disabled{opacity:.65}
 @media(max-width:460px){
   .department-status-picker{grid-template-columns:1fr}
 }
+/* v0.4.4 — dispatcher POI search + incident editor */
+.poi-search-results{
+  display:grid;
+  gap:5px;
+  margin-top:6px;
+  max-height:280px;
+  overflow:auto;
+}
+.poi-search-result{
+  display:grid;
+  gap:2px;
+  width:100%;
+  padding:9px 10px;
+  text-align:left;
+  color:#e5e7eb;
+  background:#0f172a;
+  border:1px solid #334155;
+  border-radius:9px;
+  cursor:pointer;
+}
+.poi-search-result:hover,
+.poi-search-result:focus{
+  border-color:#60a5fa;
+  background:#111c31;
+}
+.poi-search-result span{
+  color:#cbd5e1;
+  font-size:12px;
+}
+.poi-search-result small{
+  color:#94a3b8;
+}
+.poi-no-results{
+  padding:9px 2px;
+}
+.poi-selected-card{
+  padding:10px;
+  border:1px solid #334155;
+  border-radius:10px;
+  background:#0b1324;
+}
+.incident-department-picker{
+  display:grid;
+  grid-template-columns:repeat(2,minmax(0,1fr));
+  gap:6px;
+}
+@media(max-width:560px){
+  .incident-department-picker{grid-template-columns:1fr}
+}
