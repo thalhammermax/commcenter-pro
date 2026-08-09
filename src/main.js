@@ -16,6 +16,7 @@ const S={
   unitLocations:[],unitLocationMarkers:new Map(),locationAgeInterval:null,
   locationWatchId:null,locationLastSentAt:0,locationLastSent:null,locationWriteInFlight:false,
   openIncidentId:null,openUnitId:null,incidentModalMode:null,
+  dispatchLayout:null,
   dispatchDepartmentIds:[],
   commandDepartmentIds:[],
   commandDisplayMode:"calls",
@@ -103,6 +104,259 @@ function selectedDepartmentStatuses(name){
   return [...document.querySelectorAll(`input[name="${name}"]:checked`)].map(el=>el.value);
 }
 
+
+
+const DISPATCH_LAYOUT_DEFAULTS={
+  mode:"classic",
+  callsSize:300,
+  unitsSize:310,
+  bottomSize:250
+};
+
+function dispatchLayoutKey(){
+  return `commcenter-dispatch-layout:${S.session?.user?.id||"staff"}:${S.eventId||"event"}`;
+}
+
+function normalizeDispatchLayout(value){
+  const allowedModes=new Set([
+    "classic",
+    "units-left-calls-bottom",
+    "calls-left-units-bottom"
+  ]);
+
+  const input=value&&typeof value==="object"?value:{};
+  return {
+    mode:allowedModes.has(input.mode)?input.mode:DISPATCH_LAYOUT_DEFAULTS.mode,
+    callsSize:Math.max(220,Math.min(520,Number(input.callsSize)||DISPATCH_LAYOUT_DEFAULTS.callsSize)),
+    unitsSize:Math.max(220,Math.min(520,Number(input.unitsSize)||DISPATCH_LAYOUT_DEFAULTS.unitsSize)),
+    bottomSize:Math.max(170,Math.min(480,Number(input.bottomSize)||DISPATCH_LAYOUT_DEFAULTS.bottomSize))
+  };
+}
+
+function loadDispatchLayout(){
+  let saved=null;
+  try{
+    const raw=localStorage.getItem(dispatchLayoutKey());
+    if(raw)saved=JSON.parse(raw);
+  }catch{}
+  S.dispatchLayout=normalizeDispatchLayout(saved);
+  return S.dispatchLayout;
+}
+
+function saveDispatchLayout(){
+  S.dispatchLayout=normalizeDispatchLayout(S.dispatchLayout);
+  try{localStorage.setItem(dispatchLayoutKey(),JSON.stringify(S.dispatchLayout));}catch{}
+}
+
+function dispatchLayoutModeLabel(mode){
+  return ({
+    classic:"Calls Left · Units Right",
+    "units-left-calls-bottom":"Units Left · Calls Bottom",
+    "calls-left-units-bottom":"Calls Left · Units Bottom"
+  })[mode]||"Dispatcher Layout";
+}
+
+function dispatchLayoutDescription(mode){
+  return ({
+    classic:"Traditional three-column CAD view with the map centered between active calls and units.",
+    "units-left-calls-bottom":"Keeps units visible on the left, puts active calls along the bottom, and gives the map the remaining workspace.",
+    "calls-left-units-bottom":"Keeps active calls on the left, puts units along the bottom, and gives the map the remaining workspace."
+  })[mode]||"";
+}
+
+function applyDispatchLayoutToDom({invalidate=true}={}){
+  const grid=document.querySelector("#dispatchWorkspace");
+  if(!grid)return;
+
+  const prefs=normalizeDispatchLayout(S.dispatchLayout);
+  S.dispatchLayout=prefs;
+
+  grid.classList.remove(
+    "layout-classic",
+    "layout-units-left-calls-bottom",
+    "layout-calls-left-units-bottom"
+  );
+  grid.classList.add(`layout-${prefs.mode}`);
+  grid.style.setProperty("--dispatch-calls-size",`${prefs.callsSize}px`);
+  grid.style.setProperty("--dispatch-units-size",`${prefs.unitsSize}px`);
+  grid.style.setProperty("--dispatch-bottom-size",`${prefs.bottomSize}px`);
+
+  const label=document.querySelector("#layoutButton");
+  if(label)label.textContent=`Layout: ${dispatchLayoutModeLabel(prefs.mode)}`;
+
+  if(invalidate){
+    requestAnimationFrame(()=>{
+      S.map?.invalidateSize?.({pan:false});
+    });
+  }
+}
+
+function bindDispatchResizers(){
+  const grid=document.querySelector("#dispatchWorkspace");
+  if(!grid)return;
+
+  const begin=(handle,event)=>{
+    if(window.matchMedia("(max-width: 980px)").matches)return;
+    event.preventDefault();
+
+    const mode=S.dispatchLayout?.mode||"classic";
+    const rect=grid.getBoundingClientRect();
+    const pointerId=event.pointerId;
+    handle.setPointerCapture?.(pointerId);
+    document.body.classList.add("dispatch-resizing");
+
+    let frame=null;
+    const update=e=>{
+      if(frame)return;
+      frame=requestAnimationFrame(()=>{
+        frame=null;
+
+        if(handle.dataset.resize==="a"){
+          if(mode==="units-left-calls-bottom"){
+            S.dispatchLayout.unitsSize=Math.max(220,Math.min(520,e.clientX-rect.left));
+          }else{
+            S.dispatchLayout.callsSize=Math.max(220,Math.min(520,e.clientX-rect.left));
+          }
+        }else{
+          if(mode==="classic"){
+            S.dispatchLayout.unitsSize=Math.max(220,Math.min(520,rect.right-e.clientX));
+          }else{
+            S.dispatchLayout.bottomSize=Math.max(170,Math.min(480,rect.bottom-e.clientY));
+          }
+        }
+
+        applyDispatchLayoutToDom({invalidate:false});
+      });
+    };
+
+    const finish=()=>{
+      if(frame){
+        cancelAnimationFrame(frame);
+        frame=null;
+      }
+      handle.removeEventListener("pointermove",update);
+      handle.removeEventListener("pointerup",finish);
+      handle.removeEventListener("pointercancel",finish);
+      document.body.classList.remove("dispatch-resizing");
+      saveDispatchLayout();
+      S.map?.invalidateSize?.({pan:false});
+    };
+
+    handle.addEventListener("pointermove",update);
+    handle.addEventListener("pointerup",finish);
+    handle.addEventListener("pointercancel",finish);
+  };
+
+  document.querySelectorAll("#dispatchWorkspace .dispatch-resizer").forEach(handle=>{
+    handle.onpointerdown=e=>begin(handle,e);
+  });
+}
+
+function renderDispatchLayoutModal(){
+  const prefs=normalizeDispatchLayout(S.dispatchLayout||loadDispatchLayout());
+  S.incidentModalMode="layout";
+  const content=openIncidentModalShell();
+
+  content.innerHTML=`<div class="incident-modal-header">
+    <div>
+      <div class="incident-modal-eyebrow">DISPATCH WORKSPACE</div>
+      <div class="incident-modal-title-row"><h2 id="incidentModalTitle">Configure Layout</h2></div>
+      <div class="incident-modal-nature">Choose a workspace arrangement and resize the panels to fit this dispatcher.</div>
+    </div>
+    <button class="incident-modal-close" id="closeIncidentModal" aria-label="Close layout settings">×</button>
+  </div>
+
+  <div class="dispatch-layout-modal stack">
+    <div class="dispatch-layout-presets">
+      ${[
+        ["classic","Calls Left · Units Right","Three-column CAD"],
+        ["units-left-calls-bottom","Units Left · Calls Bottom","Map-focused operations"],
+        ["calls-left-units-bottom","Calls Left · Units Bottom","Call-focused operations"]
+      ].map(([mode,title,subtitle])=>`
+        <button class="dispatch-layout-card ${prefs.mode===mode?"active":""}" data-layout-mode="${mode}">
+          <span class="dispatch-layout-preview preview-${mode}">
+            <i class="preview-calls"></i><i class="preview-map"></i><i class="preview-units"></i>
+          </span>
+          <strong>${esc(title)}</strong>
+          <span>${esc(subtitle)}</span>
+        </button>
+      `).join("")}
+    </div>
+
+    <div class="card dispatch-layout-sizing">
+      <div class="row">
+        <div>
+          <div class="section-title">Panel Sizes</div>
+          <div class="small muted">You can also drag the divider handles directly on the CAD board.</div>
+        </div>
+        <button class="btn secondary" id="resetDispatchLayout">Reset Sizes</button>
+      </div>
+
+      <label>Active calls panel <span id="callsSizeValue">${Math.round(prefs.callsSize)} px</span></label>
+      <input type="range" id="callsSizeRange" min="220" max="520" step="10" value="${Math.round(prefs.callsSize)}">
+
+      <label>Units panel <span id="unitsSizeValue">${Math.round(prefs.unitsSize)} px</span></label>
+      <input type="range" id="unitsSizeRange" min="220" max="520" step="10" value="${Math.round(prefs.unitsSize)}">
+
+      <label>Bottom panel height <span id="bottomSizeValue">${Math.round(prefs.bottomSize)} px</span></label>
+      <input type="range" id="bottomSizeRange" min="170" max="480" step="10" value="${Math.round(prefs.bottomSize)}">
+    </div>
+
+    <div class="notice">
+      <strong id="layoutModeName">${esc(dispatchLayoutModeLabel(prefs.mode))}</strong><br>
+      <span id="layoutModeDescription">${esc(dispatchLayoutDescription(prefs.mode))}</span>
+    </div>
+
+    <div class="small muted">Layout preferences are saved for this user, event, and browser. They do not change another dispatcher's workstation.</div>
+  </div>
+
+  <div class="incident-modal-footer">
+    <button class="btn secondary" id="cancelLayoutSettings">Close</button>
+    <button class="btn" id="saveLayoutSettings">Save Layout</button>
+  </div>`;
+
+  const chooseMode=mode=>{
+    S.dispatchLayout=normalizeDispatchLayout({...S.dispatchLayout,mode});
+    document.querySelectorAll("[data-layout-mode]").forEach(btn=>btn.classList.toggle("active",btn.dataset.layoutMode===mode));
+    document.querySelector("#layoutModeName").textContent=dispatchLayoutModeLabel(mode);
+    document.querySelector("#layoutModeDescription").textContent=dispatchLayoutDescription(mode);
+    applyDispatchLayoutToDom();
+  };
+
+  document.querySelectorAll("[data-layout-mode]").forEach(btn=>btn.onclick=()=>chooseMode(btn.dataset.layoutMode));
+
+  const bindRange=(id,key,labelId)=>{
+    const input=document.querySelector(id);
+    input.oninput=()=>{
+      S.dispatchLayout=normalizeDispatchLayout({...S.dispatchLayout,[key]:Number(input.value)});
+      document.querySelector(labelId).textContent=`${Math.round(S.dispatchLayout[key])} px`;
+      applyDispatchLayoutToDom();
+    };
+  };
+  bindRange("#callsSizeRange","callsSize","#callsSizeValue");
+  bindRange("#unitsSizeRange","unitsSize","#unitsSizeValue");
+  bindRange("#bottomSizeRange","bottomSize","#bottomSizeValue");
+
+  document.querySelector("#resetDispatchLayout").onclick=()=>{
+    S.dispatchLayout=normalizeDispatchLayout({...DISPATCH_LAYOUT_DEFAULTS,mode:S.dispatchLayout?.mode||"classic"});
+    document.querySelector("#callsSizeRange").value=S.dispatchLayout.callsSize;
+    document.querySelector("#unitsSizeRange").value=S.dispatchLayout.unitsSize;
+    document.querySelector("#bottomSizeRange").value=S.dispatchLayout.bottomSize;
+    document.querySelector("#callsSizeValue").textContent=`${S.dispatchLayout.callsSize} px`;
+    document.querySelector("#unitsSizeValue").textContent=`${S.dispatchLayout.unitsSize} px`;
+    document.querySelector("#bottomSizeValue").textContent=`${S.dispatchLayout.bottomSize} px`;
+    applyDispatchLayoutToDom();
+  };
+
+  const close=()=>closeIncidentModal();
+  document.querySelector("#closeIncidentModal").onclick=close;
+  document.querySelector("#cancelLayoutSettings").onclick=close;
+  document.querySelector("#saveLayoutSettings").onclick=()=>{
+    saveDispatchLayout();
+    applyDispatchLayoutToDom();
+    closeIncidentModal();
+  };
+}
 
 function dispatchScopeKey(){
   return `commcenter-dispatch-scope:${S.session?.user?.id||"staff"}:${S.eventId||"event"}`;
@@ -303,26 +557,49 @@ function landing(){
   document.querySelector("#staffAccess").onclick=()=>{S.mode="staff";route();};
 }
 
+
 function staffLogin(){
   app.innerHTML=`<div class="shell">${header("Command Login")}
-    <div class="center"><div class="card stack">
-      <h2>Dispatcher / Admin Login</h2>
-      <div><label>Email</label><input id="email" type="email" autocomplete="email"></div>
-      <div><label>Password</label><input id="password" type="password" autocomplete="current-password"></div>
-      <button class="btn" id="login">Sign in</button>
-      <button class="btn secondary" id="back">Back</button>
-      <div id="loginError" class="small muted"></div>
-    </div></div></div>`;
+    <div class="center">
+      <form class="card stack" id="staffLoginForm">
+        <h2>Dispatcher / Admin Login</h2>
+        <div><label for="email">Email</label><input id="email" name="email" type="email" autocomplete="email" required></div>
+        <div><label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" required></div>
+        <button class="btn" id="login" type="submit">Sign in</button>
+        <button class="btn secondary" id="back" type="button">Back</button>
+        <div id="loginError" class="small muted" role="alert" aria-live="polite"></div>
+      </form>
+    </div></div>`;
+
   document.querySelector("#back").onclick=()=>{S.mode=null;route();};
-  document.querySelector("#login").onclick=async()=>{
-    const {error}=await supabase.auth.signInWithPassword({
-      email:document.querySelector("#email").value.trim(),
-      password:document.querySelector("#password").value
-    });
-    if(error)document.querySelector("#loginError").textContent=error.message;
-    else route();
-  };
+
+  document.querySelector("#staffLoginForm").addEventListener("submit",async e=>{
+    e.preventDefault();
+
+    const email=document.querySelector("#email").value.trim();
+    const password=document.querySelector("#password").value;
+    const button=document.querySelector("#login");
+    const errorHost=document.querySelector("#loginError");
+
+    errorHost.textContent="";
+    button.disabled=true;
+    button.textContent="Signing in…";
+
+    const {error}=await supabase.auth.signInWithPassword({email,password});
+
+    if(error){
+      errorHost.textContent=error.message;
+      button.disabled=false;
+      button.textContent="Sign in";
+      return;
+    }
+
+    route();
+  });
+
+  setTimeout(()=>document.querySelector("#email")?.focus(),0);
 }
+
 
 async function loadStaffContext(){
   const uid=S.session.user.id;
@@ -996,6 +1273,7 @@ async function dispatchPage(){
 
   try{
     await loadEventOps();
+    loadDispatchLayout();
   }catch(err){
     console.error("CommCenter Pro dispatch load failed",err);
     app.innerHTML=`<div class="shell">${header("Dispatch Load Error")}
@@ -1010,18 +1288,28 @@ async function dispatchPage(){
   }
 
   app.innerHTML=`<div class="shell">${header(`${esc(S.event?.name||"Event")} · Unified Dispatch`)}
-    <div class="cad-grid">
-      <aside class="panel left">
+    <div
+      class="cad-grid dispatch-workspace layout-${esc(S.dispatchLayout.mode)}"
+      id="dispatchWorkspace"
+      style="--dispatch-calls-size:${Math.round(S.dispatchLayout.callsSize)}px;--dispatch-units-size:${Math.round(S.dispatchLayout.unitsSize)}px;--dispatch-bottom-size:${Math.round(S.dispatchLayout.bottomSize)}px"
+    >
+      <aside class="panel calls-panel">
         <button class="btn block" id="newIncident">+ New Incident</button>
         <button class="btn secondary block dispatch-scope-button" id="dispatchScopeBtn">Dispatching: ${esc(scopeLabel())}</button>
         <div class="section-title">Active incidents</div><div id="incidentList">${incidentList()}</div>
       </aside>
-      <div class="map-wrap">
+
+      <div class="dispatch-resizer dispatch-resizer-a" data-resize="a" aria-hidden="true"></div>
+
+      <div class="map-wrap map-panel">
         <div class="map-level-toolbar"><span class="section-title">Map Layer</span><select id="dispatchLayerSelect">${S.mapLayers.filter(l=>l.status==="published").map(l=>`<option value="${l.id}" ${l.id===S.activeMapLayerId?"selected":""}>${esc(l.name)}${l.level_code?` · ${esc(l.level_code)}`:""}</option>`).join("")}</select></div>
         <div class="map-pick-banner" id="mapPickBanner"></div>
         <div id="map"></div>
       </div>
-      <aside class="panel right">
+
+      <div class="dispatch-resizer dispatch-resizer-b" data-resize="b" aria-hidden="true"></div>
+
+      <aside class="panel units-panel">
         <div class="row"><div><div class="section-title">Units</div><div class="small muted">Select a unit to open controls.</div></div></div>
         <div id="unitList">${unitList()}</div>
       </aside>
@@ -1030,6 +1318,7 @@ async function dispatchPage(){
     <button class="btn secondary" id="poiFinderBtn">Find POI</button>
     <button class="btn secondary" id="addPoiBtn">Add POI</button>
     <button class="btn secondary" id="commandDisplayBtn">Command Display</button>
+    <button class="btn secondary" id="layoutButton">Layout: ${esc(dispatchLayoutModeLabel(S.dispatchLayout.mode))}</button>
     <button class="btn secondary" id="emsOpsBtn">EMS Ops</button>
     <button class="btn secondary" id="adminBtn">Event Admin</button>
     <button class="btn secondary" id="reportsBtn">Reports</button>
@@ -1038,6 +1327,7 @@ async function dispatchPage(){
   document.querySelector("#poiFinderBtn").onclick=()=>showPoiFinder();
   document.querySelector("#addPoiBtn").onclick=()=>startPoiPlacement();
   document.querySelector("#commandDisplayBtn").onclick=()=>commandDisplayPage();
+  document.querySelector("#layoutButton").onclick=()=>renderDispatchLayoutModal();
   document.querySelector("#emsOpsBtn").onclick=()=>renderEmsOps(app,{eventId:S.eventId,event:S.event,header,onBack:()=>dispatchPage(),onAdmin:()=>eventAdmin("ems")});
   document.querySelector("#adminBtn").onclick=()=>eventAdmin();
   document.querySelector("#reportsBtn").onclick=()=>reportsPage();
@@ -1047,6 +1337,8 @@ async function dispatchPage(){
   document.querySelector("#dispatchScopeBtn").onclick=()=>renderDispatchScopeModal();
   document.querySelector("#dispatchLayerSelect")?.addEventListener("change",e=>{S.activeMapLayerId=e.target.value;saveNavigationState();setupDispatchMap();});
   bindIncidentClicks();
+  applyDispatchLayoutToDom({invalidate:false});
+  bindDispatchResizers();
   ensureCallTimerTicker();
   ensureLocationAgeTicker();
   await setupDispatchMap();
@@ -3840,6 +4132,7 @@ function reset(){
   S.unitLocationMarkers.clear();
   S.emsUnitConfigs=[];
   S.treatmentAreas=[];
+  S.dispatchLayout=null;
   S.dispatchDepartmentIds=[];
   S.commandDepartmentIds=[];
   S.commandDisplayMode="calls";
