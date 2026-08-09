@@ -57,6 +57,16 @@ export async function renderMapBuilder(app,eventId,onBack){
 
   function controlHtml(){return points.map(p=>`<div class="cp-row"><div class="row"><strong>${esc(p.label)}</strong><button class="btn secondary" data-delcp="${p.id}">Delete</button></div><div class="small mono">${Number(p.latitude).toFixed(7)}, ${Number(p.longitude).toFixed(7)}</div><div class="small muted">${p.residual_m!=null?`error ${Number(p.residual_m).toFixed(2)} m`:"not calculated"}</div></div>`).join("")||`<div class="small muted">No control points on this layer.</div>`;}
   function metricHtml(){return coeff?`<div class="grid2"><div><div class="metric">${Number(activeLayer.georef_rmse_m||0).toFixed(2)} m</div><div class="small muted">RMSE</div></div><div><div class="metric">${Number(activeLayer.georef_max_error_m||0).toFixed(2)} m</div><div class="small muted">Max</div></div></div>`:"";}
+  function poiMapIcon(){
+    return L.divIcon({
+      className:"cc-leaflet-div-icon",
+      html:`<span class="cc-map-pin cc-poi-pin" aria-hidden="true"><span class="cc-map-pin-dot"></span></span>`,
+      iconSize:[26,32],
+      iconAnchor:[13,31],
+      tooltipAnchor:[0,-28]
+    });
+  }
+
   function zoneHtml(){return currentZones().map(z=>`<div class="poi-row"><div class="row"><strong>${esc(z.name)}</strong><span class="badge">${esc(z.short_name||"")}</span></div></div>`).join("")||`<div class="small muted">No zones on this level.</div>`;}
   function poiHtml(){return currentPois().map(p=>{const z=zones.find(x=>x.id===p.zone_id);return `<div class="poi-row"><div class="row"><strong>${esc(p.name)}</strong><span class="badge">${p.poi_scope==="venue_snapshot"?"Venue":"Event"}</span></div><span class="small muted">${esc(z?.name||"")}</span></div>`;}).join("")||`<div class="small muted">No POIs on this level.</div>`;}
   function accessHtml(){return accessPoints.map(ap=>{const linked=accessNodes.filter(n=>n.access_point_id===ap.id).map(n=>layers.find(l=>l.id===n.map_layer_id)?.short_name||layers.find(l=>l.id===n.map_layer_id)?.name).filter(Boolean);return `<div class="poi-row"><strong>${esc(ap.name)}</strong> <span class="badge">${esc(ap.access_type)}</span><br><span class="small muted">${esc(linked.join(" ↕ "))}</span></div>`;}).join("")||`<div class="small muted">No vertical access points yet.</div>`;}
@@ -83,7 +93,7 @@ export async function renderMapBuilder(app,eventId,onBack){
 
   async function setupMap(){if(map){map.remove();map=null;}map=L.map("builderMap",{crs:L.CRS.Simple,minZoom:-4,maxZoom:5,zoomSnap:.25,attributionControl:false});layerGroup=L.layerGroup().addTo(map);if(!activeLayer?.rendered_image_path){map.setView([0,0],0);return;}const url=await signedMapUrl(activeLayer.rendered_image_path);const bounds=[[0,0],[activeLayer.image_height,activeLayer.image_width]];L.imageOverlay(url,bounds).addTo(map);map.fitBounds(bounds);
     for(const cp of points)L.circleMarker(pixelToLeaflet(cp.map_x,cp.map_y,activeLayer.image_height),{radius:6}).addTo(layerGroup).bindTooltip(`CP: ${cp.label}`);
-    for(const p of currentPois())L.marker(pixelToLeaflet(p.map_x,p.map_y,activeLayer.image_height)).addTo(layerGroup).bindTooltip(p.name);
+    for(const p of currentPois())L.marker(pixelToLeaflet(p.map_x,p.map_y,activeLayer.image_height),{icon:poiMapIcon()}).addTo(layerGroup).bindTooltip(p.name,{direction:"top",offset:[0,-4]});
     for(const n of accessNodes.filter(n=>n.map_layer_id===activeLayer.id)){const ap=accessPoints.find(a=>a.id===n.access_point_id);L.circleMarker(pixelToLeaflet(n.map_x,n.map_y,activeLayer.image_height),{radius:7}).addTo(layerGroup).bindTooltip(`${ap?.name||"Access"} · ${ap?.access_type||""}`);}
     map.on("click",async e=>{const px=leafletToPixel(e.latlng,activeLayer.image_height);if(clickMode==="control"){clickMode=null;showControlForm(px);}else if(clickMode==="poi"){clickMode=null;await showPoiForm(px);}else if(clickMode==="access"){clickMode=null;await showAccessForm(px);}});
   }

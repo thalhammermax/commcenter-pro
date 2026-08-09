@@ -1340,3 +1340,37 @@ body.modal-open{
   align-self:center;
   max-width:220px;
 }
+
+
+/* v0.7.4 — self-contained map pins; no Leaflet marker image asset required */
+.cc-leaflet-div-icon{
+  background:transparent !important;
+  border:0 !important;
+}
+.cc-map-pin{
+  position:relative;
+  display:block;
+  width:22px;
+  height:22px;
+  border:2px solid #fff;
+  border-radius:50% 50% 50% 0;
+  transform:rotate(-45deg);
+  box-shadow:0 2px 7px rgba(0,0,0,.55);
+}
+.cc-map-pin-dot{
+  position:absolute;
+  top:6px;
+  left:6px;
+  width:6px;
+  height:6px;
+  border-radius:50%;
+  background:#fff;
+}
+.cc-poi-pin{background:#2563eb;}
+.cc-field-incident-pin{
+  width:24px;
+  height:24px;
+  background:#dc2626;
+}
+.cc-field-incident-pin .cc-map-pin-dot{top:7px;left:7px;}
+.leaflet-marker-icon.cc-leaflet-div-icon{overflow:visible;}

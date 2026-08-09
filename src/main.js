@@ -652,6 +652,27 @@ function zoneName(id){return S.zones.find(z=>z.id===id)?.name||"";}
 function layerName(id){return S.mapLayers.find(l=>l.id===id)?.name||"";}
 
 
+
+function poiMapIcon(){
+  return L.divIcon({
+    className:"cc-leaflet-div-icon",
+    html:`<span class="cc-map-pin cc-poi-pin" aria-hidden="true"><span class="cc-map-pin-dot"></span></span>`,
+    iconSize:[26,32],
+    iconAnchor:[13,31],
+    tooltipAnchor:[0,-28]
+  });
+}
+
+function fieldIncidentMapIcon(){
+  return L.divIcon({
+    className:"cc-leaflet-div-icon",
+    html:`<span class="cc-map-pin cc-field-incident-pin" aria-hidden="true"><span class="cc-map-pin-dot"></span></span>`,
+    iconSize:[28,34],
+    iconAnchor:[14,33],
+    popupAnchor:[0,-30]
+  });
+}
+
 function poiSearchText(p){
   return [
     p.name,
@@ -944,9 +965,9 @@ async function handleRealtimePoiInsert(payload){
 
   const layer=activeMapLayer();
   if(S.map&&layer&&data.map_layer_id===layer.id&&data.map_x!=null&&data.map_y!=null){
-    L.marker(pixelToLeaflet(data.map_x,data.map_y,layer.image_height))
+    L.marker(pixelToLeaflet(data.map_x,data.map_y,layer.image_height),{icon:poiMapIcon()})
       .addTo(S.map)
-      .bindTooltip(data.name);
+      .bindTooltip(data.name,{direction:"top",offset:[0,-4]});
   }
 
   const count=S.incidentModalMode==="poi-search"
@@ -2002,7 +2023,7 @@ async function setupDispatchMap(){
   L.imageOverlay(url,bounds).addTo(S.map);S.map.fitBounds(bounds);
 
   for(const p of S.pois.filter(p=>p.map_layer_id===layer.id)){
-    L.marker(pixelToLeaflet(p.map_x,p.map_y,layer.image_height)).addTo(S.map).bindTooltip(p.name);
+    L.marker(pixelToLeaflet(p.map_x,p.map_y,layer.image_height),{icon:poiMapIcon()}).addTo(S.map).bindTooltip(p.name,{direction:"top",offset:[0,-4]});
   }
   for(const n of S.accessNodes.filter(n=>n.map_layer_id===layer.id)){
     const ap=S.accessPoints.find(a=>a.id===n.access_point_id);
@@ -3466,7 +3487,7 @@ async function showFieldMap(incident){
 
   if(incident.map_x!=null&&incident.map_y!=null){
     const pt=pixelToLeaflet(incident.map_x,incident.map_y,m.image_height);
-    L.marker(pt).addTo(map).bindPopup(`${esc(incident.incident_number)}<br>${esc(incident.landmark||"")}`).openPopup();
+    L.marker(pt,{icon:fieldIncidentMapIcon()}).addTo(map).bindPopup(`${esc(incident.incident_number)}<br>${esc(incident.landmark||"")}`).openPopup();
     map.setView(pt,0);
   }else{
     map.fitBounds([[0,0],[m.image_height,m.image_width]]);
