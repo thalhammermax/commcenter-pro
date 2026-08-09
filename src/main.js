@@ -14,7 +14,19 @@ const S={
   fieldSession:null,currentLocation:null,isPlatformAdmin:false,callTimerInterval:null,
   unitLocations:[],unitLocationMarkers:new Map(),locationAgeInterval:null,
   locationWatchId:null,locationLastSentAt:0,locationLastSent:null,locationWriteInFlight:false,
-  openIncidentId:null,incidentModalMode:null
+  openIncidentId:null,incidentModalMode:null,
+  dispatchDepartmentIds:[],
+  commandDepartmentIds:[],
+  commandDisplayMode:"calls",
+  commandActiveMapLayerId:null,
+  commandMap:null,
+  commandMapGeneration:0,
+  commandIncidentLayer:null,
+  commandUnitLayer:null,
+  commandRefreshTimer:null,
+  commandClockInterval:null,
+  mapPickMode:null,
+  pendingIncidentDraft:null
 };
 
 const esc=(v="")=>String(v).replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m]));
@@ -88,6 +100,133 @@ function departmentStatusPicker(name,selected=DEFAULT_DEPARTMENT_STATUSES){
 
 function selectedDepartmentStatuses(name){
   return [...document.querySelectorAll(`input[name="${name}"]:checked`)].map(el=>el.value);
+}
+
+
+function dispatchScopeKey(){
+  return `commcenter-dispatch-scope:${S.session?.user?.id||"staff"}:${S.eventId||"event"}`;
+}
+function commandDisplayKey(){
+  return `commcenter-command-display:${S.session?.user?.id||"staff"}:${S.eventId||"event"}`;
+}
+function normalizeDepartmentSelection(ids){
+  const valid=new Set(S.departments.map(d=>d.id));
+  return [...new Set((Array.isArray(ids)?ids:[]).filter(id=>valid.has(id)))];
+}
+function loadDispatchScope(){
+  let ids=[];
+  try{
+    const raw=localStorage.getItem(dispatchScopeKey());
+    if(raw)ids=JSON.parse(raw);
+  }catch{}
+  ids=normalizeDepartmentSelection(ids);
+  S.dispatchDepartmentIds=ids.length?ids:S.departments.map(d=>d.id);
+  saveDispatchScope();
+}
+function saveDispatchScope(){
+  try{localStorage.setItem(dispatchScopeKey(),JSON.stringify(S.dispatchDepartmentIds));}catch{}
+}
+function dispatchScopeDepartments(){
+  const selected=new Set(S.dispatchDepartmentIds);
+  return S.departments.filter(d=>selected.has(d.id));
+}
+function incidentDepartmentIds(i){
+  return (i.incident_departments||[]).map(link=>link.department_id).filter(Boolean);
+}
+function incidentMatchesDepartments(i,departmentIds){
+  const selected=new Set(departmentIds||[]);
+  return selected.size>0&&incidentDepartmentIds(i).some(id=>selected.has(id));
+}
+function incidentInDispatchScope(i){
+  return incidentMatchesDepartments(i,S.dispatchDepartmentIds);
+}
+function unitInDispatchScope(u){
+  return S.dispatchDepartmentIds.includes(u.department_id);
+}
+function scopeLabel(ids=S.dispatchDepartmentIds){
+  const selected=S.departments.filter(d=>ids.includes(d.id));
+  if(!selected.length)return "None";
+  if(selected.length===S.departments.length)return "All Departments";
+  return selected.map(d=>d.short_name||d.name).join(" + ");
+}
+function loadCommandDisplayPreferences(){
+  let saved=null;
+  try{
+    const raw=localStorage.getItem(commandDisplayKey());
+    if(raw)saved=JSON.parse(raw);
+  }catch{}
+  const selected=normalizeDepartmentSelection(saved?.departmentIds||S.dispatchDepartmentIds);
+  S.commandDepartmentIds=selected.length?selected:S.departments.map(d=>d.id);
+  S.commandDisplayMode=["calls","map","split"].includes(saved?.mode)?saved.mode:"calls";
+  S.commandActiveMapLayerId=
+    S.mapLayers.some(l=>l.id===saved?.mapLayerId&&l.status==="published")
+      ? saved.mapLayerId
+      : (S.activeMapLayerId||S.mapLayers.find(l=>l.is_default&&l.status==="published")?.id||S.mapLayers.find(l=>l.status==="published")?.id||null);
+}
+function saveCommandDisplayPreferences(){
+  try{
+    localStorage.setItem(commandDisplayKey(),JSON.stringify({
+      departmentIds:S.commandDepartmentIds,
+      mode:S.commandDisplayMode,
+      mapLayerId:S.commandActiveMapLayerId
+    }));
+  }catch{}
+}
+
+function commandViewRequested(){
+  try{return new URLSearchParams(window.location.search).get("view")==="command";}catch{return false;}
+}
+function setCommandViewUrl(active){
+  try{
+    const url=new URL(window.location.href);
+    if(active)url.searchParams.set("view","command");
+    else url.searchParams.delete("view");
+    history.replaceState(null,"",url);
+  }catch{}
+}
+
+function renderDispatchScopeModal(){
+  const content=openIncidentModalShell();
+  S.incidentModalMode="scope";
+  content.innerHTML=`<div class="incident-modal-header">
+    <div>
+      <div class="incident-modal-eyebrow">DISPATCH WORKSTATION</div>
+      <div class="incident-modal-title-row"><h2 id="incidentModalTitle">Dispatch Scope</h2></div>
+      <div class="incident-modal-nature">Choose the department(s) this console is actively dispatching.</div>
+    </div>
+    <button class="incident-modal-close" id="closeIncidentModal" aria-label="Close dispatch scope">×</button>
+  </div>
+  <div class="dispatch-scope-modal">
+    <p class="muted">This filters the active-call board, unit board, dispatch map, and the default departments on every new call. Unified dispatchers can select multiple departments.</p>
+    <div class="dispatch-scope-grid">
+      ${S.departments.map(d=>`<label class="status-select-option">
+        <input type="checkbox" name="dispatchScopeDept" value="${d.id}" ${S.dispatchDepartmentIds.includes(d.id)?"checked":""}>
+        <span><strong>${esc(d.name)}</strong>${d.short_name?`<br><span class="small muted">${esc(d.short_name)}</span>`:""}</span>
+      </label>`).join("")}
+    </div>
+  </div>
+  <div class="incident-modal-footer">
+    <button class="btn secondary" id="scopeAll">Select All</button>
+    <button class="btn secondary" id="scopeCancel">Cancel</button>
+    <button class="btn" id="scopeSave">Use Selected Departments</button>
+  </div>`;
+  document.querySelector("#closeIncidentModal").onclick=()=>closeIncidentModal();
+  document.querySelector("#scopeCancel").onclick=()=>closeIncidentModal();
+  document.querySelector("#scopeAll").onclick=()=>document.querySelectorAll('input[name="dispatchScopeDept"]').forEach(el=>el.checked=true);
+  document.querySelector("#scopeSave").onclick=()=>{
+    const ids=[...document.querySelectorAll('input[name="dispatchScopeDept"]:checked')].map(el=>el.value);
+    if(!ids.length)return alert("Select at least one department.");
+    S.dispatchDepartmentIds=normalizeDepartmentSelection(ids);
+    saveDispatchScope();
+    closeIncidentModal();
+    refreshDispatchBoards();
+    updateDispatchScopeUi();
+    setupDispatchMap();
+  };
+}
+function updateDispatchScopeUi(){
+  const button=document.querySelector("#dispatchScopeBtn");
+  if(button)button.textContent=`Dispatching: ${scopeLabel()}`;
 }
 
 const NAV_STATE_KEY="commcenter-pro-navigation-v1";
@@ -230,7 +369,7 @@ async function staffFlow(){
 
   saveNavigationState();
   if(!S.eventId)return eventPicker();
-  return dispatchPage();
+  return commandViewRequested()?commandDisplayPage():dispatchPage();
 }
 
 function orgPicker(){
@@ -280,7 +419,7 @@ function eventPicker(){
   document.querySelector("#orgSettings").onclick=()=>organizationStaffPage();
   document.querySelector("#venueLibrary").onclick=()=>venueLibraryPage();
   document.querySelector("#newEvent").onclick=()=>newEventForm();
-  document.querySelectorAll("[data-event]").forEach(b=>b.onclick=()=>{S.eventId=b.dataset.event;saveNavigationState();dispatchPage();});
+  document.querySelectorAll("[data-event]").forEach(b=>b.onclick=()=>{S.eventId=b.dataset.event;saveNavigationState();commandViewRequested()?commandDisplayPage():dispatchPage();});
 }
 
 
@@ -496,6 +635,7 @@ async function loadEventOps(){
   const preferred=S.mapLayers.find(l=>l.id===S.activeMapLayerId);
   const fallback=S.mapLayers.find(l=>l.is_default&&l.status==="published")||S.mapLayers.find(l=>l.status==="published")||S.mapLayers[0]||null;
   S.activeMapLayerId=(preferred||fallback)?.id||null;
+  loadDispatchScope();
 }
 
 function activeMapLayer(){return S.mapLayers.find(l=>l.id===S.activeMapLayerId)||null;}
@@ -600,6 +740,7 @@ function showPoiFinder(){
   if(!detail)return;
   detail.innerHTML=`<div class="card stack" data-dispatch-editor="poi-search">
     <div class="row"><strong>Find POI</strong><span class="badge">${S.pois.length} locations</span></div>
+    <button class="btn secondary" id="addPoiFromMap">+ Add POI from Map</button>
     <div>
       <label>Search name, alias, category, level, zone or W3W</label>
       <input id="dispatcherPoiSearch" autocomplete="off" placeholder="e.g. Main Medical, Section 312, Gate 4…">
@@ -607,6 +748,8 @@ function showPoiFinder(){
     </div>
     <div id="dispatcherPoiSelected" class="small muted">Start typing to search event POIs.</div>
   </div>`;
+
+  document.querySelector("#addPoiFromMap").onclick=()=>startPoiPlacement();
 
   bindPoiSearch({
     inputId:"dispatcherPoiSearch",
@@ -631,6 +774,163 @@ function showPoiFinder(){
       await focusPoiOnMap(p);
     }
   });
+}
+
+
+function showMapPickBanner(message){
+  const banner=document.querySelector("#mapPickBanner");
+  if(!banner)return;
+  banner.innerHTML=`<strong>${esc(message)}</strong><button class="btn secondary" id="cancelMapPick">Cancel</button>`;
+  banner.classList.add("active");
+  document.querySelector("#cancelMapPick").onclick=()=>{
+    S.mapPickMode=null;
+    S.pendingIncidentDraft=null;
+    hideMapPickBanner();
+  };
+}
+function hideMapPickBanner(){
+  const banner=document.querySelector("#mapPickBanner");
+  if(!banner)return;
+  banner.classList.remove("active");
+  banner.innerHTML="";
+}
+function startPoiPlacement(){
+  const layer=activeMapLayer();
+  if(!layer?.georef_coefficients)return alert("The selected map layer must be calibrated before Dispatch can place a POI from a map click.");
+  closeIncidentModal();
+  S.mapPickMode="poi";
+  S.pendingIncidentDraft=null;
+  showMapPickBanner("Click the event map where the new POI should be placed.");
+}
+function collectNewIncidentDraft(){
+  const modal=document.querySelector("[data-incident-modal-mode='new']");
+  if(!modal)return null;
+  return {
+    callType:document.querySelector("#callType")?.value||"",
+    priority:document.querySelector("#priority")?.value||"Standard",
+    landmark:document.querySelector("#landmark")?.value||"",
+    notes:document.querySelector("#notes")?.value||"",
+    departmentIds:[...document.querySelectorAll('input[name="dept"]:checked')].map(x=>x.value),
+    initialUnitIds:[...document.querySelectorAll('input[name="initialUnit"]:checked')].map(x=>x.value)
+  };
+}
+function startIncidentMapPlacement(){
+  const layer=activeMapLayer();
+  if(!layer?.georef_coefficients)return alert("The selected map layer must be calibrated before a location can be selected from the map.");
+  S.pendingIncidentDraft=collectNewIncidentDraft();
+  S.mapPickMode="incident";
+  closeIncidentModal();
+  showMapPickBanner("Click the map to set the incident location. Your unfinished call form is preserved.");
+}
+async function dispatcherPoiForm(loc,{returnToFinder=false}={}){
+  if(!loc)return;
+  S.incidentModalMode="poi-create";
+  const content=openIncidentModalShell();
+  const zones=S.zones.filter(z=>!loc.map_layer_id||z.map_layer_id===loc.map_layer_id);
+
+  content.innerHTML=`<div class="incident-modal-header">
+    <div>
+      <div class="incident-modal-eyebrow">DISPATCH MAP</div>
+      <div class="incident-modal-title-row"><h2 id="incidentModalTitle">Add POI</h2></div>
+      <div class="incident-modal-nature">Save an event location without opening Event Admin.</div>
+    </div>
+    <button class="incident-modal-close" id="closeIncidentModal" aria-label="Close POI form">×</button>
+  </div>
+  <div class="dispatcher-poi-form stack">
+    <div class="grid2">
+      <div><label>POI Name</label><input id="dispatchPoiName" autofocus placeholder="Aid Station North / Gate C / Section 312"></div>
+      <div><label>Category</label><select id="dispatchPoiCategory">
+        <option>Medical</option><option>Command</option><option>Security</option><option>Gate</option>
+        <option>Portal</option><option>Seating Section</option><option>Concession</option><option>Restroom</option>
+        <option>Production</option><option>Staging</option><option>Other</option>
+      </select></div>
+    </div>
+    <div><label>Zone</label><select id="dispatchPoiZone"><option value="">No zone</option>${zones.map(z=>`<option value="${z.id}">${esc(z.name)}</option>`).join("")}</select></div>
+    <div><label>Aliases</label><input id="dispatchPoiAliases" placeholder="Comma separated: North Med, Aid 2"></div>
+    <div><label>Operational Notes</label><textarea id="dispatchPoiNotes" rows="4" placeholder="Access instructions, nearest portal, radio/common name…"></textarea></div>
+    <div class="notice">
+      <strong>${esc(layerName(loc.map_layer_id)||"Event Map")}</strong><br>
+      ${loc.w3w?`///${esc(loc.w3w)}<br>`:""}
+      <span class="small mono">${Number(loc.latitude).toFixed(6)}, ${Number(loc.longitude).toFixed(6)}</span>
+    </div>
+    <div class="small muted">Dispatcher-created POIs are event-only. They do not automatically change the reusable organization Venue Library.</div>
+  </div>
+  <div class="incident-modal-footer">
+    <button class="btn secondary" id="cancelDispatchPoi">Cancel</button>
+    <button class="btn" id="saveDispatchPoi">Save POI</button>
+  </div>`;
+
+  const cancel=()=>{
+    closeIncidentModal();
+    if(returnToFinder)showPoiFinder();
+  };
+  document.querySelector("#closeIncidentModal").onclick=cancel;
+  document.querySelector("#cancelDispatchPoi").onclick=cancel;
+
+  document.querySelector("#saveDispatchPoi").onclick=async()=>{
+    const name=document.querySelector("#dispatchPoiName").value.trim();
+    if(!name)return alert("Enter a POI name.");
+    const aliases=document.querySelector("#dispatchPoiAliases").value.split(",").map(x=>x.trim()).filter(Boolean);
+    const button=document.querySelector("#saveDispatchPoi");
+    button.disabled=true;button.textContent="Saving…";
+
+    const {data,error}=await supabase.rpc("dispatcher_create_poi",{
+      p_event_id:S.eventId,
+      p_name:name,
+      p_category:document.querySelector("#dispatchPoiCategory").value,
+      p_map_layer_id:loc.map_layer_id||S.activeMapLayerId||null,
+      p_zone_id:document.querySelector("#dispatchPoiZone").value||null,
+      p_latitude:loc.latitude,
+      p_longitude:loc.longitude,
+      p_map_x:loc.map_x,
+      p_map_y:loc.map_y,
+      p_w3w:loc.w3w||null,
+      p_notes:document.querySelector("#dispatchPoiNotes").value.trim()||null,
+      p_aliases:aliases
+    });
+    if(error){
+      button.disabled=false;button.textContent="Save POI";
+      return alert(error.message);
+    }
+
+    const {data:poi,error:fetchError}=await supabase.from("event_pois").select("*,poi_aliases(alias)").eq("id",data).single();
+    if(fetchError){
+      await loadEventOps();
+    }else{
+      const existing=S.pois.findIndex(p=>p.id===poi.id);
+      if(existing>=0)S.pois[existing]=poi;else S.pois.push(poi);
+      S.pois.sort((a,b)=>a.name.localeCompare(b.name));
+    }
+
+    closeIncidentModal();
+    await setupDispatchMap();
+    if(returnToFinder)showPoiFinder();
+  };
+}
+
+
+async function handleRealtimePoiInsert(payload){
+  const id=payload?.new?.id;
+  if(!id)return;
+  // Alias rows may be inserted immediately after the POI row. A short delay
+  // lets the search cache pick them up as part of the same operational action.
+  await new Promise(resolve=>setTimeout(resolve,150));
+  const {data,error}=await supabase.from("event_pois").select("*,poi_aliases(alias)").eq("id",id).maybeSingle();
+  if(error||!data)return;
+
+  const index=S.pois.findIndex(p=>p.id===data.id);
+  if(index>=0)S.pois[index]=data;else S.pois.push(data);
+  S.pois.sort((a,b)=>a.name.localeCompare(b.name));
+
+  const layer=activeMapLayer();
+  if(S.map&&layer&&data.map_layer_id===layer.id&&data.map_x!=null&&data.map_y!=null){
+    L.marker(pixelToLeaflet(data.map_x,data.map_y,layer.image_height))
+      .addTo(S.map)
+      .bindTooltip(`${data.name}${data.w3w?` · ///${data.w3w}`:""}`);
+  }
+
+  const count=document.querySelector('[data-dispatch-editor="poi-search"] .badge');
+  if(count)count.textContent=`${S.pois.length} locations`;
 }
 
 async function storageSigned(path,seconds=3600){
@@ -670,29 +970,39 @@ async function dispatchPage(){
     <div class="cad-grid">
       <aside class="panel left">
         <button class="btn block" id="newIncident">+ New Incident</button>
+        <button class="btn secondary block dispatch-scope-button" id="dispatchScopeBtn">Dispatching: ${esc(scopeLabel())}</button>
         <div class="section-title">Active incidents</div><div id="incidentList">${incidentList()}</div>
       </aside>
-      <div class="map-wrap"><div class="map-level-toolbar"><span class="section-title">Map Layer</span><select id="dispatchLayerSelect">${S.mapLayers.filter(l=>l.status==="published").map(l=>`<option value="${l.id}" ${l.id===S.activeMapLayerId?"selected":""}>${esc(l.name)}${l.level_code?` · ${esc(l.level_code)}`:""}</option>`).join("")}</select></div><div id="map"></div></div>
+      <div class="map-wrap">
+        <div class="map-level-toolbar"><span class="section-title">Map Layer</span><select id="dispatchLayerSelect">${S.mapLayers.filter(l=>l.status==="published").map(l=>`<option value="${l.id}" ${l.id===S.activeMapLayerId?"selected":""}>${esc(l.name)}${l.level_code?` · ${esc(l.level_code)}`:""}</option>`).join("")}</select></div>
+        <div class="map-pick-banner" id="mapPickBanner"></div>
+        <div id="map"></div>
+      </div>
       <aside class="panel right">
         <div class="row"><div class="section-title">Units</div></div>
         <div id="unitList">${unitList()}</div>
-        <div class="section-title">Incident detail</div><div id="detail" class="muted">Select an incident or click the map.</div>
+        <div class="section-title">Unit / Dispatch Tools</div><div id="detail" class="muted">Select a unit, search POIs, or use the map.</div>
       </aside>
     </div></div>`;
   document.querySelector("#topActions").innerHTML=`
     <button class="btn secondary" id="poiFinderBtn">Find POI</button>
+    <button class="btn secondary" id="addPoiBtn">Add POI</button>
+    <button class="btn secondary" id="commandDisplayBtn">Command Display</button>
     <button class="btn secondary" id="emsOpsBtn">EMS Ops</button>
     <button class="btn secondary" id="adminBtn">Event Admin</button>
     <button class="btn secondary" id="reportsBtn">Reports</button>
     <button class="btn secondary" id="eventsBtn">Events</button>
     <button class="btn secondary" id="logoutBtn">Sign out</button>`;
   document.querySelector("#poiFinderBtn").onclick=()=>showPoiFinder();
+  document.querySelector("#addPoiBtn").onclick=()=>startPoiPlacement();
+  document.querySelector("#commandDisplayBtn").onclick=()=>commandDisplayPage();
   document.querySelector("#emsOpsBtn").onclick=()=>renderEmsOps(app,{eventId:S.eventId,event:S.event,header,onBack:()=>dispatchPage(),onAdmin:()=>eventAdmin("ems")});
   document.querySelector("#adminBtn").onclick=()=>eventAdmin();
   document.querySelector("#reportsBtn").onclick=()=>reportsPage();
   document.querySelector("#eventsBtn").onclick=()=>{closeIncidentModal();S.eventId=null;staffFlow();};
   document.querySelector("#logoutBtn").onclick=async()=>{closeIncidentModal();await supabase.auth.signOut();S.mode=null;reset();clearNavigationState();route();};
   document.querySelector("#newIncident").onclick=()=>incidentForm(null);
+  document.querySelector("#dispatchScopeBtn").onclick=()=>renderDispatchScopeModal();
   document.querySelector("#dispatchLayerSelect")?.addEventListener("change",e=>{S.activeMapLayerId=e.target.value;saveNavigationState();setupDispatchMap();});
   bindIncidentClicks();
   ensureCallTimerTicker();
@@ -795,7 +1105,10 @@ function renderUnitLocationMarker(unitId){
 function renderAllUnitLocationMarkers(){
   S.unitLocationMarkers.forEach((_,unitId)=>removeUnitLocationMarker(unitId));
   S.unitLocationMarkers.clear();
-  for(const location of S.unitLocations)renderUnitLocationMarker(location.unit_id);
+  for(const location of S.unitLocations){
+    const unit=S.units.find(u=>u.id===location.unit_id);
+    if(unit&&unitInDispatchScope(unit))renderUnitLocationMarker(location.unit_id);
+  }
 }
 
 function updateDispatcherUnitLocation(payload){
@@ -815,7 +1128,9 @@ function updateDispatcherUnitLocation(payload){
   const index=S.unitLocations.findIndex(l=>l.unit_id===row.unit_id);
   if(index>=0)S.unitLocations[index]=row;
   else S.unitLocations.push(row);
-  renderUnitLocationMarker(row.unit_id);
+  const unit=S.units.find(u=>u.id===row.unit_id);
+  if(unit&&unitInDispatchScope(unit))renderUnitLocationMarker(row.unit_id);
+  else removeUnitLocationMarker(row.unit_id);
   updateUnitLocationBoardRow(row.unit_id);
 }
 
@@ -839,10 +1154,11 @@ function refreshLocationAges(){
     const location=unitLocation(unit.id);
     if(location){
       const freshness=locationFreshness(location);
-      if(freshness==="expired")removeUnitLocationMarker(unit.id);
+      if(freshness==="expired"||!unitInDispatchScope(unit))removeUnitLocationMarker(unit.id);
       else renderUnitLocationMarker(unit.id);
     }
   }
+  if(document.querySelector("#commandDisplayShell"))renderCommandUnitMarkers();
 }
 
 function ensureLocationAgeTicker(){
@@ -859,7 +1175,7 @@ function activeAssignmentForUnit(unitId){
 }
 
 function incidentList(){
-  return S.incidents.map(i=>{
+  return S.incidents.filter(incidentInDispatchScope).map(i=>{
     const deps=(i.incident_departments||[]).map(d=>d.event_departments?.short_name||d.event_departments?.name).filter(Boolean).join("/");
     const assigned=(i.incident_units||[]).filter(x=>!x.cleared_at).map(x=>x.units?.name).filter(Boolean);
     return `<div class="incident" data-incident="${i.id}">
@@ -873,7 +1189,7 @@ function incidentList(){
 
 function unitList(){
   const groups={};
-  for(const u of S.units){
+  for(const u of S.units.filter(unitInDispatchScope)){
     const name=u.event_departments?.name||"Other";
     (groups[name]??=[]).push(u);
   }
@@ -1359,6 +1675,7 @@ function refreshDispatchBoards(){
   const unitHost=document.querySelector("#unitList");
   if(incidentHost)incidentHost.innerHTML=incidentList();
   if(unitHost)unitHost.innerHTML=unitList();
+  updateDispatchScopeUi();
   bindIncidentClicks();
   refreshLocationAges();
 }
@@ -1397,7 +1714,7 @@ function selectUnit(unitId){
         <label>Assign to incident</label>
         <select id="unitIncident">
           <option value="">Choose active incident</option>
-          ${S.incidents.map(i=>`<option value="${i.id}">${esc(i.incident_number)} · ${esc(i.call_type)} · ${esc(i.landmark||"")}</option>`).join("")}
+          ${S.incidents.filter(incidentInDispatchScope).map(i=>`<option value="${i.id}">${esc(i.incident_number)} · ${esc(i.call_type)} · ${esc(i.landmark||"")}</option>`).join("")}
         </select>
       </div>
       <button class="btn" id="assignFromUnit">Assign to Incident</button>
@@ -1436,7 +1753,7 @@ async function setupDispatchMap(){
     const ap=S.accessPoints.find(a=>a.id===n.access_point_id);
     L.circleMarker(pixelToLeaflet(n.map_x,n.map_y,layer.image_height),{radius:6,className:"access-marker"}).addTo(S.map).bindTooltip(`${ap?.name||"Access"} · ${ap?.access_type||""}`);
   }
-  for(const i of S.incidents.filter(i=>!i.map_layer_id||i.map_layer_id===layer.id)){
+  for(const i of S.incidents.filter(i=>incidentInDispatchScope(i)&&(!i.map_layer_id||i.map_layer_id===layer.id))){
     if(i.map_x!=null&&i.map_y!=null)L.circleMarker(pixelToLeaflet(i.map_x,i.map_y,layer.image_height),{radius:8,className:"incident-marker"}).addTo(S.map).bindTooltip(i.incident_number);
   }
   renderAllUnitLocationMarkers();
@@ -1446,52 +1763,130 @@ async function setupDispatchMap(){
       const geo=pixelToGeo(px.x,px.y,layer.georef_coefficients);
       const {data:words}=await supabase.rpc("w3w_for_coordinate",{p_event_id:S.eventId,p_lat:geo.lat,p_lon:geo.lon});
       S.currentLocation={map_x:px.x,map_y:px.y,latitude:geo.lat,longitude:geo.lon,w3w:words||null,poi_id:null,landmark:"",map_layer_id:layer.id,zone_id:null};
-      L.popup().setLatLng(e.latlng).setContent(`<strong>${esc(layer.name)}</strong><br>${words?`///${esc(words)}<br>`:""}${geo.lat.toFixed(6)}, ${geo.lon.toFixed(6)}<br><br><button id="createAtPoint">Create incident here</button>`).openOn(S.map);
-      setTimeout(()=>document.querySelector("#createAtPoint")?.addEventListener("click",()=>incidentForm(S.currentLocation)),0);
+
+      if(S.mapPickMode==="incident"){
+        const draft=S.pendingIncidentDraft;
+        S.mapPickMode=null;S.pendingIncidentDraft=null;hideMapPickBanner();
+        incidentForm(S.currentLocation,draft);
+        return;
+      }
+      if(S.mapPickMode==="poi"){
+        S.mapPickMode=null;hideMapPickBanner();
+        dispatcherPoiForm(S.currentLocation);
+        return;
+      }
+
+      L.popup().setLatLng(e.latlng).setContent(
+        `<strong>${esc(layer.name)}</strong><br>${words?`///${esc(words)}<br>`:""}${geo.lat.toFixed(6)}, ${geo.lon.toFixed(6)}
+        <div class="map-popup-actions"><button id="createAtPoint">Create Incident Here</button><button id="addPoiAtPoint">Add POI Here</button></div>`
+      ).openOn(S.map);
+      setTimeout(()=>{
+        document.querySelector("#createAtPoint")?.addEventListener("click",()=>incidentForm(S.currentLocation));
+        document.querySelector("#addPoiAtPoint")?.addEventListener("click",()=>dispatcherPoiForm(S.currentLocation));
+      },0);
     });
   }
 }
 
 
-function incidentForm(loc){
-  const detail=document.querySelector("#detail");
 
-  detail.innerHTML=`<div class="card stack" data-dispatch-editor="new"><strong>New Incident</strong>
+function incidentForm(loc,draft=null){
+  S.openIncidentId=null;
+  S.incidentModalMode="new";
+
+  const detail=openIncidentModalShell();
+  const defaultDepartmentIds=normalizeDepartmentSelection(
+    draft?.departmentIds?.length?draft.departmentIds:S.dispatchDepartmentIds
+  );
+
+  detail.innerHTML=`<div class="incident-modal-header">
     <div>
-      <label>Search POI / Common Name</label>
-      <input id="poiSearchNew" autocomplete="off" placeholder="Search name, alias, section, gate, category…">
-      <div id="poiSearchNewResults" class="poi-search-results"></div>
+      <div class="incident-modal-eyebrow">NEW INCIDENT</div>
+      <div class="incident-modal-title-row"><h2 id="incidentModalTitle">Create Call</h2></div>
+      <div class="incident-modal-nature">Dispatching for ${esc(scopeLabel())}</div>
     </div>
+    <button class="incident-modal-close" id="closeIncidentModal" aria-label="Close new incident form">×</button>
+  </div>
 
-    <div><label>Departments</label>${S.departments.map(d=>`<label style="font-weight:500"><input type="checkbox" name="dept" value="${d.id}"> ${esc(d.name)}</label>`).join("")}</div>
-    <div><label>Call type</label><input id="callType" placeholder="Medical, disturbance, power issue…"></div>
-    <div><label>Priority</label><select id="priority"><option>Standard</option><option>Urgent</option><option>Critical</option></select></div>
-    <div><label>Location description</label><input id="landmark" value="${esc(loc?.landmark||"")}"></div>
-    <div><label>Dispatch notes</label><textarea id="notes" rows="4"></textarea></div>
-    <div id="locSummary" class="small muted">${loc?`${loc.map_layer_id?`${esc(layerName(loc.map_layer_id))} · `:""}${loc.w3w?`///${esc(loc.w3w)} · `:""}${Number(loc.latitude).toFixed(6)}, ${Number(loc.longitude).toFixed(6)}`:"Choose a POI or click the map first."}</div>
-
-    <div>
-      <div class="section-title">Initial unit assignment</div>
-      <div class="small muted" style="margin-bottom:7px">Optional. Select one or more unassigned units.</div>
-      <div class="create-unit-grid">
-        ${S.units.map(u=>{
-          const active=activeAssignmentForUnit(u.id);
-          return `<label class="create-unit-option ${active?"disabled":""}">
-            <input type="checkbox" name="initialUnit" value="${u.id}" ${active?"disabled":""}>
-            <span><strong>${esc(u.event_departments?.short_name||"")} · ${esc(u.name)}</strong><br>
-            <span class="small muted" data-create-unit-status="${u.id}">${esc(u.status.replaceAll("_"," "))}${active?` · ${esc(active.incident.incident_number)}`:""}</span></span>
-          </label>`;
-        }).join("")||`<div class="small muted">No units configured.</div>`}
+  <div class="new-incident-modal-body" data-incident-modal-mode="new">
+    <section class="new-incident-primary stack">
+      <div class="grid2">
+        <div><label>Call Type / Nature</label><input id="callType" autofocus placeholder="Medical, disturbance, power issue…" value="${esc(draft?.callType||"")}"></div>
+        <div><label>Priority</label><select id="priority">
+          ${["Standard","Urgent","Critical"].map(p=>`<option ${draft?.priority===p?"selected":(!draft&&p==="Standard"?"selected":"")}>${p}</option>`).join("")}
+        </select></div>
       </div>
-    </div>
 
-    <div class="grid2">
-      <button class="btn secondary" id="saveIncidentOnly">Create Without Assignment</button>
-      <button class="btn" id="saveAndDispatch">Create & Dispatch Selected</button>
-    </div>
+      <div>
+        <div class="row">
+          <label>Location / POI</label>
+          <button class="btn secondary compact" id="pickIncidentMapLocation">Pick on Map</button>
+        </div>
+        <input id="poiSearchNew" autocomplete="off" placeholder="Search name, alias, section, gate, category…">
+        <div id="poiSearchNewResults" class="poi-search-results"></div>
+      </div>
+
+      <div><label>Location Description</label><input id="landmark" value="${esc(loc?.landmark||draft?.landmark||"")}"></div>
+
+      <div class="notice">
+        <strong>Selected location</strong><br>
+        <span id="locSummary">${loc?`${loc.map_layer_id?`${esc(layerName(loc.map_layer_id))} · `:""}${loc.w3w?`///${esc(loc.w3w)} · `:""}${Number(loc.latitude).toFixed(6)}, ${Number(loc.longitude).toFixed(6)}`:"Search for a POI or choose Pick on Map."}</span>
+      </div>
+
+      <div><label>Dispatch Notes</label><textarea id="notes" rows="7" placeholder="Caller information, patient/problem description, access instructions, updates…">${esc(draft?.notes||"")}</textarea></div>
+    </section>
+
+    <aside class="new-incident-side stack">
+      <div>
+        <div class="section-title">Departments for this call</div>
+        <div class="small muted" style="margin-bottom:8px">Your dispatch scope is preselected automatically. Change this only when this call involves a different combination of departments.</div>
+        <div class="new-call-department-list">
+          ${S.departments.map(d=>`<label class="status-select-option">
+            <input type="checkbox" name="dept" value="${d.id}" ${defaultDepartmentIds.includes(d.id)?"checked":""}>
+            <span>${esc(d.name)}</span>
+          </label>`).join("")}
+        </div>
+      </div>
+
+      <div>
+        <div class="section-title">Initial Unit Assignment</div>
+        <div class="small muted" style="margin-bottom:7px">Available choices follow the departments selected for this call.</div>
+        <div class="create-unit-grid" id="newIncidentUnitChoices"></div>
+      </div>
+    </aside>
+  </div>
+
+  <div class="incident-modal-footer">
+    <button class="btn secondary" id="cancelNewIncident">Cancel</button>
+    <button class="btn secondary" id="saveIncidentOnly">Create Without Assignment</button>
+    <button class="btn" id="saveAndDispatch">Create & Dispatch Selected</button>
   </div>`;
 
   let chosen=loc?{...loc}:null;
+  let preservedUnitIds=new Set(draft?.initialUnitIds||[]);
+
+  const renderUnitChoices=()=>{
+    const selectedDeps=new Set([...document.querySelectorAll('input[name="dept"]:checked')].map(x=>x.value));
+    document.querySelectorAll('input[name="initialUnit"]:checked').forEach(x=>preservedUnitIds.add(x.value));
+
+    const units=S.units.filter(u=>selectedDeps.has(u.department_id));
+    const host=document.querySelector("#newIncidentUnitChoices");
+    host.innerHTML=units.map(u=>{
+      const active=activeAssignmentForUnit(u.id);
+      return `<label class="create-unit-option ${active?"disabled":""}">
+        <input type="checkbox" name="initialUnit" value="${u.id}" ${active?"disabled":""} ${!active&&preservedUnitIds.has(u.id)?"checked":""}>
+        <span><strong>${esc(u.event_departments?.short_name||"")} · ${esc(u.name)}</strong><br>
+        <span class="small muted" data-create-unit-status="${u.id}">${esc(u.status.replaceAll("_"," "))}${active?` · ${esc(active.incident.incident_number)}`:""}</span></span>
+      </label>`;
+    }).join("")||`<div class="small muted">No units are configured for the selected department(s).</div>`;
+  };
+
+  renderUnitChoices();
+  document.querySelectorAll('input[name="dept"]').forEach(el=>el.addEventListener("change",renderUnitChoices));
+
+  document.querySelector("#closeIncidentModal").onclick=()=>closeIncidentModal();
+  document.querySelector("#cancelNewIncident").onclick=()=>closeIncidentModal();
+  document.querySelector("#pickIncidentMapLocation").onclick=()=>startIncidentMapPlacement();
 
   bindPoiSearch({
     inputId:"poiSearchNew",
@@ -1505,18 +1900,25 @@ function incidentForm(loc){
   });
 
   const create=async(assignSelected)=>{
-    if(!chosen)return alert("Choose a POI or click the map to set the incident location.");
+    if(!chosen)return alert("Choose a POI or use Pick on Map to set the incident location.");
+
     const deps=[...document.querySelectorAll('input[name="dept"]:checked')].map(x=>x.value);
     if(!deps.length)return alert("Choose at least one department.");
+
+    const callType=document.querySelector("#callType").value.trim();
+    if(!callType)return alert("Enter a call type / nature.");
 
     const selectedUnits=assignSelected
       ? [...document.querySelectorAll('input[name="initialUnit"]:checked')].map(x=>x.value)
       : [];
 
+    const buttons=[document.querySelector("#saveIncidentOnly"),document.querySelector("#saveAndDispatch")];
+    buttons.forEach(b=>{if(b)b.disabled=true;});
+
     const {data,error}=await supabase.rpc("create_incident_v2",{
       p_event_id:S.eventId,
       p_department_ids:deps,
-      p_call_type:document.querySelector("#callType").value.trim()||"Other",
+      p_call_type:callType,
       p_priority:document.querySelector("#priority").value,
       p_latitude:chosen.latitude,
       p_longitude:chosen.longitude,
@@ -1531,6 +1933,7 @@ function incidentForm(loc){
     });
 
     if(error){
+      buttons.forEach(b=>{if(b)b.disabled=false;});
       console.error("CommCenter Pro create incident error",error);
       return alert(`Incident was NOT created.\n\n${error.message}${error.hint?`\n\nHint: ${error.hint}`:""}`);
     }
@@ -1543,8 +1946,11 @@ function incidentForm(loc){
       if(result.error)failures.push(result.error.message);
     }
 
-    await dispatchPage();
-    if(createdId)setTimeout(()=>selectIncident(createdId),50);
+    closeIncidentModal();
+    await loadEventOps();
+    refreshDispatchBoards();
+    await setupDispatchMap();
+    if(createdId)selectIncident(createdId);
 
     if(failures.length){
       alert(`Incident created, but one or more units could not be assigned:\n\n${failures.join("\n")}`);
@@ -1554,8 +1960,6 @@ function incidentForm(loc){
   document.querySelector("#saveIncidentOnly").onclick=()=>create(false);
   document.querySelector("#saveAndDispatch").onclick=()=>create(true);
 }
-
-
 
 function editIncidentForm(incidentId){
   const i=S.incidents.find(x=>x.id===incidentId);
@@ -1694,6 +2098,343 @@ function editIncidentForm(incidentId){
     refreshDispatchBoards();
     selectIncident(incidentId);
   };
+}
+
+
+/* ---------------- COMMAND CENTER DISPLAY ---------------- */
+
+function commandFilteredIncidents(){
+  return S.incidents.filter(i=>incidentMatchesDepartments(i,S.commandDepartmentIds));
+}
+function commandFilteredUnits(){
+  return S.units.filter(u=>S.commandDepartmentIds.includes(u.department_id));
+}
+function commandPriorityClass(priority){
+  const key=String(priority||"").toLowerCase();
+  if(key==="critical")return "command-priority-critical";
+  if(key==="urgent")return "command-priority-urgent";
+  return "command-priority-standard";
+}
+function commandCallCardsHtml(){
+  const incidents=commandFilteredIncidents();
+  return incidents.map(i=>{
+    const deps=(i.incident_departments||[])
+      .map(d=>d.event_departments?.short_name||d.event_departments?.name)
+      .filter(Boolean);
+    const assigned=(i.incident_units||[])
+      .filter(x=>!x.cleared_at)
+      .map(link=>{
+        const unit=S.units.find(u=>u.id===link.unit_id);
+        if(!unit)return "";
+        return `<span class="command-unit-chip"><strong>${esc(unit.name)}</strong> · ${esc(String(unit.status||"").replaceAll("_"," "))}</span>`;
+      }).filter(Boolean).join("");
+
+    return `<div class="command-call-card ${commandPriorityClass(i.priority)}">
+      <div class="command-call-head">
+        <div>
+          <div class="command-incident-number">${esc(i.incident_number)}</div>
+          <div class="command-call-nature">${esc(i.call_type)}</div>
+        </div>
+        <div class="command-call-head-right">
+          <span class="badge">${esc(i.priority)}</span>
+          <span class="command-elapsed" data-call-start="${esc(i.created_at)}">00:00</span>
+        </div>
+      </div>
+      <div class="command-call-location">
+        ${i.map_layer_id?`<span class="badge layer-badge">${esc(layerName(i.map_layer_id))}</span>`:""}
+        ${i.zone_id?`<span class="badge">${esc(zoneName(i.zone_id))}</span>`:""}
+        <strong>${esc(i.landmark||i.w3w||"Mapped location")}</strong>
+      </div>
+      <div class="command-call-departments">${esc(deps.join(" / "))}</div>
+      <div class="command-call-units">${assigned||`<span class="muted">No units assigned</span>`}</div>
+    </div>`;
+  }).join("")||`<div class="command-empty">No active calls for the selected department filter.</div>`;
+}
+function renderCommandCallPanel(){
+  const host=document.querySelector("#commandCallList");
+  if(host)host.innerHTML=commandCallCardsHtml();
+  const count=document.querySelector("#commandCallCount");
+  if(count)count.textContent=String(commandFilteredIncidents().length);
+  updateCallTimers();
+}
+function commandMapLayer(){
+  return S.mapLayers.find(l=>l.id===S.commandActiveMapLayerId&&l.status==="published")||null;
+}
+function clearCommandMap(){
+  S.commandMapGeneration++;
+  if(S.commandMap){
+    try{S.commandMap.remove();}catch{}
+  }
+  S.commandMap=null;
+  S.commandIncidentLayer=null;
+  S.commandUnitLayer=null;
+}
+function renderCommandIncidentMarkers(){
+  if(!S.commandMap||!S.commandIncidentLayer)return;
+  S.commandIncidentLayer.clearLayers();
+  const layer=commandMapLayer();
+  if(!layer)return;
+
+  for(const i of commandFilteredIncidents().filter(i=>!i.map_layer_id||i.map_layer_id===layer.id)){
+    if(i.map_x==null||i.map_y==null)continue;
+    L.circleMarker(pixelToLeaflet(i.map_x,i.map_y,layer.image_height),{
+      radius:10,weight:3,className:`command-incident-marker ${commandPriorityClass(i.priority)}`
+    }).addTo(S.commandIncidentLayer)
+      .bindTooltip(`<strong>${esc(i.incident_number)}</strong><br>${esc(i.call_type)}<br>${esc(i.landmark||"")}`,{direction:"top"});
+  }
+}
+function renderCommandUnitMarkers(){
+  if(!S.commandMap||!S.commandUnitLayer)return;
+  S.commandUnitLayer.clearLayers();
+  const layer=commandMapLayer();
+  if(!layer?.georef_coefficients)return;
+
+  for(const unit of commandFilteredUnits()){
+    const location=unitLocation(unit.id);
+    if(!location||locationFreshness(location)==="expired")continue;
+    if(unitLocationLayerId(unit)!==layer.id)continue;
+
+    let px;
+    try{
+      px=geoToPixel(Number(location.latitude),Number(location.longitude),layer.georef_coefficients);
+    }catch{
+      continue;
+    }
+    if(px.x < -50 || px.y < -50 || px.x > Number(layer.image_width)+50 || px.y > Number(layer.image_height)+50)continue;
+
+    const freshness=locationFreshness(location);
+    L.circleMarker(pixelToLeaflet(px.x,px.y,layer.image_height),{
+      radius:10,weight:3,
+      fillOpacity:freshness==="live"?.95:.5,
+      opacity:freshness==="live"?1:.6,
+      className:`command-unit-marker command-unit-${freshness}`
+    }).addTo(S.commandUnitLayer)
+      .bindTooltip(`<strong>${esc(unit.name)}</strong><br>${esc(String(unit.status||"").replaceAll("_"," "))}<br>${esc(locationAgeLabel(location))}${location.accuracy_m!=null?` · ±${Math.round(location.accuracy_m)}m`:""}`,{direction:"top"});
+  }
+}
+async function setupCommandDisplayMap(){
+  const host=document.querySelector("#commandMap");
+  if(!host)return;
+
+  clearCommandMap();
+  const generation=S.commandMapGeneration;
+  const layer=commandMapLayer();
+  if(!layer?.rendered_image_path){
+    host.innerHTML=`<div class="command-map-empty">No published map layer selected.</div>`;
+    return;
+  }
+
+  host.innerHTML="";
+  const url=await storageSigned(layer.rendered_image_path);
+  if(generation!==S.commandMapGeneration||!document.querySelector("#commandMap"))return;
+
+  S.commandMap=L.map("commandMap",{
+    crs:L.CRS.Simple,minZoom:-4,maxZoom:5,zoomSnap:.25,attributionControl:false,zoomControl:false
+  });
+  const bounds=[[0,0],[layer.image_height,layer.image_width]];
+  L.imageOverlay(url,bounds).addTo(S.commandMap);
+  S.commandMap.fitBounds(bounds);
+
+  S.commandIncidentLayer=L.layerGroup().addTo(S.commandMap);
+  S.commandUnitLayer=L.layerGroup().addTo(S.commandMap);
+  renderCommandIncidentMarkers();
+  renderCommandUnitMarkers();
+  setTimeout(()=>S.commandMap?.invalidateSize(),50);
+}
+function commandDisplayDepartmentControls(){
+  const allSelected=S.commandDepartmentIds.length===S.departments.length;
+  return `<button class="command-filter-chip ${allSelected?"active":""}" data-command-all="true">All</button>`+
+    S.departments.map(d=>`
+      <button class="command-filter-chip ${S.commandDepartmentIds.includes(d.id)?"active":""}" data-command-dept="${d.id}">
+        ${esc(d.short_name||d.name)}
+      </button>
+    `).join("");
+}
+function renderCommandDisplayLayout(){
+  const content=document.querySelector("#commandDisplayContent");
+  if(!content)return;
+  const showCalls=S.commandDisplayMode==="calls"||S.commandDisplayMode==="split";
+  const showMap=S.commandDisplayMode==="map"||S.commandDisplayMode==="split";
+
+  content.className=`command-display-content mode-${S.commandDisplayMode}`;
+  content.innerHTML=`
+    ${showCalls?`<section class="command-call-board"><div id="commandCallList">${commandCallCardsHtml()}</div></section>`:""}
+    ${showMap?`<section class="command-map-board"><div id="commandMap"></div><div class="command-map-legend"><span><i class="legend-call"></i> Active Call</span><span><i class="legend-unit"></i> Live Unit GPS</span></div></section>`:""}
+  `;
+  renderCommandCallPanel();
+  if(showMap)setupCommandDisplayMap();
+}
+function updateCommandClock(){
+  const el=document.querySelector("#commandClock");
+  if(el)el.textContent=new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",second:"2-digit"});
+}
+async function refreshCommandDisplayStructure(){
+  if(!document.querySelector("#commandDisplayShell"))return;
+  const previousDepartments=[...S.commandDepartmentIds];
+  const previousMode=S.commandDisplayMode;
+  const previousLayer=S.commandActiveMapLayerId;
+
+  try{
+    await loadEventOps();
+  }catch(error){
+    console.warn("Command Display refresh failed",error);
+    return;
+  }
+
+  S.commandDepartmentIds=normalizeDepartmentSelection(previousDepartments);
+  if(!S.commandDepartmentIds.length)S.commandDepartmentIds=S.departments.map(d=>d.id);
+  S.commandDisplayMode=previousMode;
+  S.commandActiveMapLayerId=S.mapLayers.some(l=>l.id===previousLayer&&l.status==="published")
+    ? previousLayer
+    : S.mapLayers.find(l=>l.is_default&&l.status==="published")?.id||S.mapLayers.find(l=>l.status==="published")?.id||null;
+
+  const filterHost=document.querySelector("#commandDepartmentFilters");
+  if(filterHost)filterHost.innerHTML=commandDisplayDepartmentControls();
+  bindCommandDisplayControls();
+  renderCommandDisplayLayout();
+}
+function scheduleCommandDisplayRefresh(){
+  if(S.commandRefreshTimer)clearTimeout(S.commandRefreshTimer);
+  S.commandRefreshTimer=setTimeout(()=>{
+    S.commandRefreshTimer=null;
+    refreshCommandDisplayStructure();
+  },250);
+}
+function updateCommandDisplayUnitLocation(payload){
+  const row=payload?.new;
+  const old=payload?.old;
+  if(payload.eventType==="DELETE"){
+    const unitId=old?.unit_id;
+    if(unitId)S.unitLocations=S.unitLocations.filter(l=>l.unit_id!==unitId);
+  }else if(row?.unit_id){
+    const index=S.unitLocations.findIndex(l=>l.unit_id===row.unit_id);
+    if(index>=0)S.unitLocations[index]=row;else S.unitLocations.push(row);
+  }
+  renderCommandUnitMarkers();
+}
+function subscribeCommandDisplay(){
+  const ch=supabase.channel(`command-display-${S.eventId}-${Date.now()}`)
+    .on("postgres_changes",{event:"*",schema:"public",table:"incidents",filter:`event_id=eq.${S.eventId}`},scheduleCommandDisplayRefresh)
+    .on("postgres_changes",{event:"*",schema:"public",table:"incident_units"},scheduleCommandDisplayRefresh)
+    .on("postgres_changes",{event:"UPDATE",schema:"public",table:"units",filter:`event_id=eq.${S.eventId}`},payload=>{
+      const unit=S.units.find(u=>u.id===payload.new?.id);
+      if(unit&&payload.new?.status)unit.status=payload.new.status;
+      renderCommandCallPanel();
+      renderCommandUnitMarkers();
+    })
+    .on("postgres_changes",{event:"*",schema:"public",table:"unit_locations"},payload=>updateCommandDisplayUnitLocation(payload))
+    .subscribe();
+  S.realtime.push(ch);
+}
+function bindCommandDisplayControls(){
+  document.querySelector("[data-command-all]")?.addEventListener("click",()=>{
+    S.commandDepartmentIds=S.departments.map(d=>d.id);
+    saveCommandDisplayPreferences();
+    document.querySelectorAll("[data-command-dept]").forEach(b=>b.classList.add("active"));
+    document.querySelector("[data-command-all]")?.classList.add("active");
+    renderCommandDisplayLayout();
+  });
+
+  document.querySelectorAll("[data-command-dept]").forEach(btn=>{
+    btn.onclick=()=>{
+      const id=btn.dataset.commandDept;
+      const set=new Set(S.commandDepartmentIds);
+      if(set.has(id)){
+        if(set.size===1)return;
+        set.delete(id);
+      }else set.add(id);
+      S.commandDepartmentIds=[...set];
+      saveCommandDisplayPreferences();
+      document.querySelectorAll("[data-command-dept]").forEach(b=>b.classList.toggle("active",S.commandDepartmentIds.includes(b.dataset.commandDept)));
+      document.querySelector("[data-command-all]")?.classList.toggle("active",S.commandDepartmentIds.length===S.departments.length);
+      renderCommandDisplayLayout();
+    };
+  });
+}
+async function commandDisplayPage(){
+  closeIncidentModal();
+  setCommandViewUrl(true);
+  cleanupRealtime();
+  clearCommandMap();
+
+  try{
+    await loadEventOps();
+  }catch(error){
+    alert(error.message);
+    setCommandViewUrl(false);
+    return dispatchPage();
+  }
+
+  loadCommandDisplayPreferences();
+
+  app.innerHTML=`<div class="command-display-shell" id="commandDisplayShell">
+    <header class="command-display-header">
+      <div>
+        <div class="command-display-brand">CommCenter Pro</div>
+        <div class="command-display-event">${esc(S.event?.name||"Event")} · Command Center</div>
+      </div>
+      <div class="command-display-metrics">
+        <div><span>ACTIVE CALLS</span><strong id="commandCallCount">${commandFilteredIncidents().length}</strong></div>
+        <div><span>TIME</span><strong id="commandClock"></strong></div>
+      </div>
+      <div class="command-display-actions">
+        <button class="btn secondary" id="commandFullscreen">Full Screen</button>
+        <button class="btn secondary" id="commandBack">Back to Dispatch</button>
+      </div>
+    </header>
+
+    <div class="command-display-controls">
+      <div class="command-control-group">
+        <span class="command-control-label">Departments</span>
+        <div class="command-filter-row" id="commandDepartmentFilters">${commandDisplayDepartmentControls()}</div>
+      </div>
+      <div class="command-control-group command-mode-controls">
+        <span class="command-control-label">View</span>
+        <button class="command-mode-button ${S.commandDisplayMode==="calls"?"active":""}" data-command-mode="calls">Calls</button>
+        <button class="command-mode-button ${S.commandDisplayMode==="split"?"active":""}" data-command-mode="split">Split</button>
+        <button class="command-mode-button ${S.commandDisplayMode==="map"?"active":""}" data-command-mode="map">Map</button>
+      </div>
+      <div class="command-control-group">
+        <span class="command-control-label">Map Layer</span>
+        <select id="commandMapLayer">
+          ${S.mapLayers.filter(l=>l.status==="published").map(l=>`<option value="${l.id}" ${l.id===S.commandActiveMapLayerId?"selected":""}>${esc(l.name)}</option>`).join("")}
+        </select>
+      </div>
+    </div>
+
+    <main id="commandDisplayContent"></main>
+  </div>`;
+
+  document.querySelector("#commandBack").onclick=()=>{setCommandViewUrl(false);dispatchPage();};
+  document.querySelector("#commandFullscreen").onclick=async()=>{
+    const shell=document.querySelector("#commandDisplayShell");
+    try{
+      if(!document.fullscreenElement)await shell.requestFullscreen();
+      else await document.exitFullscreen();
+    }catch(error){
+      alert(`Full screen is not available in this browser: ${error.message}`);
+    }
+  };
+  document.querySelectorAll("[data-command-mode]").forEach(btn=>btn.onclick=()=>{
+    S.commandDisplayMode=btn.dataset.commandMode;
+    saveCommandDisplayPreferences();
+    document.querySelectorAll("[data-command-mode]").forEach(b=>b.classList.toggle("active",b.dataset.commandMode===S.commandDisplayMode));
+    renderCommandDisplayLayout();
+  });
+  document.querySelector("#commandMapLayer").onchange=e=>{
+    S.commandActiveMapLayerId=e.target.value;
+    saveCommandDisplayPreferences();
+    if(S.commandDisplayMode!=="calls")setupCommandDisplayMap();
+  };
+
+  bindCommandDisplayControls();
+  renderCommandDisplayLayout();
+  updateCommandClock();
+  if(S.commandClockInterval)clearInterval(S.commandClockInterval);
+  S.commandClockInterval=setInterval(updateCommandClock,1000);
+  ensureCallTimerTicker();
+  ensureLocationAgeTicker();
+  subscribeCommandDisplay();
 }
 
 /* ---------------- EVENT ADMIN ---------------- */
@@ -2431,6 +3172,7 @@ function subscribeDispatch(){
     .on("postgres_changes",{event:"*",schema:"public",table:"incident_units"},()=>refreshDispatchStructure())
     // GPS changes update only the unit's map marker/readout.
     .on("postgres_changes",{event:"*",schema:"public",table:"unit_locations"},payload=>updateDispatcherUnitLocation(payload))
+    .on("postgres_changes",{event:"INSERT",schema:"public",table:"event_pois",filter:`event_id=eq.${S.eventId}`},payload=>handleRealtimePoiInsert(payload))
     .subscribe();
   S.realtime.push(ch);
 }
@@ -2458,6 +3200,9 @@ function cleanupRealtime(){
   S.realtime.forEach(ch=>supabase.removeChannel(ch));S.realtime=[];
   S.unitLocationMarkers.clear();
   if(S.map){try{S.map.remove()}catch{}}S.map=null;
+  clearCommandMap();
+  if(S.commandRefreshTimer){clearTimeout(S.commandRefreshTimer);S.commandRefreshTimer=null;}
+  if(S.commandClockInterval){clearInterval(S.commandClockInterval);S.commandClockInterval=null;}
 }
 function reset(){
   if(S.locationWatchId!=null&&navigator.geolocation){
@@ -2469,6 +3214,12 @@ function reset(){
   S.locationWriteInFlight=false;
   S.unitLocations=[];
   S.unitLocationMarkers.clear();
+  S.dispatchDepartmentIds=[];
+  S.commandDepartmentIds=[];
+  S.commandDisplayMode="calls";
+  S.commandActiveMapLayerId=null;
+  S.mapPickMode=null;
+  S.pendingIncidentDraft=null;
   closeIncidentModal();
   S.orgId=null;S.eventId=null;S.event=null;S.fieldSession=null;S.activeMapLayerId=null;
 }
