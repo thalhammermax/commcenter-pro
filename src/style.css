@@ -2558,3 +2558,119 @@ body.modal-open{
 #commandOpPrefix{
   font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;
 }
+
+
+/* ============================================================
+   v0.9.1 — STRICT EMS WALK-IN VISIBILITY + OPTIONAL MAP
+   ============================================================ */
+
+/* When map is off, remove it from layout entirely instead of leaving an
+   invisible center column. The existing first divider remains useful for
+   resizing the two board panels. */
+.dispatch-workspace.map-hidden .map-panel,
+.dispatch-workspace.map-hidden .dispatch-resizer-b{
+  display:none !important;
+}
+
+.dispatch-workspace.map-hidden.layout-classic{
+  grid-template-columns:var(--dispatch-calls-size) 7px minmax(0,1fr);
+  grid-template-rows:minmax(0,1fr);
+  grid-template-areas:"calls resize-a units";
+}
+
+.dispatch-workspace.map-hidden.layout-units-left-calls-bottom{
+  grid-template-columns:var(--dispatch-units-size) 7px minmax(0,1fr);
+  grid-template-rows:minmax(0,1fr);
+  grid-template-areas:"units resize-a calls";
+}
+
+.dispatch-workspace.map-hidden.layout-calls-left-units-bottom{
+  grid-template-columns:var(--dispatch-calls-size) 7px minmax(0,1fr);
+  grid-template-rows:minmax(0,1fr);
+  grid-template-areas:"calls resize-a units";
+}
+
+.dispatch-workspace.map-hidden .calls-panel,
+.dispatch-workspace.map-hidden .units-panel{
+  border-top:0;
+}
+
+.dispatch-workspace.map-hidden.layout-classic .units-panel,
+.dispatch-workspace.map-hidden.layout-calls-left-units-bottom .units-panel{
+  border-left:1px solid var(--line,#334155);
+}
+
+.dispatch-workspace.map-hidden.layout-units-left-calls-bottom .calls-panel{
+  border-left:1px solid var(--line,#334155);
+}
+
+.dispatch-map-visibility-card{
+  background:#0c1928;
+  border-color:#31465f;
+}
+
+.dispatch-map-toggle{
+  display:flex;
+  align-items:flex-start;
+  gap:10px;
+  cursor:pointer;
+}
+
+.dispatch-map-toggle input{
+  width:auto;
+  margin-top:3px;
+}
+
+.dispatch-map-toggle span{
+  display:grid;
+  gap:3px;
+}
+
+.dispatch-map-toggle small{
+  color:var(--cc-muted);
+  line-height:1.35;
+  font-weight:500;
+}
+
+#dispatchMapVisibilityHint{
+  margin-top:8px;
+  padding-left:27px;
+}
+
+#dispatchPrimaryActions{
+  display:grid;
+  gap:7px;
+}
+
+#dispatchPrimaryActions #newWalkInPatient{
+  margin-top:0;
+}
+
+/* Make the no-map layout preview understandable without changing the three
+   layout presets themselves. */
+.dispatch-workspace.map-hidden .dispatch-resizer-a{
+  cursor:col-resize;
+}
+
+@media(max-width:980px){
+  .dispatch-workspace.map-hidden.layout-classic,
+  .dispatch-workspace.map-hidden.layout-units-left-calls-bottom,
+  .dispatch-workspace.map-hidden.layout-calls-left-units-bottom{
+    display:grid;
+    grid-template-columns:1fr;
+    grid-template-rows:auto minmax(260px,1fr);
+    grid-template-areas:
+      "calls"
+      "units";
+  }
+
+  .dispatch-workspace.map-hidden.layout-units-left-calls-bottom{
+    grid-template-areas:
+      "units"
+      "calls";
+  }
+
+  .dispatch-workspace.map-hidden .dispatch-resizer{
+    display:none !important;
+  }
+}

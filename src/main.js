@@ -111,7 +111,8 @@ const DISPATCH_LAYOUT_DEFAULTS={
   mode:"classic",
   callsSize:300,
   unitsSize:310,
-  bottomSize:250
+  bottomSize:250,
+  mapVisible:true
 };
 
 function dispatchLayoutKey(){
@@ -130,7 +131,8 @@ function normalizeDispatchLayout(value){
     mode:allowedModes.has(input.mode)?input.mode:DISPATCH_LAYOUT_DEFAULTS.mode,
     callsSize:Math.max(220,Math.min(520,Number(input.callsSize)||DISPATCH_LAYOUT_DEFAULTS.callsSize)),
     unitsSize:Math.max(220,Math.min(520,Number(input.unitsSize)||DISPATCH_LAYOUT_DEFAULTS.unitsSize)),
-    bottomSize:Math.max(170,Math.min(480,Number(input.bottomSize)||DISPATCH_LAYOUT_DEFAULTS.bottomSize))
+    bottomSize:Math.max(170,Math.min(480,Number(input.bottomSize)||DISPATCH_LAYOUT_DEFAULTS.bottomSize)),
+    mapVisible:input.mapVisible!==false
   };
 }
 
@@ -165,6 +167,30 @@ function dispatchLayoutDescription(mode){
   })[mode]||"";
 }
 
+function dispatchLayoutSummary(prefs=S.dispatchLayout){
+  const normalized=normalizeDispatchLayout(prefs);
+  return `${dispatchLayoutModeLabel(normalized.mode)}${normalized.mapVisible?"":" · Map Off"}`;
+}
+
+async function setDispatchMapVisibility(visible,{persist=true}={}){
+  S.dispatchLayout=normalizeDispatchLayout({...S.dispatchLayout,mapVisible:!!visible});
+  if(persist)saveDispatchLayout();
+  applyDispatchLayoutToDom({invalidate:false});
+
+  if(!S.dispatchLayout.mapVisible){
+    if(S.map){
+      try{S.map.remove();}catch{}
+      S.map=null;
+    }
+    S.unitLocationMarkers.clear();
+    return;
+  }
+
+  if(document.querySelector("#map")){
+    await setupDispatchMap();
+  }
+}
+
 function applyDispatchLayoutToDom({invalidate=true}={}){
   const grid=document.querySelector("#dispatchWorkspace");
   if(!grid)return;
@@ -175,17 +201,19 @@ function applyDispatchLayoutToDom({invalidate=true}={}){
   grid.classList.remove(
     "layout-classic",
     "layout-units-left-calls-bottom",
-    "layout-calls-left-units-bottom"
+    "layout-calls-left-units-bottom",
+    "map-hidden"
   );
   grid.classList.add(`layout-${prefs.mode}`);
+  if(!prefs.mapVisible)grid.classList.add("map-hidden");
   grid.style.setProperty("--dispatch-calls-size",`${prefs.callsSize}px`);
   grid.style.setProperty("--dispatch-units-size",`${prefs.unitsSize}px`);
   grid.style.setProperty("--dispatch-bottom-size",`${prefs.bottomSize}px`);
 
   const label=document.querySelector("#layoutButton span");
-  if(label)label.textContent=dispatchLayoutModeLabel(prefs.mode);
+  if(label)label.textContent=dispatchLayoutSummary(prefs);
 
-  if(invalidate){
+  if(invalidate&&prefs.mapVisible){
     requestAnimationFrame(()=>{
       S.map?.invalidateSize?.({pan:false});
     });
@@ -284,6 +312,19 @@ function renderDispatchLayoutModal(){
       `).join("")}
     </div>
 
+    <div class="card dispatch-map-visibility-card">
+      <label class="dispatch-map-toggle">
+        <input type="checkbox" id="dispatchMapVisible" ${prefs.mapVisible?"checked":""}>
+        <span>
+          <strong>Show Map on Dispatch Board</strong>
+          <small>Turn this off for events or workstations that only need the call and unit boards. This preference is saved for this dispatcher, event, and browser.</small>
+        </span>
+      </label>
+      <div class="small muted" id="dispatchMapVisibilityHint">${prefs.mapVisible
+        ?"Map is currently part of the workspace."
+        :"Map is hidden. Calls and units use the available workspace."}</div>
+    </div>
+
     <div class="card dispatch-layout-sizing">
       <div class="row">
         <div>
@@ -326,6 +367,14 @@ function renderDispatchLayoutModal(){
 
   document.querySelectorAll("[data-layout-mode]").forEach(btn=>btn.onclick=()=>chooseMode(btn.dataset.layoutMode));
 
+  document.querySelector("#dispatchMapVisible").onchange=async e=>{
+    const visible=e.target.checked;
+    document.querySelector("#dispatchMapVisibilityHint").textContent=visible
+      ?"Map is currently part of the workspace."
+      :"Map is hidden. Calls and units use the available workspace.";
+    await setDispatchMapVisibility(visible,{persist:false});
+  };
+
   const bindRange=(id,key,labelId)=>{
     const input=document.querySelector(id);
     input.oninput=()=>{
@@ -339,7 +388,11 @@ function renderDispatchLayoutModal(){
   bindRange("#bottomSizeRange","bottomSize","#bottomSizeValue");
 
   document.querySelector("#resetDispatchLayout").onclick=()=>{
-    S.dispatchLayout=normalizeDispatchLayout({...DISPATCH_LAYOUT_DEFAULTS,mode:S.dispatchLayout?.mode||"classic"});
+    S.dispatchLayout=normalizeDispatchLayout({
+      ...DISPATCH_LAYOUT_DEFAULTS,
+      mode:S.dispatchLayout?.mode||"classic",
+      mapVisible:S.dispatchLayout?.mapVisible!==false
+    });
     document.querySelector("#callsSizeRange").value=S.dispatchLayout.callsSize;
     document.querySelector("#unitsSizeRange").value=S.dispatchLayout.unitsSize;
     document.querySelector("#bottomSizeRange").value=S.dispatchLayout.bottomSize;
@@ -410,7 +463,47 @@ function emsEnabledDepartmentIds(){
 
 function dispatchHasEmsEnabled(){
   const emsDepartments=emsEnabledDepartmentIds();
-  return S.dispatchDepartmentIds.some(id=>emsDepartments.has(id));
+  return (S.dispatchDepartmentIds||[]).some(id=>emsDepartments.has(id));
+}
+
+function dispatchWalkInTreatmentAreas(){
+  if(!dispatchHasEmsEnabled())return [];
+
+  const emsDepartments=emsEnabledDepartmentIds();
+  const dispatchDepartments=new Set(S.dispatchDepartmentIds||[]);
+
+  return (S.treatmentAreas||[]).filter(area=>
+    area.active!==false
+    &&area.status!=="CLOSED"
+    &&area.department_id
+    &&emsDepartments.has(area.department_id)
+    &&dispatchDepartments.has(area.department_id)
+  );
+}
+
+function dispatchWalkInAvailable(){
+  return !!S.activeOperationalPeriod
+    &&dispatchHasEmsEnabled()
+    &&dispatchWalkInTreatmentAreas().length>0;
+}
+
+function dispatchPrimaryActionsHtml(){
+  return `
+    <button class="btn block" id="newIncident" ${S.activeOperationalPeriod?"":"disabled"}>+ New Incident</button>
+    ${dispatchWalkInAvailable()?`<button class="btn secondary block" id="newWalkInPatient">+ Walk-In Patient</button>`:""}
+  `;
+}
+
+function bindDispatchPrimaryActions(){
+  document.querySelector("#newIncident")?.addEventListener("click",()=>{
+    if(!S.activeOperationalPeriod)return alert("No Operational Period is active. Event Admin must activate one before creating a call.");
+    incidentForm(null);
+  });
+
+  document.querySelector("#newWalkInPatient")?.addEventListener("click",()=>{
+    if(!dispatchWalkInAvailable())return;
+    treatmentWalkInForm();
+  });
 }
 
 function scopeLabel(ids=S.dispatchDepartmentIds){
@@ -483,7 +576,7 @@ function renderDispatchScopeModal(){
   document.querySelector("#closeIncidentModal").onclick=()=>closeIncidentModal();
   document.querySelector("#scopeCancel").onclick=()=>closeIncidentModal();
   document.querySelector("#scopeAll").onclick=()=>document.querySelectorAll('input[name="dispatchScopeDept"]').forEach(el=>el.checked=true);
-  document.querySelector("#scopeSave").onclick=()=>{
+  document.querySelector("#scopeSave").onclick=async()=>{
     const ids=[...document.querySelectorAll('input[name="dispatchScopeDept"]:checked')].map(el=>el.value);
     if(!ids.length)return alert("Select at least one department.");
     S.dispatchDepartmentIds=normalizeDepartmentSelection(ids);
@@ -491,15 +584,18 @@ function renderDispatchScopeModal(){
     closeIncidentModal();
     refreshDispatchBoards();
     updateDispatchScopeUi();
-    setupDispatchMap();
+    if(S.dispatchLayout?.mapVisible!==false)await setupDispatchMap();
   };
 }
 function updateDispatchScopeUi(){
   const button=document.querySelector("#dispatchScopeBtn");
   if(button)button.textContent=`Dispatching: ${scopeLabel()}`;
 
-  const walkInButton=document.querySelector("#newWalkInPatient");
-  if(walkInButton)walkInButton.classList.toggle("hidden",!dispatchHasEmsEnabled()||!S.activeOperationalPeriod);
+  const actions=document.querySelector("#dispatchPrimaryActions");
+  if(actions){
+    actions.innerHTML=dispatchPrimaryActionsHtml();
+    bindDispatchPrimaryActions();
+  }
 }
 
 const NAV_STATE_KEY="commcenter-pro-navigation-v1";
@@ -1339,8 +1435,7 @@ async function dispatchPage(){
             </div>
           `}
         </div>
-        <button class="btn block" id="newIncident" ${S.activeOperationalPeriod?"":"disabled"}>+ New Incident</button>
-        <button class="btn secondary block ${dispatchHasEmsEnabled()&&S.activeOperationalPeriod?"":"hidden"}" id="newWalkInPatient">+ Walk-In Patient</button>
+        <div id="dispatchPrimaryActions">${dispatchPrimaryActionsHtml()}</div>
         <button class="btn secondary block dispatch-scope-button" id="dispatchScopeBtn">Dispatching: ${esc(scopeLabel())}</button>
         <div class="section-title">Active incidents</div><div id="incidentList">${incidentList()}</div>
       </aside>
@@ -1369,7 +1464,7 @@ async function dispatchPage(){
       <div class="topbar-menu-panel">
         <button class="topbar-menu-item" id="layoutButton">
           <strong>Layout</strong>
-          <span>${esc(dispatchLayoutModeLabel(S.dispatchLayout.mode))}</span>
+          <span>${esc(dispatchLayoutSummary(S.dispatchLayout))}</span>
         </button>
         <button class="topbar-menu-item" id="operationalPeriodsBtn">
           <strong>Operational Periods</strong>
@@ -1410,14 +1505,7 @@ async function dispatchPage(){
   document.querySelector("#reportsBtn").onclick=()=>{closeDispatchMenu();reportsPage();};
   document.querySelector("#eventsBtn").onclick=()=>{closeDispatchMenu();closeIncidentModal();S.eventId=null;staffFlow();};
   document.querySelector("#logoutBtn").onclick=async()=>{closeDispatchMenu();closeIncidentModal();await supabase.auth.signOut();S.mode=null;reset();clearNavigationState();route();};
-  document.querySelector("#newIncident").onclick=()=>{
-    if(!S.activeOperationalPeriod)return alert("No Operational Period is active. Event Admin must activate one before creating a call.");
-    incidentForm(null);
-  };
-  document.querySelector("#newWalkInPatient").onclick=()=>{
-    if(!S.activeOperationalPeriod)return alert("No Operational Period is active. Event Admin must activate one before creating a walk-in patient.");
-    treatmentWalkInForm();
-  };
+  bindDispatchPrimaryActions();
   document.querySelector("#dispatchScopeBtn").onclick=()=>renderDispatchScopeModal();
   document.querySelector("#dispatchLayerSelect")?.addEventListener("change",e=>{S.activeMapLayerId=e.target.value;saveNavigationState();setupDispatchMap();});
   bindIncidentClicks();
@@ -1425,7 +1513,7 @@ async function dispatchPage(){
   bindDispatchResizers();
   ensureCallTimerTicker();
   ensureLocationAgeTicker();
-  await setupDispatchMap();
+  if(S.dispatchLayout?.mapVisible!==false)await setupDispatchMap();
   subscribeDispatch();
 }
 
@@ -2250,7 +2338,7 @@ async function selectIncident(id){
   <div class="incident-modal-actions">
     <button class="btn" id="editIncident">Edit Call Details</button>
     <button class="btn secondary" id="emsPatientFlow">EMS Patient Flow</button>
-    <button class="btn secondary" id="showIncidentMap">Show on Map</button>
+    ${current.map_x!=null&&current.map_y!=null&&current.map_layer_id?`<button class="btn secondary" id="showIncidentMap">Show on Map</button>`:""}
     <button class="btn danger" id="closeIncident">Close Incident</button>
   </div>
 
@@ -2343,7 +2431,10 @@ async function selectIncident(id){
     );
   };
 
-  document.querySelector("#showIncidentMap").onclick=async()=>{
+  document.querySelector("#showIncidentMap")?.addEventListener("click",async()=>{
+    if(S.dispatchLayout?.mapVisible===false){
+      await setDispatchMapVisibility(true);
+    }
     if(current.map_layer_id&&current.map_layer_id!==S.activeMapLayerId){
       S.activeMapLayerId=current.map_layer_id;
       saveNavigationState();
@@ -2356,7 +2447,7 @@ async function selectIncident(id){
       S.map.setView(pixelToLeaflet(current.map_x,current.map_y,layer.image_height),Math.max(S.map.getZoom(),1));
     }
     closeIncidentModal();
-  };
+  });
 
   document.querySelector("#dispatchUnit").onclick=async()=>{
     const unitId=document.querySelector("#assignUnit").value;
@@ -2715,6 +2806,11 @@ function selectUnit(unitId){
 async function setupDispatchMap(){
   S.unitLocationMarkers.clear();
   if(S.map){try{S.map.remove()}catch{}S.map=null;}
+
+  if(S.dispatchLayout?.mapVisible===false||!document.querySelector("#map")){
+    return;
+  }
+
   const layer=activeMapLayer();
   if(!layer?.rendered_image_path || layer.status!=="published"){
     S.map=L.map("map",{crs:L.CRS.Simple,attributionControl:false}).setView([0,0],0);
@@ -2772,7 +2868,7 @@ function treatmentWalkInForm(){
   S.openUnitId=null;
   S.incidentModalMode="walk-in";
 
-  const areas=(S.treatmentAreas||[]).filter(a=>a.active!==false&&a.status!=="CLOSED");
+  const areas=dispatchWalkInTreatmentAreas();
   const detail=openIncidentModalShell();
 
   detail.innerHTML=`<div class="incident-modal-header">
@@ -2927,9 +3023,11 @@ function incidentForm(loc,draft=null){
       <div>
         <div class="row">
           <label>Location / POI</label>
-          <button class="btn secondary compact" id="pickIncidentMapLocation">Pick on Map</button>
+          ${S.dispatchLayout?.mapVisible!==false&&S.mapLayers.some(l=>l.status==="published")
+            ?`<button class="btn secondary compact" id="pickIncidentMapLocation">Pick on Map</button>`
+            :`<span class="small muted">Map not in use</span>`}
         </div>
-        <input id="poiSearchNew" autocomplete="off" placeholder="Search POIs">
+        <input id="poiSearchNew" autocomplete="off" placeholder="Search POIs (optional)">
         <div id="poiSearchNewResults" class="poi-search-results"></div>
       </div>
 
@@ -2937,7 +3035,11 @@ function incidentForm(loc,draft=null){
 
       <div class="notice">
         <strong>Selected location</strong><br>
-        <span id="locSummary">${loc?`${loc.map_layer_id?`${esc(layerName(loc.map_layer_id))} · `:""}${Number(loc.latitude).toFixed(6)}, ${Number(loc.longitude).toFixed(6)}`:"Search for a POI or choose Pick on Map."}</span>
+        <span id="locSummary">${loc
+          ?`${loc.map_layer_id?`${esc(layerName(loc.map_layer_id))} · `:""}${loc.latitude!=null&&loc.longitude!=null?`${Number(loc.latitude).toFixed(6)}, ${Number(loc.longitude).toFixed(6)}`:esc(loc.landmark||"Selected location")}`
+          :(S.dispatchLayout?.mapVisible===false
+            ?"Map is hidden. Enter a Location Description or select an existing POI."
+            :"Search for a POI, choose Pick on Map, or enter a Location Description.")}</span>
       </div>
 
       <div
@@ -3054,7 +3156,7 @@ function incidentForm(loc,draft=null){
 
   document.querySelector("#closeIncidentModal").onclick=()=>closeIncidentModal();
   document.querySelector("#cancelNewIncident").onclick=()=>closeIncidentModal();
-  document.querySelector("#pickIncidentMapLocation").onclick=()=>startIncidentMapPlacement();
+  document.querySelector("#pickIncidentMapLocation")?.addEventListener("click",()=>startIncidentMapPlacement());
 
   bindPoiSearch({
     inputId:"poiSearchNew",
@@ -3069,8 +3171,6 @@ function incidentForm(loc,draft=null){
   });
 
   const create=async(assignSelected)=>{
-    if(!chosen)return alert("Choose a POI or use Pick on Map to set the incident location.");
-
     const deps=[...document.querySelectorAll('input[name="dept"]:checked')].map(x=>x.value);
     if(!deps.length)return alert("Choose at least one department.");
 
@@ -3078,6 +3178,10 @@ function incidentForm(loc,draft=null){
     if(!callType)return alert("Enter a call type / nature.");
 
     const landmark=document.querySelector("#landmark").value.trim();
+    if(!chosen&&!landmark){
+      return alert("Enter a Location Description, select a POI, or use Pick on Map.");
+    }
+
     const saveAsPoi=!!(
       chosen
       &&!chosen.poi_id
@@ -3103,15 +3207,15 @@ function incidentForm(loc,draft=null){
       p_department_ids:deps,
       p_call_type:callType,
       p_priority:document.querySelector("#priority").value,
-      p_latitude:chosen.latitude,
-      p_longitude:chosen.longitude,
-      p_map_x:chosen.map_x,
-      p_map_y:chosen.map_y,
+      p_latitude:chosen?.latitude??null,
+      p_longitude:chosen?.longitude??null,
+      p_map_x:chosen?.map_x??null,
+      p_map_y:chosen?.map_y??null,
       p_landmark:landmark,
       p_notes:document.querySelector("#notes").value.trim(),
-      p_poi_id:chosen.poi_id||null,
-      p_map_layer_id:chosen.map_layer_id||S.activeMapLayerId||null,
-      p_zone_id:chosen.zone_id||null,
+      p_poi_id:chosen?.poi_id||null,
+      p_map_layer_id:chosen?.map_layer_id||null,
+      p_zone_id:chosen?.zone_id||null,
       p_create_poi:saveAsPoi,
       p_poi_category:saveAsPoi?document.querySelector("#incidentPoiCategory").value:null,
       p_poi_aliases:poiAliases
@@ -5133,9 +5237,9 @@ async function fieldUnitCad(){
     <div class="field-shell stack">
       <div class="card"><div class="small muted">Your unit</div><div class="big">${esc(fs.units?.name)}</div><span class="badge status-${esc(fs.units?.status)}" data-field-unit-status>${esc(fs.units?.status?.replaceAll("_"," "))}</span></div>
       ${incident?`<div class="card assignment"><div class="row"><strong>${esc(incident.incident_number)}</strong><span class="incident-head-meta"><span class="call-timer field-call-timer" title="Elapsed call time" data-call-start="${esc(incident.created_at)}">00:00</span><span class="badge">${esc(incident.priority)}</span></span></div>
-        <h2>${esc(incident.call_type)}</h2>${fieldLayer?`<div class="venue-location-line"><span class="badge layer-badge">${esc(fieldLayer.name)}</span>${fieldZone?` <span class="badge">${esc(fieldZone.name)}</span>`:""}</div>`:""}<p>${esc(incident.landmark||"")}<br>
-        <span class="small mono">${Number(incident.latitude).toFixed(6)}, ${Number(incident.longitude).toFixed(6)}</span></p><p>${esc(incident.notes||"")}</p>
-        <button class="btn secondary block" id="viewFieldMap">View on Event Map</button>
+        <h2>${esc(incident.call_type)}</h2>${fieldLayer?`<div class="venue-location-line"><span class="badge layer-badge">${esc(fieldLayer.name)}</span>${fieldZone?` <span class="badge">${esc(fieldZone.name)}</span>`:""}</div>`:""}<p>${esc(incident.landmark||"No location description")}
+        ${incident.latitude!=null&&incident.longitude!=null?`<br><span class="small mono">${Number(incident.latitude).toFixed(6)}, ${Number(incident.longitude).toFixed(6)}</span>`:""}</p><p>${esc(incident.notes||"")}</p>
+        ${fieldLayer&&incident.map_x!=null&&incident.map_y!=null?`<button class="btn secondary block" id="viewFieldMap">View on Event Map</button>`:""}
         <div id="fieldMapHolder"></div>
       </div>`:`<div class="card"><strong>No current assignment</strong><p class="muted">Remain available for dispatch.</p></div>`}
       ${fs.events?.field_location_enabled?`<div class="card field-location-card">
@@ -5297,7 +5401,7 @@ async function fieldUnitCad(){
   getOfflineEvent(S.eventId).then(x=>{if(x)document.querySelector("#offlineStatus").textContent=`Offline package saved ${new Date(x.savedAt).toLocaleString()}`;}).catch(()=>{});
   document.querySelector("#changeUnit").onclick=async()=>{await stopFieldLocationSharing(fs.unit_id,{notifyServer:true});await supabase.rpc("field_release_unit",{p_field_session_id:fs.id});fieldUnitPicker();};
   document.querySelector("#leaveEvent").onclick=leaveField;
-  if(incident)document.querySelector("#viewFieldMap").onclick=()=>showFieldMap(incident);
+  if(incident)document.querySelector("#viewFieldMap")?.addEventListener("click",()=>showFieldMap(incident));
   subscribeField(fs.unit_id);
 }
 
