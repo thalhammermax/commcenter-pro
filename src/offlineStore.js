@@ -43,6 +43,3 @@ export async function removeOfflineEvent(eventId){
   });
 }
 
-export function localW3WForCoordinate(rows,lat,lon){
-  return (rows||[]).find(s=>lat>=s.south&&lat<s.north&&lon>=s.west&&lon<s.east)?.words||null;
-}

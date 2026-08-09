@@ -3,7 +3,7 @@ import L from "leaflet";
 import { supabase } from "./supabase.js";
 import { renderMapBuilder } from "./mapBuilder.js";
 import { pixelToGeo, pixelToLeaflet, leafletToPixel, geoToPixel, distanceMeters } from "./georef.js";
-import { saveOfflineEvent, getOfflineEvent, localW3WForCoordinate } from "./offlineStore.js";
+import { saveOfflineEvent, getOfflineEvent } from "./offlineStore.js";
 import { renderEmsOps, renderEmsAdmin, renderTreatmentAreaFlow, loadFieldEmsState, fieldEmsPanelHtml, bindFieldEmsPanel, renderDispatchIncidentTreatmentPanel } from "./ems.js";
 import { loadVenueChoices, applyVenueVersionToEvent, saveEventToVenueLibrary, renderVenueLibrary } from "./venueLibrary.js";
 
@@ -389,7 +389,7 @@ function createOrganizationForm(){
   app.innerHTML=`<div class="shell">${header("Platform Admin · New Customer")}
     <div class="center"><div class="card stack">
       <h2>Create Customer Organization</h2>
-      <div><label>Company / organization name</label><input id="orgName" placeholder="Superior Event Management"></div>
+      <div><label>Company / organization name</label><input id="orgName" placeholder="Organization name"></div>
       <button class="btn" id="saveOrg">Create Organization</button>
       <button class="btn secondary" id="cancelOrg">Cancel</button>
       <div id="orgErr" class="small muted"></div>
@@ -441,7 +441,7 @@ function organizationStaffPage(){
   app.innerHTML=`<div class="shell">${header(`${esc(org?.organizations?.name||"Organization")} · Staff`)}
     <div class="center"><div class="card stack">
       <p class="muted">This starter can assign an existing Supabase Auth user to this organization. Create the person's account first in Supabase Authentication → Users, then enter that same email here.</p>
-      <div><label>User email</label><input id="memberEmail" type="email" placeholder="dispatcher@example.com"></div>
+      <div><label>User email</label><input id="memberEmail" type="email" placeholder="Email address"></div>
       <div><label>Organization role</label><select id="memberRole">
         <option value="admin">Admin</option><option value="dispatcher">Dispatcher</option><option value="viewer">Viewer</option><option value="owner">Owner</option>
       </select></div>
@@ -473,10 +473,10 @@ async function newEventForm(preselectedVersionId=null){
   app.innerHTML=`<div class="shell">${header(`${org?.organizations?.name||""} · Create Event`)}
     <div class="center"><div class="card stack">
       <h2>Create Event</h2>
-      <div><label>Event name</label><input id="eventName" placeholder="American Family Field Concert 2027"></div>
-      <div><label>Event ID / field code</label><input id="eventCode" placeholder="AFF27"></div>
-      <div><label>4-digit field PIN</label><input id="fieldPin" inputmode="numeric" maxlength="4" placeholder="4821"></div>
-      <div><label>Incident prefix</label><input id="prefix" placeholder="AFF27"></div>
+      <div><label>Event name</label><input id="eventName" placeholder="Event name"></div>
+      <div><label>Event ID / field code</label><input id="eventCode" placeholder="Event code"></div>
+      <div><label>4-digit field PIN</label><input id="fieldPin" inputmode="numeric" maxlength="4" placeholder="••••"></div>
+      <div><label>Incident prefix</label><input id="prefix" placeholder="Event code"></div>
 
       <div>
         <label>Venue / Map Setup</label>
@@ -484,7 +484,7 @@ async function newEventForm(preselectedVersionId=null){
           <option value="">Start with a blank event map</option>
           ${venues.map(v=>`<option value="${v.version_id}" ${v.version_id===preselectedVersionId?"selected":""}>${esc(v.venue_name)} · v${v.version_number}${v.address?` · ${esc(v.address)}`:""}</option>`).join("")}
         </select>
-        <div class="small muted" style="margin-top:5px">Selecting a venue copies its published map layers, calibration, zones, POIs, aliases, vertical access points and W3W library into this event as a snapshot.</div>
+        <div class="small muted" style="margin-top:5px">Selecting a venue copies its published map layers, calibration, zones, POIs, aliases, and vertical access points into this event as a snapshot.</div>
       </div>
 
       <button class="btn" id="createEvent">Create Event</button>
@@ -647,7 +647,6 @@ function poiSearchText(p){
   return [
     p.name,
     p.category,
-    p.w3w,
     layerName(p.map_layer_id),
     zoneName(p.zone_id),
     ...(p.poi_aliases||[]).map(a=>a.alias)
@@ -674,7 +673,6 @@ function poiLocationObject(p){
     map_y:p.map_y,
     latitude:p.latitude,
     longitude:p.longitude,
-    w3w:p.w3w,
     landmark:p.name,
     map_layer_id:p.map_layer_id||null,
     zone_id:p.zone_id||null
@@ -687,7 +685,6 @@ function poiSearchResultsHtml(query){
     <strong>${esc(p.name)}</strong>
     <span>${esc([p.poi_scope==="venue_snapshot"?"Venue":"Event",p.category,layerName(p.map_layer_id),p.zone_id?zoneName(p.zone_id):""].filter(Boolean).join(" · "))}</span>
     ${(p.poi_aliases||[]).length?`<small>Aliases: ${esc((p.poi_aliases||[]).map(a=>a.alias).join(", "))}</small>`:""}
-    ${p.w3w?`<small>///${esc(p.w3w)}</small>`:""}
   </button>`).join("")||`<div class="small muted poi-no-results">No POIs match that search.</div>`;
 }
 
@@ -730,7 +727,7 @@ async function focusPoiOnMap(p){
     const point=pixelToLeaflet(p.map_x,p.map_y,layer.image_height);
     S.map.setView(point,Math.max(S.map.getZoom(),1));
     L.popup().setLatLng(point).setContent(
-      `<strong>${esc(p.name)}</strong><br>${esc(layerName(p.map_layer_id)||"")}${p.zone_id?` · ${esc(zoneName(p.zone_id))}`:""}${p.w3w?`<br>///${esc(p.w3w)}`:""}`
+      `<strong>${esc(p.name)}</strong><br>${esc(layerName(p.map_layer_id)||"")}${p.zone_id?` · ${esc(zoneName(p.zone_id))}`:""}`
     ).openOn(S.map);
   }
 }
@@ -742,8 +739,8 @@ function showPoiFinder(){
     <div class="row"><strong>Find POI</strong><span class="badge">${S.pois.length} locations</span></div>
     <button class="btn secondary" id="addPoiFromMap">+ Add POI from Map</button>
     <div>
-      <label>Search name, alias, category, level, zone or W3W</label>
-      <input id="dispatcherPoiSearch" autocomplete="off" placeholder="e.g. Main Medical, Section 312, Gate 4…">
+      <label>Search name, alias, category, level, or zone</label>
+      <input id="dispatcherPoiSearch" autocomplete="off" placeholder="Search POIs">
       <div id="dispatcherPoiResults" class="poi-search-results"></div>
     </div>
     <div id="dispatcherPoiSelected" class="small muted">Start typing to search event POIs.</div>
@@ -759,7 +756,6 @@ function showPoiFinder(){
         <div class="poi-selected-card">
           <strong>${esc(p.name)}</strong><br>
           ${esc([p.category,layerName(p.map_layer_id),p.zone_id?zoneName(p.zone_id):""].filter(Boolean).join(" · "))}
-          ${p.w3w?`<br><strong>///${esc(p.w3w)}</strong>`:""}
           ${(p.poi_aliases||[]).length?`<br><span class="muted">Aliases: ${esc((p.poi_aliases||[]).map(a=>a.alias).join(", "))}</span>`:""}
           <div class="grid2" style="margin-top:10px">
             <button class="btn secondary" id="showPoiOnMap">Show on Map</button>
@@ -838,7 +834,7 @@ async function dispatcherPoiForm(loc,{returnToFinder=false}={}){
   </div>
   <div class="dispatcher-poi-form stack">
     <div class="grid2">
-      <div><label>POI Name</label><input id="dispatchPoiName" autofocus placeholder="Aid Station North / Gate C / Section 312"></div>
+      <div><label>POI Name</label><input id="dispatchPoiName" autofocus placeholder="POI name"></div>
       <div><label>Category</label><select id="dispatchPoiCategory">
         <option>Medical</option><option>Command</option><option>Security</option><option>Gate</option>
         <option>Portal</option><option>Seating Section</option><option>Concession</option><option>Restroom</option>
@@ -846,11 +842,10 @@ async function dispatcherPoiForm(loc,{returnToFinder=false}={}){
       </select></div>
     </div>
     <div><label>Zone</label><select id="dispatchPoiZone"><option value="">No zone</option>${zones.map(z=>`<option value="${z.id}">${esc(z.name)}</option>`).join("")}</select></div>
-    <div><label>Aliases</label><input id="dispatchPoiAliases" placeholder="Comma separated: North Med, Aid 2"></div>
-    <div><label>Operational Notes</label><textarea id="dispatchPoiNotes" rows="4" placeholder="Access instructions, nearest portal, radio/common name…"></textarea></div>
+    <div><label>Aliases</label><input id="dispatchPoiAliases" placeholder="Comma-separated aliases"></div>
+    <div><label>Operational Notes</label><textarea id="dispatchPoiNotes" rows="4" placeholder="Optional notes"></textarea></div>
     <div class="notice">
       <strong>${esc(layerName(loc.map_layer_id)||"Event Map")}</strong><br>
-      ${loc.w3w?`///${esc(loc.w3w)}<br>`:""}
       <span class="small mono">${Number(loc.latitude).toFixed(6)}, ${Number(loc.longitude).toFixed(6)}</span>
     </div>
     <div class="small muted">Dispatcher-created POIs are event-only. They do not automatically change the reusable organization Venue Library.</div>
@@ -874,7 +869,7 @@ async function dispatcherPoiForm(loc,{returnToFinder=false}={}){
     const button=document.querySelector("#saveDispatchPoi");
     button.disabled=true;button.textContent="Saving…";
 
-    const {data,error}=await supabase.rpc("dispatcher_create_poi",{
+    const {data,error}=await supabase.rpc("dispatcher_create_poi_v2",{
       p_event_id:S.eventId,
       p_name:name,
       p_category:document.querySelector("#dispatchPoiCategory").value,
@@ -884,7 +879,6 @@ async function dispatcherPoiForm(loc,{returnToFinder=false}={}){
       p_longitude:loc.longitude,
       p_map_x:loc.map_x,
       p_map_y:loc.map_y,
-      p_w3w:loc.w3w||null,
       p_notes:document.querySelector("#dispatchPoiNotes").value.trim()||null,
       p_aliases:aliases
     });
@@ -926,7 +920,7 @@ async function handleRealtimePoiInsert(payload){
   if(S.map&&layer&&data.map_layer_id===layer.id&&data.map_x!=null&&data.map_y!=null){
     L.marker(pixelToLeaflet(data.map_x,data.map_y,layer.image_height))
       .addTo(S.map)
-      .bindTooltip(`${data.name}${data.w3w?` · ///${data.w3w}`:""}`);
+      .bindTooltip(data.name);
   }
 
   const count=document.querySelector('[data-dispatch-editor="poi-search"] .badge');
@@ -1181,7 +1175,7 @@ function incidentList(){
     return `<div class="incident" data-incident="${i.id}">
       <div class="row"><strong>${esc(i.incident_number)}</strong><span class="incident-head-meta"><span class="call-timer" title="Elapsed call time" data-call-start="${esc(i.created_at)}">00:00</span><span class="badge">${esc(i.priority)}</span></span></div>
       <div>${esc(i.call_type)}</div>
-      <div class="small muted">${esc(deps)} · ${esc(layerName(i.map_layer_id))}${i.zone_id?` / ${esc(zoneName(i.zone_id))}`:""} · ${esc(i.landmark||i.w3w||"Mapped")}</div>
+      <div class="small muted">${esc(deps)} · ${esc(layerName(i.map_layer_id))}${i.zone_id?` / ${esc(zoneName(i.zone_id))}`:""} · ${esc(i.landmark||"Mapped")}</div>
       ${assigned.length?`<div class="small" style="margin-top:5px"><strong>${esc(assigned.join(", "))}</strong></div>`:""}
     </div>`;
   }).join("")||`<div class="small muted">No active incidents.</div>`;
@@ -1274,6 +1268,7 @@ function activityTitle(action){
     EMS_HANDOFF_DECLINED:"EMS handoff declined",
     EMS_HANDOFF_CANCELLED:"EMS handoff cancelled",
     EMS_TREATMENT_RECEIVED:"Treatment-area custody confirmed",
+    EMS_CUSTODY_SET:"EMS custody recorded",
     EMS_TRANSPORT_STARTED:"Transport started",
     EMS_TRANSPORT_COMPLETED:"Transport completed",
     INCIDENT_CLOSED:"Incident closed"
@@ -1304,6 +1299,10 @@ function activitySummary(row){
   }
   if(row.action==="EMS_TREATMENT_RECEIVED"){
     return `${d.incident_number||""}${d.treatment_area_name?` → ${d.treatment_area_name}`:""}${d.confirmation_source?` · confirmed by ${d.confirmation_source}`:""}`;
+  }
+  if(row.action==="EMS_CUSTODY_SET"){
+    const unit=d.to_unit_id?S.units.find(u=>u.id===d.to_unit_id)?.name:null;
+    return `${d.incident_number||""}${unit?` → ${unit}`:""}`;
   }
   if(d.incident_number)return d.incident_number;
   if(d.status)return String(d.status).replaceAll("_"," ");
@@ -1384,7 +1383,6 @@ function incidentLocationHtml(i){
   return `<div class="incident-location-block">
     <div class="big">${esc(parts[0]||"No location description")}</div>
     ${parts.slice(1).length?`<div class="small muted">${esc(parts.slice(1).join(" · "))}</div>`:""}
-    ${i.w3w?`<div class="mono incident-w3w">///${esc(i.w3w)}</div>`:""}
     ${i.latitude!=null&&i.longitude!=null?`<div class="small mono muted">${Number(i.latitude).toFixed(6)}, ${Number(i.longitude).toFixed(6)}</div>`:""}
   </div>`;
 }
@@ -1497,7 +1495,7 @@ async function selectIncident(id){
 
   const assignedLinks=(current.incident_units||[]).filter(x=>!x.cleared_at);
   const assignedIds=new Set(assignedLinks.map(x=>x.unit_id));
-  const pending=extra.handoffs.find(h=>h.status==="PENDING")||null;
+  const latestTransfer=extra.handoffs.find(h=>h.status==="COMPLETED")||null;
   const deps=incidentDepartmentNames(current);
 
   content.innerHTML=`<div class="incident-modal-header">
@@ -1515,7 +1513,7 @@ async function selectIncident(id){
 
   <div class="incident-modal-actions">
     <button class="btn" id="editIncident">Edit Call Details</button>
-    <button class="btn secondary" id="emsTreatmentHandoff">EMS Treatment Handoff</button>
+    <button class="btn secondary" id="emsTreatmentHandoff">EMS Handoff / Custody</button>
     <button class="btn secondary" id="showIncidentMap">Show on Map</button>
     <button class="btn danger" id="closeIncident">Close Incident</button>
   </div>
@@ -1582,10 +1580,10 @@ async function selectIncident(id){
         ${extra.encounter?`
           <div class="incident-ems-summary">
             <div><span class="small muted">Current custody</span><strong>${esc(emsCustodyName(extra.encounter,extra.areas))}</strong></div>
-            ${pending?`<div><span class="small muted">Pending handoff</span><strong>${esc(handoffResourceName({unitId:pending.from_unit_id,areaId:pending.from_treatment_area_id},extra.areas))} → ${esc(handoffResourceName({unitId:pending.to_unit_id,areaId:pending.to_treatment_area_id},extra.areas))}</strong></div>`:""}
-            ${extra.encounter.destination?`<div><span class="small muted">Destination</span><strong>${esc(extra.encounter.destination)}</strong></div>`:""}
+            ${latestTransfer?`<div><span class="small muted">Most recent handoff</span><strong>${esc(handoffResourceName({unitId:latestTransfer.from_unit_id,areaId:latestTransfer.from_treatment_area_id},extra.areas))} → ${esc(handoffResourceName({unitId:latestTransfer.to_unit_id,areaId:latestTransfer.to_treatment_area_id},extra.areas))}</strong></div>`:""}
+            ${extra.encounter.transport_destination?`<div><span class="small muted">Destination</span><strong>${esc(extra.encounter.transport_destination)}</strong></div>`:""}
           </div>
-        `:`<div class="small muted">No EMS custody/handoff activity has been recorded for this incident.</div>`}
+        `:`<div class="small muted">No EMS custody has been recorded for this incident.</div>`}
       </section>
     </div>
 
@@ -1693,7 +1691,7 @@ function selectUnit(unitId){
     ${active?`<div class="notice">
       <strong>Current assignment</strong><br>
       ${esc(active.incident.incident_number)} · ${esc(active.incident.call_type)}<br>
-      ${esc(active.incident.landmark||active.incident.w3w||"")}
+      ${esc(active.incident.landmark||"")}
     </div>`:`<div class="notice ok"><strong>Unassigned</strong></div>`}
 
     <div>
@@ -1747,7 +1745,7 @@ async function setupDispatchMap(){
   L.imageOverlay(url,bounds).addTo(S.map);S.map.fitBounds(bounds);
 
   for(const p of S.pois.filter(p=>p.map_layer_id===layer.id)){
-    L.marker(pixelToLeaflet(p.map_x,p.map_y,layer.image_height)).addTo(S.map).bindTooltip(`${p.name}${p.w3w?` · ///${p.w3w}`:""}`);
+    L.marker(pixelToLeaflet(p.map_x,p.map_y,layer.image_height)).addTo(S.map).bindTooltip(p.name);
   }
   for(const n of S.accessNodes.filter(n=>n.map_layer_id===layer.id)){
     const ap=S.accessPoints.find(a=>a.id===n.access_point_id);
@@ -1761,8 +1759,7 @@ async function setupDispatchMap(){
     S.map.on("click",async e=>{
       const px=leafletToPixel(e.latlng,layer.image_height);
       const geo=pixelToGeo(px.x,px.y,layer.georef_coefficients);
-      const {data:words}=await supabase.rpc("w3w_for_coordinate",{p_event_id:S.eventId,p_lat:geo.lat,p_lon:geo.lon});
-      S.currentLocation={map_x:px.x,map_y:px.y,latitude:geo.lat,longitude:geo.lon,w3w:words||null,poi_id:null,landmark:"",map_layer_id:layer.id,zone_id:null};
+      S.currentLocation={map_x:px.x,map_y:px.y,latitude:geo.lat,longitude:geo.lon,poi_id:null,landmark:"",map_layer_id:layer.id,zone_id:null};
 
       if(S.mapPickMode==="incident"){
         const draft=S.pendingIncidentDraft;
@@ -1777,7 +1774,7 @@ async function setupDispatchMap(){
       }
 
       L.popup().setLatLng(e.latlng).setContent(
-        `<strong>${esc(layer.name)}</strong><br>${words?`///${esc(words)}<br>`:""}${geo.lat.toFixed(6)}, ${geo.lon.toFixed(6)}
+        `<strong>${esc(layer.name)}</strong><br>${geo.lat.toFixed(6)}, ${geo.lon.toFixed(6)}
         <div class="map-popup-actions"><button id="createAtPoint">Create Incident Here</button><button id="addPoiAtPoint">Add POI Here</button></div>`
       ).openOn(S.map);
       setTimeout(()=>{
@@ -1811,7 +1808,7 @@ function incidentForm(loc,draft=null){
   <div class="new-incident-modal-body" data-incident-modal-mode="new">
     <section class="new-incident-primary stack">
       <div class="grid2">
-        <div><label>Call Type / Nature</label><input id="callType" autofocus placeholder="Medical, disturbance, power issue…" value="${esc(draft?.callType||"")}"></div>
+        <div><label>Call Type / Nature</label><input id="callType" autofocus placeholder="Call type / nature" value="${esc(draft?.callType||"")}"></div>
         <div><label>Priority</label><select id="priority">
           ${["Standard","Urgent","Critical"].map(p=>`<option ${draft?.priority===p?"selected":(!draft&&p==="Standard"?"selected":"")}>${p}</option>`).join("")}
         </select></div>
@@ -1822,7 +1819,7 @@ function incidentForm(loc,draft=null){
           <label>Location / POI</label>
           <button class="btn secondary compact" id="pickIncidentMapLocation">Pick on Map</button>
         </div>
-        <input id="poiSearchNew" autocomplete="off" placeholder="Search name, alias, section, gate, category…">
+        <input id="poiSearchNew" autocomplete="off" placeholder="Search POIs">
         <div id="poiSearchNewResults" class="poi-search-results"></div>
       </div>
 
@@ -1830,10 +1827,10 @@ function incidentForm(loc,draft=null){
 
       <div class="notice">
         <strong>Selected location</strong><br>
-        <span id="locSummary">${loc?`${loc.map_layer_id?`${esc(layerName(loc.map_layer_id))} · `:""}${loc.w3w?`///${esc(loc.w3w)} · `:""}${Number(loc.latitude).toFixed(6)}, ${Number(loc.longitude).toFixed(6)}`:"Search for a POI or choose Pick on Map."}</span>
+        <span id="locSummary">${loc?`${loc.map_layer_id?`${esc(layerName(loc.map_layer_id))} · `:""}${Number(loc.latitude).toFixed(6)}, ${Number(loc.longitude).toFixed(6)}`:"Search for a POI or choose Pick on Map."}</span>
       </div>
 
-      <div><label>Dispatch Notes</label><textarea id="notes" rows="7" placeholder="Caller information, patient/problem description, access instructions, updates…">${esc(draft?.notes||"")}</textarea></div>
+      <div><label>Dispatch Notes</label><textarea id="notes" rows="7" placeholder="Operational notes">${esc(draft?.notes||"")}</textarea></div>
     </section>
 
     <aside class="new-incident-side stack">
@@ -1894,7 +1891,7 @@ function incidentForm(loc,draft=null){
     onSelect:p=>{
       chosen=poiLocationObject(p);
       document.querySelector("#landmark").value=p.name;
-      document.querySelector("#locSummary").textContent=`${layerName(p.map_layer_id)||"Unlayered"}${p.zone_id?` / ${zoneName(p.zone_id)}`:""} · ${p.w3w?`///${p.w3w} · `:""}${Number(p.latitude).toFixed(6)}, ${Number(p.longitude).toFixed(6)}`;
+      document.querySelector("#locSummary").textContent=`${layerName(p.map_layer_id)||"Unlayered"}${p.zone_id?` / ${zoneName(p.zone_id)}`:""} · ${Number(p.latitude).toFixed(6)}, ${Number(p.longitude).toFixed(6)}`;
       focusPoiOnMap(p);
     }
   });
@@ -1915,7 +1912,7 @@ function incidentForm(loc,draft=null){
     const buttons=[document.querySelector("#saveIncidentOnly"),document.querySelector("#saveAndDispatch")];
     buttons.forEach(b=>{if(b)b.disabled=true;});
 
-    const {data,error}=await supabase.rpc("create_incident_v2",{
+    const {data,error}=await supabase.rpc("create_incident_v3",{
       p_event_id:S.eventId,
       p_department_ids:deps,
       p_call_type:callType,
@@ -1924,7 +1921,6 @@ function incidentForm(loc,draft=null){
       p_longitude:chosen.longitude,
       p_map_x:chosen.map_x,
       p_map_y:chosen.map_y,
-      p_w3w:chosen.w3w,
       p_landmark:document.querySelector("#landmark").value.trim(),
       p_notes:document.querySelector("#notes").value.trim(),
       p_poi_id:chosen.poi_id||null,
@@ -1974,7 +1970,6 @@ function editIncidentForm(incidentId){
     map_y:i.map_y,
     latitude:i.latitude,
     longitude:i.longitude,
-    w3w:i.w3w,
     landmark:i.landmark,
     map_layer_id:i.map_layer_id||null,
     zone_id:i.zone_id||null
@@ -2022,7 +2017,7 @@ function editIncidentForm(incidentId){
 
       <div class="notice">
         <strong>Selected location</strong><br>
-        <span id="editLocationSummary">${esc(layerName(i.map_layer_id)||"Unlayered")}${i.zone_id?` / ${esc(zoneName(i.zone_id))}`:""} · ${esc(i.landmark||"")}${i.w3w?` · ///${esc(i.w3w)}`:""}</span>
+        <span id="editLocationSummary">${esc(layerName(i.map_layer_id)||"Unlayered")}${i.zone_id?` / ${esc(zoneName(i.zone_id))}`:""} · ${esc(i.landmark||"")}</span>
       </div>
 
       <div><label>Location Description</label><input id="editLandmark" value="${esc(i.landmark||"")}"></div>
@@ -2054,7 +2049,7 @@ function editIncidentForm(incidentId){
     onSelect:p=>{
       chosen=poiLocationObject(p);
       document.querySelector("#editLandmark").value=p.name;
-      document.querySelector("#editLocationSummary").textContent=`${layerName(p.map_layer_id)||"Unlayered"}${p.zone_id?` / ${zoneName(p.zone_id)}`:""} · ${p.name}${p.w3w?` · ///${p.w3w}`:""}`;
+      document.querySelector("#editLocationSummary").textContent=`${layerName(p.map_layer_id)||"Unlayered"}${p.zone_id?` / ${zoneName(p.zone_id)}`:""} · ${p.name}`;
       focusPoiOnMap(p);
     }
   });
@@ -2072,7 +2067,7 @@ function editIncidentForm(incidentId){
     saveButton.disabled=true;
     saveButton.textContent="Saving…";
 
-    const {error}=await supabase.rpc("update_incident_v2",{
+    const {error}=await supabase.rpc("update_incident_v3",{
       p_incident_id:incidentId,
       p_department_ids:departments,
       p_call_type:callType,
@@ -2081,7 +2076,6 @@ function editIncidentForm(incidentId){
       p_longitude:chosen.longitude,
       p_map_x:chosen.map_x,
       p_map_y:chosen.map_y,
-      p_w3w:chosen.w3w,
       p_landmark:document.querySelector("#editLandmark").value.trim(),
       p_notes:document.querySelector("#editNotes").value.trim(),
       p_poi_id:chosen.poi_id||null,
@@ -2143,7 +2137,7 @@ function commandCallCardsHtml(){
       <div class="command-call-location">
         ${i.map_layer_id?`<span class="badge layer-badge">${esc(layerName(i.map_layer_id))}</span>`:""}
         ${i.zone_id?`<span class="badge">${esc(zoneName(i.zone_id))}</span>`:""}
-        <strong>${esc(i.landmark||i.w3w||"Mapped location")}</strong>
+        <strong>${esc(i.landmark||"Mapped location")}</strong>
       </div>
       <div class="command-call-departments">${esc(deps.join(" / "))}</div>
       <div class="command-call-units">${assigned||`<span class="muted">No units assigned</span>`}</div>
@@ -2478,7 +2472,7 @@ function renderEventSetup(){
       <h2>Field Access</h2>
       <div class="grid2">
         <div><label>Event ID</label><input value="${esc(S.event.event_code)}" disabled></div>
-        <div><label>New 4-digit PIN</label><input id="newPin" maxlength="4" inputmode="numeric" placeholder="4821"></div>
+        <div><label>New 4-digit PIN</label><input id="newPin" maxlength="4" inputmode="numeric" placeholder="••••"></div>
       </div>
       <label style="margin-top:10px"><input id="accessEnabled" type="checkbox" ${S.event.field_access_enabled?"checked":""}> Field access enabled</label>
       <label style="margin-top:8px"><input id="locationEnabled" type="checkbox" ${S.event.field_location_enabled?"checked":""}> Allow field units to share live GPS location with Dispatch</label>
@@ -2503,8 +2497,8 @@ function renderEventSetup(){
 
       <div class="section-title">Add Department</div>
       <div class="grid2">
-        <div><label>Department Name</label><input id="deptName" placeholder="Police"></div>
-        <div><label>Short Name</label><input id="deptShort" placeholder="PD"></div>
+        <div><label>Department Name</label><input id="deptName" placeholder="Department name"></div>
+        <div><label>Short Name</label><input id="deptShort" placeholder="Short name"></div>
       </div>
 
       <div style="margin-top:12px">
@@ -2521,7 +2515,7 @@ function renderEventSetup(){
       <div id="adminUnits">${unitList()}</div>
       <div class="grid2">
         <select id="unitDept"><option value="">Department</option>${S.departments.map(d=>`<option value="${d.id}">${esc(d.name)}</option>`).join("")}</select>
-        <input id="unitName" placeholder="Medic 1">
+        <input id="unitName" placeholder="Unit name">
       </div>
       <button class="btn" id="addUnit">Add Unit</button>
     </div>
@@ -2613,11 +2607,11 @@ async function renderVenueSavePanel(){
       <input type="hidden" id="venueExistingId" value="${linkedVenue.venue_id}">
       <div class="notice">This event is based on <strong>${esc(linkedVenue.venue_name)}</strong>. Saving creates a new immutable venue version; older events stay on their existing snapshots.</div>
     `:`
-      <div><label>Venue Name</label><input id="venueName" placeholder="American Family Field"></div>
-      <div><label>Venue Address</label><input id="venueAddress" placeholder="1 Brewers Way, Milwaukee, WI"></div>
+      <div><label>Venue Name</label><input id="venueName" placeholder="Venue name"></div>
+      <div><label>Venue Address</label><input id="venueAddress" placeholder="Venue address"></div>
     `}
 
-    <div><label>Version Notes</label><input id="venueNotes" placeholder="Updated 300-level map and medical POIs"></div>
+    <div><label>Version Notes</label><input id="venueNotes" placeholder="Version notes"></div>
 
     ${S.event.venue_id?`
       <label class="venue-promote-check"><input type="checkbox" id="includeEventPois"> Include event-only POIs in this new venue version</label>
@@ -2705,17 +2699,17 @@ async function reportsPage(){
     <div class="wrap stack">
       <div class="row"><h2>Dispatch Log</h2><div class="nav"><button class="btn secondary" id="backCad">Back to CAD</button><button class="btn" id="downloadCsv">Download CSV</button></div></div>
       <div class="table-wrap"><table><thead><tr>
-        <th>Incident</th><th>Received</th><th>Departments</th><th>Nature</th><th>Priority</th><th>Location</th><th>W3W</th><th>Units</th><th>En Route</th><th>On Scene</th><th>Disposition</th><th>Clear</th>
+        <th>Incident</th><th>Received</th><th>Departments</th><th>Nature</th><th>Priority</th><th>Location</th><th>Units</th><th>En Route</th><th>On Scene</th><th>Disposition</th><th>Clear</th>
       </tr></thead><tbody>${(data||[]).map(r=>`<tr>
         <td>${esc(r.incident_number)}</td><td>${fmt(r.received_time)}</td><td>${esc(r.departments||"")}</td><td>${esc(r.call_type)}</td><td>${esc(r.priority)}</td>
-        <td>${esc(r.landmark||"")}</td><td>${r.w3w?`///${esc(r.w3w)}`:""}</td><td>${esc(r.units||"")}</td><td>${fmt(r.first_enroute)}</td><td>${fmt(r.first_onscene)}</td><td>${esc(r.disposition||"")}</td><td>${fmt(r.last_clear||r.closed_at)}</td>
+        <td>${esc(r.landmark||"")}</td><td>${esc(r.units||"")}</td><td>${fmt(r.first_enroute)}</td><td>${fmt(r.first_onscene)}</td><td>${esc(r.disposition||"")}</td><td>${fmt(r.last_clear||r.closed_at)}</td>
       </tr>`).join("")}</tbody></table></div>
     </div></div>`;
   document.querySelector("#backCad").onclick=()=>dispatchPage();
   document.querySelector("#downloadCsv").onclick=()=>downloadCsv(data||[]);
 }
 function downloadCsv(rows){
-  const cols=["incident_number","received_time","departments","call_type","priority","landmark","w3w","latitude","longitude","units","first_enroute","first_onscene","first_transporting","last_clear","disposition","closed_at"];
+  const cols=["incident_number","received_time","departments","call_type","priority","landmark","latitude","longitude","units","first_enroute","first_onscene","first_transporting","last_clear","disposition","closed_at"];
   const q=v=>`"${String(v??"").replaceAll('"','""')}"`;
   const csv=[cols.join(","),...rows.map(r=>cols.map(c=>q(r[c])).join(","))].join("\n");
   const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([csv],{type:"text/csv;charset=utf-8"}));a.download=`${S.event?.event_code||"event"}-dispatch-log.csv`;a.click();URL.revokeObjectURL(a.href);
@@ -2744,9 +2738,9 @@ function fieldError(message){
 function fieldJoin(){
   app.innerHTML=`<div class="shell">${header("Field Unit Access")}<div class="center"><div class="card stack">
     <h2>Join Event</h2>
-    <div><label>Event ID</label><input id="fieldEventCode" placeholder="XR41"></div>
+    <div><label>Event ID</label><input id="fieldEventCode" placeholder="Event code"></div>
     <div><label>4-digit access code</label><input id="fieldPin" inputmode="numeric" maxlength="4" placeholder="••••"></div>
-    <div><label>Operator name (optional)</label><input id="operatorName" placeholder="First name / callsign"></div>
+    <div><label>Operator name (optional)</label><input id="operatorName" placeholder="Operator name"></div>
     <button class="btn" id="joinEvent">Continue</button><button class="btn secondary" id="home">Back</button><div id="fieldErr" class="small muted"></div>
   </div></div></div>`;
   document.querySelector("#home").onclick=async()=>{await supabase.auth.signOut();S.mode=null;route();};
@@ -2802,7 +2796,7 @@ async function fieldUnitCad(){
     <div class="field-shell stack">
       <div class="card"><div class="small muted">Your unit</div><div class="big">${esc(fs.units?.name)}</div><span class="badge status-${esc(fs.units?.status)}" data-field-unit-status>${esc(fs.units?.status?.replaceAll("_"," "))}</span></div>
       ${incident?`<div class="card assignment"><div class="row"><strong>${esc(incident.incident_number)}</strong><span class="incident-head-meta"><span class="call-timer field-call-timer" title="Elapsed call time" data-call-start="${esc(incident.created_at)}">00:00</span><span class="badge">${esc(incident.priority)}</span></span></div>
-        <h2>${esc(incident.call_type)}</h2>${fieldLayer?`<div class="venue-location-line"><span class="badge layer-badge">${esc(fieldLayer.name)}</span>${fieldZone?` <span class="badge">${esc(fieldZone.name)}</span>`:""}</div>`:""}<p>${incident.w3w?`<strong>///${esc(incident.w3w)}</strong><br>`:""}${esc(incident.landmark||"")}<br>
+        <h2>${esc(incident.call_type)}</h2>${fieldLayer?`<div class="venue-location-line"><span class="badge layer-badge">${esc(fieldLayer.name)}</span>${fieldZone?` <span class="badge">${esc(fieldZone.name)}</span>`:""}</div>`:""}<p>${esc(incident.landmark||"")}<br>
         <span class="small mono">${Number(incident.latitude).toFixed(6)}, ${Number(incident.longitude).toFixed(6)}</span></p><p>${esc(incident.notes||"")}</p>
         <button class="btn secondary block" id="viewFieldMap">View on Event Map</button>
         <div id="fieldMapHolder"></div>
@@ -2835,7 +2829,7 @@ async function fieldUnitCad(){
       ${fieldEmsPanelHtml(emsState,incident)}
       <div class="status-buttons">${statuses.map(status=>`<button class="btn field-status-button ${fieldStatusColorClass(status)} ${status===fs.units?.status?"field-status-active":""}" data-status="${esc(status)}" aria-pressed="${status===fs.units?.status?"true":"false"}">${esc(status.replaceAll("_"," "))}</button>`).join("")}</div>
       <div class="notice ${navigator.onLine?"ok":""}">${navigator.onLine?"Connected":"Offline — CAD changes cannot reach dispatch until connectivity returns."}</div>
-      <button class="btn secondary" id="downloadOffline">Download Event Map + W3W for Offline Use</button>
+      <button class="btn secondary" id="downloadOffline">Download Event Map for Offline Use</button>
       <div id="offlineStatus" class="small muted"></div>
       <button class="btn secondary" id="changeUnit">Change Unit</button><button class="btn secondary" id="leaveEvent">Leave Event</button>
     </div></div>`;
@@ -3072,16 +3066,21 @@ function updateFieldUnitStatusUI(status){
   });
 }
 
+
 async function downloadOfflineEventData(){
   const status=document.querySelector("#offlineStatus");
   try{
     status.textContent="Downloading venue map package…";
-    const [{data:layers,error:layersErr},{data:pois,error:poisErr},{data:event,error:eventErr}]=await Promise.all([
+
+    const [{data:layers,error:layersErr},{data:pois,error:poisErr},{data:zones,error:zonesErr}]=await Promise.all([
       supabase.from("event_map_layers").select("*").eq("event_id",S.eventId).eq("active",true).eq("status","published").order("sort_order"),
-      supabase.from("event_pois").select("id,name,category,w3w,latitude,longitude,map_x,map_y,map_layer_id,zone_id,notes").eq("event_id",S.eventId).eq("active",true),
-      supabase.from("events").select("offline_w3w_path").eq("id",S.eventId).single()
+      supabase.from("event_pois").select("id,name,category,latitude,longitude,map_x,map_y,map_layer_id,zone_id,notes").eq("event_id",S.eventId).eq("active",true),
+      supabase.from("event_zones").select("*").eq("event_id",S.eventId).eq("active",true)
     ]);
-    if(layersErr)throw layersErr;if(poisErr)throw poisErr;if(eventErr)throw eventErr;
+
+    if(layersErr)throw layersErr;
+    if(poisErr)throw poisErr;
+    if(zonesErr)throw zonesErr;
     if(!(layers||[]).length)throw new Error("No published map layers.");
 
     const offlineLayers=[];
@@ -3092,39 +3091,69 @@ async function downloadOfflineEventData(){
       offlineLayers.push({meta:layer,mapBlob});
     }
 
-    let w3w=[];
-    if(event.offline_w3w_path){
-      const {data:w3wBlob,error}=await supabase.storage.from("event-assets").download(event.offline_w3w_path);
-      if(error)throw error;
-      w3w=JSON.parse(await w3wBlob.text());
-    }
-    const {data:zones}=await supabase.from("event_zones").select("*").eq("event_id",S.eventId).eq("active",true);
-    await saveOfflineEvent({eventId:S.eventId,savedAt:new Date().toISOString(),layers:offlineLayers,pois:pois||[],zones:zones||[],w3w});
-    status.textContent=`Saved offline: ${offlineLayers.length} map layer${offlineLayers.length===1?"":"s"} + ${w3w.length.toLocaleString()} W3W squares.`;
-  }catch(err){status.textContent=`Offline download failed: ${err.message}`;}
+    await saveOfflineEvent({
+      eventId:S.eventId,
+      savedAt:new Date().toISOString(),
+      layers:offlineLayers,
+      pois:pois||[],
+      zones:zones||[]
+    });
+
+    status.textContent=`Saved offline: ${offlineLayers.length} map layer${offlineLayers.length===1?"":"s"}.`;
+  }catch(err){
+    status.textContent=`Offline download failed: ${err.message}`;
+  }
 }
+
 
 async function showFieldMap(incident){
   const holder=document.querySelector("#fieldMapHolder");
   holder.innerHTML=`<div id="fieldLayerName" class="small muted" style="margin-top:8px"></div><div id="fieldMap" style="height:420px;margin-top:6px;border-radius:10px;overflow:hidden"></div><div id="fieldMapReadout" class="small muted" style="margin-top:6px"></div>`;
-  let m=null,url=null,w3wRows=[];
+
+  let m=null,url=null;
   const targetLayerId=incident.map_layer_id||null;
+
   try{
     if(navigator.onLine){
       let q=supabase.from("event_map_layers").select("*").eq("event_id",S.eventId).eq("status","published");
       q=targetLayerId?q.eq("id",targetLayerId):q.eq("is_default",true);
       const {data}=await q.limit(1).maybeSingle();
-      if(data?.rendered_image_path){m=data;url=await storageSigned(m.rendered_image_path);}
+      if(data?.rendered_image_path){
+        m=data;
+        url=await storageSigned(m.rendered_image_path);
+      }
     }
   }catch{}
+
   const offline=await getOfflineEvent(S.eventId).catch(()=>null);
-  if(!m&&offline?.layers?.length){const item=offline.layers.find(x=>x.meta.id===targetLayerId)||offline.layers.find(x=>x.meta.is_default)||offline.layers[0];m=item.meta;url=URL.createObjectURL(item.mapBlob);w3wRows=offline.w3w||[];}else if(offline){w3wRows=offline.w3w||[];}
-  if(!m||!url)return alert("No published map layer is available. Download the event package while connected.");
+  if(!m&&offline?.layers?.length){
+    const item=offline.layers.find(x=>x.meta.id===targetLayerId)||offline.layers.find(x=>x.meta.is_default)||offline.layers[0];
+    m=item.meta;
+    url=URL.createObjectURL(item.mapBlob);
+  }
+
+  if(!m||!url)return alert("No published map layer is available. Download the event map while connected.");
+
   document.querySelector("#fieldLayerName").textContent=`Map layer: ${m.name}${incident.zone_id?` · ${offline?.zones?.find(z=>z.id===incident.zone_id)?.name||""}`:""}`;
+
   const map=L.map("fieldMap",{crs:L.CRS.Simple,minZoom:-4,maxZoom:5,attributionControl:false});
   L.imageOverlay(url,[[0,0],[m.image_height,m.image_width]]).addTo(map);
-  if(incident.map_x!=null&&incident.map_y!=null){const pt=pixelToLeaflet(incident.map_x,incident.map_y,m.image_height);L.marker(pt).addTo(map).bindPopup(`${esc(incident.incident_number)}<br>${esc(incident.landmark||"")}`).openPopup();map.setView(pt,0);}else map.fitBounds([[0,0],[m.image_height,m.image_width]]);
-  if(m.georef_coefficients)map.on("click",async e=>{const px=leafletToPixel(e.latlng,m.image_height),geo=pixelToGeo(px.x,px.y,m.georef_coefficients);let words=localW3WForCoordinate(w3wRows,geo.lat,geo.lon);if(!words&&navigator.onLine){try{words=(await supabase.rpc("w3w_for_coordinate",{p_event_id:S.eventId,p_lat:geo.lat,p_lon:geo.lon})).data||null;}catch{}}document.querySelector("#fieldMapReadout").textContent=`${m.name} · ${words?`///${words} · `:""}${geo.lat.toFixed(6)}, ${geo.lon.toFixed(6)}`;});
+
+  if(incident.map_x!=null&&incident.map_y!=null){
+    const pt=pixelToLeaflet(incident.map_x,incident.map_y,m.image_height);
+    L.marker(pt).addTo(map).bindPopup(`${esc(incident.incident_number)}<br>${esc(incident.landmark||"")}`).openPopup();
+    map.setView(pt,0);
+  }else{
+    map.fitBounds([[0,0],[m.image_height,m.image_width]]);
+  }
+
+  if(m.georef_coefficients){
+    map.on("click",e=>{
+      const px=leafletToPixel(e.latlng,m.image_height);
+      const geo=pixelToGeo(px.x,px.y,m.georef_coefficients);
+      document.querySelector("#fieldMapReadout").textContent=`${m.name} · ${geo.lat.toFixed(6)}, ${geo.lon.toFixed(6)}`;
+    });
+  }
 }
 
 async function leaveField(){
@@ -3192,6 +3221,7 @@ function subscribeField(unitId){
       }
     })
     .on("postgres_changes",{event:"*",schema:"public",table:"incident_units",filter:`unit_id=eq.${unitId}`},()=>fieldUnitCad())
+    .on("postgres_changes",{event:"*",schema:"public",table:"ems_encounters",filter:`event_id=eq.${S.eventId}`},()=>fieldUnitCad())
     .subscribe();
 
   S.realtime.push(ch);

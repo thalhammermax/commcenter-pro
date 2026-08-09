@@ -69,15 +69,6 @@ export async function applyVenueVersionToEvent({eventId,versionId,onProgress=()=
     if(updateError)throw updateError;
   }
 
-  if(payload.offline_w3w_path){
-    onProgress("Copying offline W3W library…");
-    const destination=`${eventId}/offline/w3w.json`;
-    await copyStorageObject(payload.offline_w3w_path,destination);
-    const {error:updateEventError}=await supabase.from("events").update({
-      offline_w3w_path:destination
-    }).eq("id",eventId);
-    if(updateEventError)throw updateEventError;
-  }
 
   onProgress("Venue snapshot ready.");
   return payload;
@@ -138,15 +129,6 @@ export async function saveEventToVenueLibrary({
     if(updateError)throw updateError;
   }
 
-  if(payload.source_offline_w3w_path){
-    onProgress("Saving offline W3W library…");
-    const destination=`venues/${organizationId}/${payload.version_id}/offline/w3w.json`;
-    await copyStorageObject(payload.source_offline_w3w_path,destination);
-    const {error:versionUpdateError}=await supabase.from("organization_venue_versions").update({
-      offline_w3w_path:destination
-    }).eq("id",payload.version_id);
-    if(versionUpdateError)throw versionUpdateError;
-  }
 
   onProgress("Publishing venue version…");
   const {error:publishError}=await supabase.rpc("publish_venue_version",{

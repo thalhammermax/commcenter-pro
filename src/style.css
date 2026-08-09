@@ -624,10 +624,6 @@ body.modal-open{
   display:grid;
   gap:4px;
 }
-.incident-w3w{
-  color:#93c5fd;
-  font-weight:700;
-}
 .incident-notes{
   white-space:pre-wrap;
 }
@@ -1248,3 +1244,21 @@ body.modal-open{
 .command-incident-marker.command-priority-standard{fill:#3b82f6}
 .command-incident-marker.command-priority-urgent{fill:#f59e0b}
 .command-incident-marker.command-priority-critical{fill:#ef4444}
+
+
+/* v0.7.0 — direct EMS handoffs */
+.direct-handoff-grid{
+  align-items:stretch;
+}
+.direct-handoff-option{
+  display:grid;
+  align-content:start;
+  gap:8px;
+  padding:12px;
+  border:1px solid #334155;
+  border-radius:10px;
+  background:#0b1324;
+}
+.direct-handoff-option .btn{
+  margin-top:2px;
+}
