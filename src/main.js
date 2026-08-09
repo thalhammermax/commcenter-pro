@@ -2106,6 +2106,7 @@ function activityTitle(action){
     EMS_TRANSPORT_COMPLETED:"Patient delivered",
     EMS_TRANSPORT_REFUSAL:"Transport ended with refusal",
     EMS_ENCOUNTER_CLOSED:"EMS patient flow closed",
+    EMS_TREATMENT_CLEARED_BY_DISPATCH:"Patient cleared from treatment by Dispatch",
     INCIDENT_CLOSED:"Incident closed"
   };
   return labels[action]||String(action||"Activity").replaceAll("_"," ").toLowerCase().replace(/^\w/,c=>c.toUpperCase());
@@ -2524,20 +2525,29 @@ async function dispatcherAssign(incidentId,unitId){
 
 async function openCloseIncidentDispositionModal(incident,{hasEms=false}={}){
   let existingEmsDisposition="";
+  let activeTreatmentCustody=null;
 
   const {data:emsHistory,error:emsHistoryError}=await supabase.from("ems_encounters")
-    .select("id,final_disposition,current_status,created_at")
+    .select("id,final_disposition,current_status,current_treatment_area_id,current_unit_id,created_at")
     .eq("event_id",S.eventId)
     .eq("incident_id",incident.id)
     .order("created_at",{ascending:false})
-    .limit(1);
+    .limit(10);
 
   if(emsHistoryError){
     console.warn("Could not check EMS disposition history before incident close",emsHistoryError);
   }else if(emsHistory?.length){
     hasEms=true;
-    existingEmsDisposition=emsHistory[0].final_disposition||"";
+    existingEmsDisposition=emsHistory.find(row=>row.final_disposition)?.final_disposition||"";
+    activeTreatmentCustody=emsHistory.find(row=>
+      row.current_status!=="CLOSED"
+      &&row.current_treatment_area_id
+    )||null;
   }
+
+  const activeTreatmentArea=activeTreatmentCustody
+    ?S.treatmentAreas.find(area=>area.id===activeTreatmentCustody.current_treatment_area_id)||null
+    :null;
 
   const generalOptions=dispositionOptions("GENERAL");
   const emsOptions=dispositionOptions("EMS");
@@ -2570,6 +2580,13 @@ async function openCloseIncidentDispositionModal(incident,{hasEms=false}={}){
       <strong>Closing this call releases all units still committed to it.</strong><br>
       Select the final call disposition${hasEms?" and EMS patient disposition":""}. These values are stored separately in the CAD record.
     </div>
+
+    ${activeTreatmentCustody?`
+      <div class="notice error close-treatment-release-warning">
+        <strong>Patient currently in ${esc(activeTreatmentArea?.name||"a Treatment Area")}.</strong><br>
+        Closing this incident will immediately close the EMS patient flow and remove the patient from that Treatment Area's active census. The Treatment Area Station will update automatically.
+      </div>
+    `:""}
 
     <div class="${hasEms?"grid2":""}">
       <div>
