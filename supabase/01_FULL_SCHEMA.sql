@@ -329,6 +329,36 @@ create or replace function public.field_has_unit_access(p_unit uuid)
 returns boolean language sql stable security definer set search_path=public
 as $$ select exists(select 1 from public.field_sessions where unit_id=p_unit and auth_user_id=auth.uid() and active=true); $$;
 
+
+-- RLS helper: checks whether the current anonymous/authenticated field session
+-- is assigned to an active unit on an incident. Kept outside the exposed public
+-- schema so it can safely bypass RLS on the join tables without creating a
+-- circular incidents <-> incident_units policy dependency.
+create schema if not exists private;
+revoke all on schema private from public;
+grant usage on schema private to authenticated;
+
+create or replace function private.field_can_read_incident(p_incident_id uuid)
+returns boolean
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select exists (
+    select 1
+    from public.incident_units iu
+    join public.field_sessions fs on fs.unit_id=iu.unit_id
+    where iu.incident_id=p_incident_id
+      and iu.cleared_at is null
+      and fs.auth_user_id=(select auth.uid())
+      and fs.active=true
+  );
+$$;
+
+revoke all on function private.field_can_read_incident(uuid) from public;
+grant execute on function private.field_can_read_incident(uuid) to authenticated;
+
 create or replace function public.storage_event_access(object_name text)
 returns boolean language plpgsql stable security definer set search_path=public,storage
 as $$
@@ -404,7 +434,7 @@ $$;
 create or replace function public.create_event(
   p_organization_id uuid,p_name text,p_event_code text,p_pin text,p_incident_prefix text
 ) returns uuid
-language plpgsql security definer set search_path=public
+language plpgsql security definer set search_path=public,extensions
 as $$
 declare eid uuid; slug text;
 begin
@@ -423,7 +453,7 @@ $$;
 
 create or replace function public.set_event_field_access(p_event_id uuid,p_pin text,p_enabled boolean)
 returns void
-language plpgsql security definer set search_path=public
+language plpgsql security definer set search_path=public,extensions
 as $$
 begin
   if not public.can_admin_event(p_event_id) then raise exception 'Event admin access required'; end if;
@@ -469,25 +499,244 @@ begin
 end;
 $$;
 
+-- CommCenter Pro v0.3.1
+-- Dispatcher assignment / unit-control upgrade.
+-- Safe to run on an existing v0.3.0 database.
+-- No existing incidents or EMS encounter data are deleted.
+
 create or replace function public.assign_unit(p_incident_id uuid,p_unit_id uuid)
 returns void
-language plpgsql security definer set search_path=public
+language plpgsql
+security definer
+set search_path=public
 as $$
-declare eid uuid; old_s text;
+declare
+  eid uuid;
+  old_s text;
+  other_incident text;
 begin
-  select event_id into eid from public.incidents where id=p_incident_id;
-  if not public.can_dispatch_event(eid) then raise exception 'Dispatch access required'; end if;
-  if not exists(select 1 from public.units where id=p_unit_id and event_id=eid) then raise exception 'Unit is not part of this event'; end if;
+  select event_id into eid
+  from public.incidents
+  where id=p_incident_id and status='OPEN';
 
-  select status into old_s from public.units where id=p_unit_id;
-  insert into public.incident_units(incident_id,unit_id) values(p_incident_id,p_unit_id)
-  on conflict(incident_id,unit_id) do update set assigned_at=now(),cleared_at=null;
-  update public.units set status='ASSIGNED' where id=p_unit_id;
+  if eid is null then
+    raise exception 'Incident not found or is already closed';
+  end if;
 
-  insert into public.unit_status_log(event_id,incident_id,unit_id,old_status,new_status,actor_user_id,actor_kind)
-  values(eid,p_incident_id,p_unit_id,old_s,'ASSIGNED',auth.uid(),'staff');
-  insert into public.cad_activity(event_id,incident_id,unit_id,action,actor_user_id,actor_kind)
-  values(eid,p_incident_id,p_unit_id,'UNIT_ASSIGNED',auth.uid(),'staff');
+  if not public.can_dispatch_event(eid) then
+    raise exception 'Dispatch access required';
+  end if;
+
+  if not exists(
+    select 1 from public.units
+    where id=p_unit_id and event_id=eid and active=true
+  ) then
+    raise exception 'Unit is not an active unit in this event';
+  end if;
+
+  select i.incident_number
+  into other_incident
+  from public.incident_units iu
+  join public.incidents i on i.id=iu.incident_id
+  where iu.unit_id=p_unit_id
+    and iu.cleared_at is null
+    and i.status='OPEN'
+    and i.id<>p_incident_id
+  order by iu.assigned_at desc
+  limit 1;
+
+  if other_incident is not null then
+    raise exception 'Unit is already assigned to %', other_incident;
+  end if;
+
+  select status into old_s
+  from public.units
+  where id=p_unit_id;
+
+  insert into public.incident_units(incident_id,unit_id)
+  values(p_incident_id,p_unit_id)
+  on conflict(incident_id,unit_id)
+  do update set assigned_at=now(),cleared_at=null;
+
+  update public.units
+  set status='ASSIGNED'
+  where id=p_unit_id;
+
+  if old_s is distinct from 'ASSIGNED' then
+    insert into public.unit_status_log(
+      event_id,incident_id,unit_id,old_status,new_status,
+      actor_user_id,actor_kind
+    )
+    values(
+      eid,p_incident_id,p_unit_id,old_s,'ASSIGNED',
+      auth.uid(),'staff'
+    );
+  end if;
+
+  insert into public.cad_activity(
+    event_id,incident_id,unit_id,action,actor_user_id,actor_kind
+  )
+  values(
+    eid,p_incident_id,p_unit_id,'UNIT_ASSIGNED',auth.uid(),'staff'
+  );
+end;
+$$;
+
+
+create or replace function public.unassign_unit(
+  p_incident_id uuid,
+  p_unit_id uuid,
+  p_new_status text default 'AVAILABLE'
+)
+returns void
+language plpgsql
+security definer
+set search_path=public
+as $$
+declare
+  eid uuid;
+  old_s text;
+  dep_statuses jsonb;
+begin
+  select event_id into eid
+  from public.incidents
+  where id=p_incident_id;
+
+  if eid is null then
+    raise exception 'Incident not found';
+  end if;
+
+  if not public.can_dispatch_event(eid) then
+    raise exception 'Dispatch access required';
+  end if;
+
+  if not exists(
+    select 1 from public.incident_units
+    where incident_id=p_incident_id
+      and unit_id=p_unit_id
+      and cleared_at is null
+  ) then
+    raise exception 'Unit is not currently assigned to this incident';
+  end if;
+
+  select u.status,d.status_profile
+  into old_s,dep_statuses
+  from public.units u
+  join public.event_departments d on d.id=u.department_id
+  where u.id=p_unit_id and u.event_id=eid;
+
+  if old_s is null then
+    raise exception 'Unit not found in this event';
+  end if;
+
+  if p_new_status is null or trim(p_new_status)='' then
+    p_new_status:='AVAILABLE';
+  end if;
+
+  -- AVAILABLE is always valid as the default post-assignment state.
+  -- Otherwise require the department's configured status list.
+  if p_new_status<>'AVAILABLE' and not (dep_statuses ? p_new_status) then
+    raise exception 'Status % is not allowed for this department', p_new_status;
+  end if;
+
+  update public.incident_units
+  set cleared_at=now()
+  where incident_id=p_incident_id
+    and unit_id=p_unit_id
+    and cleared_at is null;
+
+  update public.units
+  set status=p_new_status
+  where id=p_unit_id;
+
+  if old_s is distinct from p_new_status then
+    insert into public.unit_status_log(
+      event_id,incident_id,unit_id,old_status,new_status,
+      actor_user_id,actor_kind
+    )
+    values(
+      eid,p_incident_id,p_unit_id,old_s,p_new_status,
+      auth.uid(),'staff'
+    );
+  end if;
+
+  insert into public.cad_activity(
+    event_id,incident_id,unit_id,action,detail,
+    actor_user_id,actor_kind
+  )
+  values(
+    eid,p_incident_id,p_unit_id,'UNIT_UNASSIGNED',
+    jsonb_build_object('new_status',p_new_status),
+    auth.uid(),'staff'
+  );
+end;
+$$;
+
+
+create or replace function public.staff_set_unit_status(
+  p_unit_id uuid,
+  p_status text,
+  p_incident_id uuid default null
+)
+returns void
+language plpgsql
+security definer
+set search_path=public
+as $$
+declare
+  eid uuid;
+  old_s text;
+  dep_statuses jsonb;
+begin
+  select u.event_id,u.status,d.status_profile
+  into eid,old_s,dep_statuses
+  from public.units u
+  join public.event_departments d on d.id=u.department_id
+  where u.id=p_unit_id and u.active=true;
+
+  if eid is null then
+    raise exception 'Active unit not found';
+  end if;
+
+  if not public.can_dispatch_event(eid) then
+    raise exception 'Dispatch access required';
+  end if;
+
+  if p_incident_id is not null and not exists(
+    select 1 from public.incidents
+    where id=p_incident_id and event_id=eid
+  ) then
+    raise exception 'Incident is not part of this event';
+  end if;
+
+  if p_status<>'ASSIGNED' and not (dep_statuses ? p_status) then
+    raise exception 'Status % is not allowed for this department', p_status;
+  end if;
+
+  update public.units
+  set status=p_status
+  where id=p_unit_id;
+
+  if old_s is distinct from p_status then
+    insert into public.unit_status_log(
+      event_id,incident_id,unit_id,old_status,new_status,
+      actor_user_id,actor_kind
+    )
+    values(
+      eid,p_incident_id,p_unit_id,old_s,p_status,
+      auth.uid(),'staff'
+    );
+
+    insert into public.cad_activity(
+      event_id,incident_id,unit_id,action,detail,
+      actor_user_id,actor_kind
+    )
+    values(
+      eid,p_incident_id,p_unit_id,'UNIT_STATUS_CHANGED',
+      jsonb_build_object('from',old_s,'to',p_status),
+      auth.uid(),'staff'
+    );
+  end if;
 end;
 $$;
 
@@ -550,7 +799,7 @@ $$;
 
 create or replace function public.field_enter_event(p_event_code text,p_pin text,p_operator_name text default null)
 returns public.field_sessions
-language plpgsql security definer set search_path=public
+language plpgsql security definer set search_path=public,extensions
 as $$
 declare e public.events; fs public.field_sessions;
 begin
@@ -746,12 +995,11 @@ create policy "poi aliases admin delete" on public.poi_aliases for delete using(
   exists(select 1 from public.event_pois p where p.id=poi_id and public.can_admin_event(p.event_id))
 );
 
-create policy "incidents read" on public.incidents for select using(
-  public.has_event_staff_access(event_id) or exists(
-    select 1 from public.incident_units iu
-    join public.field_sessions fs on fs.unit_id=iu.unit_id
-    where iu.incident_id=incidents.id and iu.cleared_at is null and fs.auth_user_id=auth.uid() and fs.active=true
-  )
+create policy "incidents read" on public.incidents
+for select to authenticated
+using(
+  public.has_event_staff_access(event_id)
+  or private.field_can_read_incident(id)
 );
 create policy "incident departments read" on public.incident_departments for select using(
   exists(select 1 from public.incidents i where i.id=incident_id and public.has_event_staff_access(i.event_id))
@@ -829,6 +1077,8 @@ grant execute on function public.create_event(uuid,text,text,text,text) to authe
 grant execute on function public.set_event_field_access(uuid,text,boolean) to authenticated;
 grant execute on function public.create_incident(uuid,uuid[],text,text,double precision,double precision,double precision,double precision,text,text,text,uuid) to authenticated;
 grant execute on function public.assign_unit(uuid,uuid) to authenticated;
+grant execute on function public.unassign_unit(uuid,uuid,text) to authenticated;
+grant execute on function public.staff_set_unit_status(uuid,text,uuid) to authenticated;
 grant execute on function public.close_incident(uuid,text) to authenticated;
 grant execute on function public.w3w_for_coordinate(uuid,double precision,double precision) to authenticated;
 grant execute on function public.w3w_squares_in_bounds(uuid,double precision,double precision,double precision,double precision,integer) to authenticated;
@@ -838,3 +1088,1198 @@ grant execute on function public.field_release_unit(uuid) to authenticated;
 grant execute on function public.field_end_session(uuid) to authenticated;
 grant execute on function public.field_set_unit_status(uuid,text,uuid,timestamptz) to authenticated;
 grant select on public.dispatch_log to authenticated;
+
+-- ============================================================
+-- COMM CENTER PRO v0.3.0 EMS OPERATIONS
+-- ============================================================
+-- CommCenter Pro v0.3.0 — EMS Operations
+-- Adds treatment areas, lightweight patient/encounter tracking, ambulances,
+-- field/treatment/ambulance handoffs, treatment-area stations, and EMS command data.
+--
+-- This intentionally stores OPERATIONAL patient-flow data, not an ePCR.
+
+alter table public.events
+  add column if not exists next_ems_encounter_number integer not null default 1;
+
+-- ============================================================
+-- EMS RESOURCE CONFIGURATION
+-- ============================================================
+
+create table if not exists public.ems_unit_config (
+  unit_id uuid primary key references public.units(id) on delete cascade,
+  ems_role text not null check (ems_role in ('field_team','ambulance','command')),
+  transport_capable boolean not null default false,
+  ambulance_level text check (ambulance_level is null or ambulance_level in ('BLS','ALS','CCT','OTHER')),
+  active boolean not null default true,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists public.ems_treatment_areas (
+  id uuid primary key default gen_random_uuid(),
+  event_id uuid not null references public.events(id) on delete cascade,
+  department_id uuid references public.event_departments(id) on delete set null,
+  poi_id uuid references public.event_pois(id) on delete set null,
+  name text not null,
+  capacity integer not null default 1 check (capacity > 0),
+  status text not null default 'OPEN' check (status in ('OPEN','LIMITED','FULL','CLOSED')),
+  accepting_patients boolean not null default true,
+  active boolean not null default true,
+  notes text,
+  created_at timestamptz not null default now(),
+  unique(event_id,name)
+);
+
+create index if not exists ems_treatment_areas_event_idx
+  on public.ems_treatment_areas(event_id,active);
+
+create table if not exists public.treatment_area_sessions (
+  id uuid primary key default gen_random_uuid(),
+  event_id uuid not null references public.events(id) on delete cascade,
+  treatment_area_id uuid references public.ems_treatment_areas(id) on delete set null,
+  auth_user_id uuid not null references auth.users(id) on delete cascade,
+  operator_name text,
+  started_at timestamptz not null default now(),
+  last_seen_at timestamptz not null default now(),
+  ended_at timestamptz,
+  active boolean not null default true
+);
+
+create index if not exists treatment_area_sessions_auth_active_idx
+  on public.treatment_area_sessions(auth_user_id,active);
+create index if not exists treatment_area_sessions_area_active_idx
+  on public.treatment_area_sessions(treatment_area_id,active);
+
+-- ============================================================
+-- EMS ENCOUNTERS + HANDOFFS
+-- ============================================================
+
+create table if not exists public.ems_encounters (
+  id uuid primary key default gen_random_uuid(),
+  event_id uuid not null references public.events(id) on delete cascade,
+  incident_id uuid references public.incidents(id) on delete set null,
+  tracking_number text not null,
+  current_status text not null default 'FIELD' check (
+    current_status in ('FIELD','IN_TREATMENT','WITH_AMBULANCE','TRANSPORTING','CLOSED')
+  ),
+  current_unit_id uuid references public.units(id) on delete set null,
+  current_treatment_area_id uuid references public.ems_treatment_areas(id) on delete set null,
+  origin_unit_id uuid references public.units(id) on delete set null,
+  operational_note text,
+  transport_destination text,
+  transport_started_at timestamptz,
+  transport_completed_at timestamptz,
+  final_disposition text,
+  created_by uuid references auth.users(id),
+  created_at timestamptz not null default now(),
+  closed_at timestamptz,
+  unique(event_id,tracking_number),
+  check (not (current_unit_id is not null and current_treatment_area_id is not null))
+);
+
+create index if not exists ems_encounters_event_status_idx
+  on public.ems_encounters(event_id,current_status);
+create index if not exists ems_encounters_current_unit_idx
+  on public.ems_encounters(current_unit_id) where current_unit_id is not null;
+create index if not exists ems_encounters_current_area_idx
+  on public.ems_encounters(current_treatment_area_id) where current_treatment_area_id is not null;
+create index if not exists ems_encounters_incident_idx
+  on public.ems_encounters(incident_id) where incident_id is not null;
+
+create table if not exists public.ems_handoffs (
+  id uuid primary key default gen_random_uuid(),
+  event_id uuid not null references public.events(id) on delete cascade,
+  encounter_id uuid not null references public.ems_encounters(id) on delete cascade,
+  from_unit_id uuid references public.units(id) on delete set null,
+  from_treatment_area_id uuid references public.ems_treatment_areas(id) on delete set null,
+  to_unit_id uuid references public.units(id) on delete set null,
+  to_treatment_area_id uuid references public.ems_treatment_areas(id) on delete set null,
+  status text not null default 'PENDING' check (status in ('PENDING','COMPLETED','DECLINED','CANCELLED')),
+  note text,
+  requested_by uuid references auth.users(id),
+  requested_at timestamptz not null default now(),
+  responded_by uuid references auth.users(id),
+  responded_at timestamptz,
+  completed_at timestamptz,
+  check ((from_unit_id is not null)::int + (from_treatment_area_id is not null)::int = 1),
+  check ((to_unit_id is not null)::int + (to_treatment_area_id is not null)::int = 1)
+);
+
+create index if not exists ems_handoffs_event_status_idx
+  on public.ems_handoffs(event_id,status,requested_at desc);
+create index if not exists ems_handoffs_encounter_idx
+  on public.ems_handoffs(encounter_id,requested_at desc);
+create index if not exists ems_handoffs_to_unit_pending_idx
+  on public.ems_handoffs(to_unit_id,status) where to_unit_id is not null;
+create index if not exists ems_handoffs_to_area_pending_idx
+  on public.ems_handoffs(to_treatment_area_id,status) where to_treatment_area_id is not null;
+
+-- ============================================================
+-- PRIVATE ACCESS HELPERS (avoid circular RLS)
+-- ============================================================
+
+create schema if not exists private;
+revoke all on schema private from public;
+grant usage on schema private to authenticated;
+
+create or replace function private.field_can_read_incident(p_incident_id uuid)
+returns boolean
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select exists (
+    select 1
+    from public.incident_units iu
+    join public.field_sessions fs on fs.unit_id=iu.unit_id
+    where iu.incident_id=p_incident_id
+      and iu.cleared_at is null
+      and fs.auth_user_id=(select auth.uid())
+      and fs.active=true
+  );
+$$;
+
+create or replace function private.current_field_unit()
+returns uuid
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select fs.unit_id
+  from public.field_sessions fs
+  where fs.auth_user_id = (select auth.uid())
+    and fs.active = true
+    and fs.unit_id is not null
+  order by fs.started_at desc
+  limit 1;
+$$;
+
+create or replace function private.current_treatment_area()
+returns uuid
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select ts.treatment_area_id
+  from public.treatment_area_sessions ts
+  where ts.auth_user_id = (select auth.uid())
+    and ts.active = true
+    and ts.treatment_area_id is not null
+  order by ts.started_at desc
+  limit 1;
+$$;
+
+create or replace function private.treatment_has_event_access(p_event_id uuid)
+returns boolean
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select exists (
+    select 1
+    from public.treatment_area_sessions ts
+    where ts.event_id = p_event_id
+      and ts.auth_user_id = (select auth.uid())
+      and ts.active = true
+  );
+$$;
+
+create or replace function private.can_read_ems_resource_event(p_event_id uuid)
+returns boolean
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select public.has_event_staff_access(p_event_id)
+      or public.field_has_event_access(p_event_id)
+      or private.treatment_has_event_access(p_event_id);
+$$;
+
+create or replace function private.ems_config_event(p_unit_id uuid)
+returns uuid
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select u.event_id from public.units u where u.id=p_unit_id;
+$$;
+
+create or replace function private.can_read_ems_encounter(p_encounter_id uuid)
+returns boolean
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select exists (
+    select 1
+    from public.ems_encounters e
+    where e.id = p_encounter_id
+      and (
+        public.has_event_staff_access(e.event_id)
+        or e.current_unit_id = private.current_field_unit()
+        or e.current_treatment_area_id = private.current_treatment_area()
+        or exists (
+          select 1
+          from public.ems_handoffs h
+          where h.encounter_id=e.id
+            and (
+              h.from_unit_id = private.current_field_unit()
+              or h.to_unit_id = private.current_field_unit()
+              or h.from_treatment_area_id = private.current_treatment_area()
+              or h.to_treatment_area_id = private.current_treatment_area()
+            )
+        )
+      )
+  );
+$$;
+
+create or replace function private.can_read_ems_handoff(p_handoff_id uuid)
+returns boolean
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select exists (
+    select 1
+    from public.ems_handoffs h
+    where h.id=p_handoff_id
+      and (
+        public.has_event_staff_access(h.event_id)
+        or h.from_unit_id = private.current_field_unit()
+        or h.to_unit_id = private.current_field_unit()
+        or h.from_treatment_area_id = private.current_treatment_area()
+        or h.to_treatment_area_id = private.current_treatment_area()
+      )
+  );
+$$;
+
+create or replace function private.treatment_can_read_incident(p_incident_id uuid)
+returns boolean
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select exists (
+    select 1
+    from public.ems_encounters e
+    where e.incident_id=p_incident_id
+      and (
+        e.current_treatment_area_id=private.current_treatment_area()
+        or exists (
+          select 1 from public.ems_handoffs h
+          where h.encounter_id=e.id
+            and (
+              h.from_treatment_area_id=private.current_treatment_area()
+              or h.to_treatment_area_id=private.current_treatment_area()
+            )
+        )
+      )
+  );
+$$;
+
+revoke all on function private.field_can_read_incident(uuid) from public;
+revoke all on function private.current_field_unit() from public;
+revoke all on function private.current_treatment_area() from public;
+revoke all on function private.treatment_has_event_access(uuid) from public;
+revoke all on function private.can_read_ems_resource_event(uuid) from public;
+revoke all on function private.ems_config_event(uuid) from public;
+revoke all on function private.can_read_ems_encounter(uuid) from public;
+revoke all on function private.can_read_ems_handoff(uuid) from public;
+revoke all on function private.treatment_can_read_incident(uuid) from public;
+
+grant execute on function private.field_can_read_incident(uuid) to authenticated;
+grant execute on function private.current_field_unit() to authenticated;
+grant execute on function private.current_treatment_area() to authenticated;
+grant execute on function private.treatment_has_event_access(uuid) to authenticated;
+grant execute on function private.can_read_ems_resource_event(uuid) to authenticated;
+grant execute on function private.ems_config_event(uuid) to authenticated;
+grant execute on function private.can_read_ems_encounter(uuid) to authenticated;
+grant execute on function private.can_read_ems_handoff(uuid) to authenticated;
+grant execute on function private.treatment_can_read_incident(uuid) to authenticated;
+
+-- ============================================================
+-- TREATMENT AREA SESSION RPCs
+-- ============================================================
+
+create or replace function public.treatment_enter_event(
+  p_event_code text,
+  p_pin text,
+  p_operator_name text default null
+) returns public.treatment_area_sessions
+language plpgsql
+security definer
+set search_path=public,extensions
+as $$
+declare
+  e public.events;
+  ts public.treatment_area_sessions;
+begin
+  select * into e
+  from public.events
+  where upper(event_code)=upper(trim(p_event_code))
+    and active=true
+    and field_access_enabled=true;
+
+  if e.id is null then
+    raise exception 'Event not found or field access is disabled';
+  end if;
+
+  if e.field_pin_hash is null or crypt(p_pin,e.field_pin_hash)<>e.field_pin_hash then
+    raise exception 'Invalid event access code';
+  end if;
+
+  update public.treatment_area_sessions
+  set active=false,ended_at=now()
+  where auth_user_id=auth.uid() and active=true;
+
+  update public.field_sessions
+  set active=false,ended_at=now()
+  where auth_user_id=auth.uid() and active=true;
+
+  insert into public.treatment_area_sessions(event_id,auth_user_id,operator_name)
+  values(e.id,auth.uid(),nullif(trim(p_operator_name),''))
+  returning * into ts;
+
+  insert into public.cad_activity(event_id,action,detail,actor_user_id,actor_kind)
+  values(e.id,'TREATMENT_SESSION_STARTED',jsonb_build_object('treatment_session_id',ts.id),auth.uid(),'field');
+
+  return ts;
+end;
+$$;
+
+create or replace function public.treatment_claim_area(
+  p_treatment_session_id uuid,
+  p_treatment_area_id uuid
+) returns void
+language plpgsql
+security definer
+set search_path=public
+as $$
+declare ts public.treatment_area_sessions;
+begin
+  select * into ts
+  from public.treatment_area_sessions
+  where id=p_treatment_session_id and auth_user_id=auth.uid() and active=true;
+
+  if ts.id is null then raise exception 'Treatment-area session not found'; end if;
+  if not exists(
+    select 1 from public.ems_treatment_areas ta
+    where ta.id=p_treatment_area_id and ta.event_id=ts.event_id and ta.active=true
+  ) then raise exception 'Invalid treatment area'; end if;
+
+  update public.treatment_area_sessions
+  set treatment_area_id=p_treatment_area_id,last_seen_at=now()
+  where id=ts.id;
+end;
+$$;
+
+create or replace function public.treatment_release_area(p_treatment_session_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path=public
+as $$
+begin
+  update public.treatment_area_sessions
+  set treatment_area_id=null,last_seen_at=now()
+  where id=p_treatment_session_id and auth_user_id=auth.uid() and active=true;
+end;
+$$;
+
+create or replace function public.treatment_end_session(p_treatment_session_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path=public
+as $$
+begin
+  update public.treatment_area_sessions
+  set active=false,ended_at=now(),last_seen_at=now()
+  where id=p_treatment_session_id and auth_user_id=auth.uid() and active=true;
+end;
+$$;
+
+create or replace function public.treatment_set_status(
+  p_treatment_area_id uuid,
+  p_status text,
+  p_accepting boolean
+) returns void
+language plpgsql
+security definer
+set search_path=public
+as $$
+declare eid uuid;
+begin
+  select event_id into eid from public.ems_treatment_areas where id=p_treatment_area_id;
+  if eid is null then raise exception 'Treatment area not found'; end if;
+
+  if not (
+    public.can_dispatch_event(eid)
+    or private.current_treatment_area()=p_treatment_area_id
+  ) then raise exception 'Not authorized for this treatment area'; end if;
+
+  if p_status not in ('OPEN','LIMITED','FULL','CLOSED') then
+    raise exception 'Invalid treatment-area status';
+  end if;
+
+  update public.ems_treatment_areas
+  set status=p_status,accepting_patients=p_accepting
+  where id=p_treatment_area_id;
+end;
+$$;
+
+-- ============================================================
+-- EMS ENCOUNTER RPCs
+-- ============================================================
+
+create or replace function public.ems_create_encounter(
+  p_event_id uuid,
+  p_incident_id uuid default null,
+  p_source_unit_id uuid default null,
+  p_source_treatment_area_id uuid default null,
+  p_operational_note text default null
+) returns uuid
+language plpgsql
+security definer
+set search_path=public
+as $$
+declare
+  n integer;
+  tracking text;
+  encounter_id uuid;
+  initial_status text;
+begin
+  if ((p_source_unit_id is not null)::int + (p_source_treatment_area_id is not null)::int) <> 1 then
+    raise exception 'Exactly one source resource is required';
+  end if;
+
+  if p_incident_id is not null and not exists(
+    select 1 from public.incidents i where i.id=p_incident_id and i.event_id=p_event_id
+  ) then raise exception 'Incident is not part of this event'; end if;
+
+  if p_source_unit_id is not null then
+    if not exists(select 1 from public.units u where u.id=p_source_unit_id and u.event_id=p_event_id) then
+      raise exception 'Unit is not part of this event';
+    end if;
+    if not (public.can_dispatch_event(p_event_id) or public.field_has_unit_access(p_source_unit_id)) then
+      raise exception 'Not authorized for this unit';
+    end if;
+    initial_status:='FIELD';
+  else
+    if not exists(select 1 from public.ems_treatment_areas ta where ta.id=p_source_treatment_area_id and ta.event_id=p_event_id and ta.active=true) then
+      raise exception 'Treatment area is not part of this event';
+    end if;
+    if not (public.can_dispatch_event(p_event_id) or private.current_treatment_area()=p_source_treatment_area_id) then
+      raise exception 'Not authorized for this treatment area';
+    end if;
+    initial_status:='IN_TREATMENT';
+  end if;
+
+  update public.events
+  set next_ems_encounter_number=next_ems_encounter_number+1
+  where id=p_event_id
+  returning next_ems_encounter_number-1 into n;
+
+  tracking:='PT-'||lpad(n::text,4,'0');
+
+  insert into public.ems_encounters(
+    event_id,incident_id,tracking_number,current_status,current_unit_id,
+    current_treatment_area_id,origin_unit_id,operational_note,created_by
+  ) values(
+    p_event_id,p_incident_id,tracking,initial_status,p_source_unit_id,
+    p_source_treatment_area_id,p_source_unit_id,nullif(trim(p_operational_note),''),auth.uid()
+  ) returning id into encounter_id;
+
+  insert into public.cad_activity(event_id,incident_id,unit_id,action,detail,actor_user_id,actor_kind)
+  values(
+    p_event_id,p_incident_id,p_source_unit_id,'EMS_ENCOUNTER_CREATED',
+    jsonb_build_object('encounter_id',encounter_id,'tracking_number',tracking,'treatment_area_id',p_source_treatment_area_id),
+    auth.uid(),case when public.can_dispatch_event(p_event_id) then 'staff' else 'field' end
+  );
+
+  return encounter_id;
+end;
+$$;
+
+create or replace function public.ems_request_handoff(
+  p_encounter_id uuid,
+  p_to_unit_id uuid default null,
+  p_to_treatment_area_id uuid default null,
+  p_note text default null
+) returns uuid
+language plpgsql
+security definer
+set search_path=public
+as $$
+declare
+  e public.ems_encounters;
+  hid uuid;
+  caller_unit uuid;
+  caller_area uuid;
+  target_event uuid;
+  occupancy integer;
+  ta public.ems_treatment_areas;
+begin
+  select * into e from public.ems_encounters where id=p_encounter_id and current_status<>'CLOSED';
+  if e.id is null then raise exception 'Active EMS encounter not found'; end if;
+
+  if ((p_to_unit_id is not null)::int + (p_to_treatment_area_id is not null)::int) <> 1 then
+    raise exception 'Choose exactly one handoff destination';
+  end if;
+
+  caller_unit:=private.current_field_unit();
+  caller_area:=private.current_treatment_area();
+
+  if not (
+    public.can_dispatch_event(e.event_id)
+    or e.current_unit_id=caller_unit
+    or e.current_treatment_area_id=caller_area
+  ) then raise exception 'Only the current holder can request this handoff'; end if;
+
+  if exists(select 1 from public.ems_handoffs h where h.encounter_id=e.id and h.status='PENDING') then
+    raise exception 'This encounter already has a pending handoff';
+  end if;
+
+  if p_to_unit_id is not null then
+    select u.event_id into target_event from public.units u where u.id=p_to_unit_id and u.active=true;
+    if target_event is distinct from e.event_id then raise exception 'Destination unit is not part of this event'; end if;
+    if not exists(
+      select 1 from public.ems_unit_config c
+      where c.unit_id=p_to_unit_id and c.active=true and (c.ems_role='ambulance' or c.transport_capable=true)
+    ) then raise exception 'Destination unit is not configured as a transport-capable EMS unit'; end if;
+  else
+    select * into ta from public.ems_treatment_areas where id=p_to_treatment_area_id and active=true;
+    if ta.id is null or ta.event_id<>e.event_id then raise exception 'Destination treatment area is not part of this event'; end if;
+    if not ta.accepting_patients or ta.status in ('FULL','CLOSED') then raise exception 'Destination treatment area is not accepting patients'; end if;
+    select count(*) into occupancy
+    from public.ems_encounters x
+    where x.current_treatment_area_id=ta.id and x.current_status<>'CLOSED';
+    if occupancy>=ta.capacity then raise exception 'Destination treatment area is at capacity'; end if;
+  end if;
+
+  insert into public.ems_handoffs(
+    event_id,encounter_id,from_unit_id,from_treatment_area_id,
+    to_unit_id,to_treatment_area_id,note,requested_by
+  ) values(
+    e.event_id,e.id,e.current_unit_id,e.current_treatment_area_id,
+    p_to_unit_id,p_to_treatment_area_id,nullif(trim(p_note),''),auth.uid()
+  ) returning id into hid;
+
+  insert into public.cad_activity(event_id,incident_id,unit_id,action,detail,actor_user_id,actor_kind)
+  values(
+    e.event_id,e.incident_id,e.current_unit_id,'EMS_HANDOFF_REQUESTED',
+    jsonb_build_object('encounter_id',e.id,'handoff_id',hid,'to_unit_id',p_to_unit_id,'to_treatment_area_id',p_to_treatment_area_id),
+    auth.uid(),case when public.can_dispatch_event(e.event_id) then 'staff' else 'field' end
+  );
+
+  return hid;
+end;
+$$;
+
+create or replace function public.ems_accept_handoff(p_handoff_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path=public
+as $$
+declare
+  h public.ems_handoffs;
+  new_status text;
+  role_name text;
+begin
+  select * into h from public.ems_handoffs where id=p_handoff_id and status='PENDING';
+  if h.id is null then raise exception 'Pending handoff not found'; end if;
+
+  if not (
+    public.can_dispatch_event(h.event_id)
+    or (h.to_unit_id is not null and private.current_field_unit()=h.to_unit_id)
+    or (h.to_treatment_area_id is not null and private.current_treatment_area()=h.to_treatment_area_id)
+  ) then raise exception 'Only the receiving resource can accept this handoff'; end if;
+
+  if h.to_treatment_area_id is not null then
+    new_status:='IN_TREATMENT';
+  else
+    select ems_role into role_name from public.ems_unit_config where unit_id=h.to_unit_id and active=true;
+    if role_name='ambulance' then new_status:='WITH_AMBULANCE'; else new_status:='FIELD'; end if;
+  end if;
+
+  update public.ems_handoffs
+  set status='COMPLETED',responded_by=auth.uid(),responded_at=now(),completed_at=now()
+  where id=h.id;
+
+  update public.ems_handoffs
+  set status='CANCELLED',responded_at=now()
+  where encounter_id=h.encounter_id and id<>h.id and status='PENDING';
+
+  update public.ems_encounters
+  set current_unit_id=h.to_unit_id,
+      current_treatment_area_id=h.to_treatment_area_id,
+      current_status=new_status
+  where id=h.encounter_id;
+
+  insert into public.cad_activity(event_id,action,detail,actor_user_id,actor_kind)
+  values(
+    h.event_id,'EMS_HANDOFF_COMPLETED',
+    jsonb_build_object('encounter_id',h.encounter_id,'handoff_id',h.id,'to_unit_id',h.to_unit_id,'to_treatment_area_id',h.to_treatment_area_id),
+    auth.uid(),case when public.can_dispatch_event(h.event_id) then 'staff' else 'field' end
+  );
+end;
+$$;
+
+create or replace function public.ems_decline_handoff(p_handoff_id uuid,p_note text default null)
+returns void
+language plpgsql
+security definer
+set search_path=public
+as $$
+declare h public.ems_handoffs;
+begin
+  select * into h from public.ems_handoffs where id=p_handoff_id and status='PENDING';
+  if h.id is null then raise exception 'Pending handoff not found'; end if;
+
+  if not (
+    public.can_dispatch_event(h.event_id)
+    or (h.to_unit_id is not null and private.current_field_unit()=h.to_unit_id)
+    or (h.to_treatment_area_id is not null and private.current_treatment_area()=h.to_treatment_area_id)
+  ) then raise exception 'Only the receiving resource can decline this handoff'; end if;
+
+  update public.ems_handoffs
+  set status='DECLINED',responded_by=auth.uid(),responded_at=now(),
+      note=coalesce(nullif(trim(p_note),''),note)
+  where id=h.id;
+end;
+$$;
+
+create or replace function public.ems_cancel_handoff(p_handoff_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path=public
+as $$
+declare h public.ems_handoffs;
+begin
+  select * into h from public.ems_handoffs where id=p_handoff_id and status='PENDING';
+  if h.id is null then raise exception 'Pending handoff not found'; end if;
+
+  if not (
+    public.can_dispatch_event(h.event_id)
+    or (h.from_unit_id is not null and private.current_field_unit()=h.from_unit_id)
+    or (h.from_treatment_area_id is not null and private.current_treatment_area()=h.from_treatment_area_id)
+  ) then raise exception 'Only the sending resource can cancel this handoff'; end if;
+
+  update public.ems_handoffs
+  set status='CANCELLED',responded_by=auth.uid(),responded_at=now()
+  where id=h.id;
+end;
+$$;
+
+create or replace function public.ems_release_encounter(p_encounter_id uuid,p_disposition text)
+returns void
+language plpgsql
+security definer
+set search_path=public
+as $$
+declare e public.ems_encounters;
+begin
+  select * into e from public.ems_encounters where id=p_encounter_id and current_status<>'CLOSED';
+  if e.id is null then raise exception 'Active EMS encounter not found'; end if;
+
+  if not (
+    public.can_dispatch_event(e.event_id)
+    or e.current_unit_id=private.current_field_unit()
+    or e.current_treatment_area_id=private.current_treatment_area()
+  ) then raise exception 'Only the current holder can close this encounter'; end if;
+
+  update public.ems_handoffs
+  set status='CANCELLED',responded_at=now()
+  where encounter_id=e.id and status='PENDING';
+
+  update public.ems_encounters
+  set current_status='CLOSED',final_disposition=nullif(trim(p_disposition),''),closed_at=now()
+  where id=e.id;
+
+  insert into public.cad_activity(event_id,incident_id,unit_id,action,detail,actor_user_id,actor_kind)
+  values(
+    e.event_id,e.incident_id,e.current_unit_id,'EMS_ENCOUNTER_CLOSED',
+    jsonb_build_object('encounter_id',e.id,'tracking_number',e.tracking_number,'disposition',p_disposition),
+    auth.uid(),case when public.can_dispatch_event(e.event_id) then 'staff' else 'field' end
+  );
+end;
+$$;
+
+create or replace function public.ems_mark_transporting(p_encounter_id uuid,p_destination text)
+returns void
+language plpgsql
+security definer
+set search_path=public
+as $$
+declare e public.ems_encounters;
+begin
+  select * into e from public.ems_encounters where id=p_encounter_id and current_status<>'CLOSED';
+  if e.id is null then raise exception 'Active EMS encounter not found'; end if;
+
+  if e.current_unit_id is null or not exists(
+    select 1 from public.ems_unit_config c
+    where c.unit_id=e.current_unit_id and c.active=true and (c.ems_role='ambulance' or c.transport_capable=true)
+  ) then raise exception 'Current holder is not a transport-capable EMS unit'; end if;
+
+  if not (public.can_dispatch_event(e.event_id) or e.current_unit_id=private.current_field_unit()) then
+    raise exception 'Only the transporting unit can start transport';
+  end if;
+
+  update public.ems_encounters
+  set current_status='TRANSPORTING',transport_destination=nullif(trim(p_destination),''),transport_started_at=coalesce(transport_started_at,now())
+  where id=e.id;
+end;
+$$;
+
+create or replace function public.ems_complete_transport(p_encounter_id uuid,p_destination text default null)
+returns void
+language plpgsql
+security definer
+set search_path=public
+as $$
+declare e public.ems_encounters;
+begin
+  select * into e from public.ems_encounters where id=p_encounter_id and current_status<>'CLOSED';
+  if e.id is null then raise exception 'Active EMS encounter not found'; end if;
+
+  if not (public.can_dispatch_event(e.event_id) or e.current_unit_id=private.current_field_unit()) then
+    raise exception 'Only the transporting unit can complete transport';
+  end if;
+
+  update public.ems_encounters
+  set current_status='CLOSED',
+      transport_destination=coalesce(nullif(trim(p_destination),''),transport_destination),
+      transport_completed_at=now(),final_disposition='TRANSPORTED',closed_at=now()
+  where id=e.id;
+end;
+$$;
+
+-- Replace field entry so switching a browser from Treatment Area -> Field
+-- cannot leave both anonymous session types active at the same time.
+create or replace function public.field_enter_event(p_event_code text,p_pin text,p_operator_name text default null)
+returns public.field_sessions
+language plpgsql security definer set search_path=public,extensions
+as $$
+declare e public.events; fs public.field_sessions;
+begin
+  select * into e from public.events
+  where upper(event_code)=upper(trim(p_event_code)) and active=true and field_access_enabled=true;
+  if e.id is null then raise exception 'Event not found or field access is disabled'; end if;
+  if e.field_pin_hash is null or crypt(p_pin,e.field_pin_hash)<>e.field_pin_hash then raise exception 'Invalid event access code'; end if;
+
+  update public.field_sessions set active=false,ended_at=now() where auth_user_id=auth.uid() and active=true;
+  update public.treatment_area_sessions set active=false,ended_at=now() where auth_user_id=auth.uid() and active=true;
+
+  insert into public.field_sessions(event_id,auth_user_id,operator_name)
+  values(e.id,auth.uid(),nullif(trim(p_operator_name),'')) returning * into fs;
+
+  insert into public.cad_activity(event_id,action,detail,actor_user_id,actor_kind)
+  values(e.id,'FIELD_SESSION_STARTED',jsonb_build_object('field_session_id',fs.id),auth.uid(),'field');
+  return fs;
+end;
+$$;
+
+-- ============================================================
+-- RLS
+-- ============================================================
+
+-- Extend existing core read policies so treatment-area stations can read only the
+-- event/unit metadata they need, plus incidents linked to patients that passed
+-- through their station.
+drop policy if exists "event read" on public.events;
+create policy "event read" on public.events for select to authenticated
+using(
+  public.has_event_staff_access(id)
+  or public.field_has_event_access(id)
+  or private.treatment_has_event_access(id)
+);
+
+drop policy if exists "units read" on public.units;
+create policy "units read" on public.units for select to authenticated
+using(
+  public.has_event_staff_access(event_id)
+  or public.field_has_event_access(event_id)
+  or private.treatment_has_event_access(event_id)
+);
+
+drop policy if exists "incidents read" on public.incidents;
+create policy "incidents read" on public.incidents for select to authenticated
+using(
+  public.has_event_staff_access(event_id)
+  or private.field_can_read_incident(id)
+  or private.treatment_can_read_incident(id)
+);
+
+alter table public.ems_unit_config enable row level security;
+alter table public.ems_treatment_areas enable row level security;
+alter table public.treatment_area_sessions enable row level security;
+alter table public.ems_encounters enable row level security;
+alter table public.ems_handoffs enable row level security;
+
+create policy "ems unit config read"
+on public.ems_unit_config for select to authenticated
+using (private.can_read_ems_resource_event(private.ems_config_event(unit_id)));
+
+create policy "ems unit config admin insert"
+on public.ems_unit_config for insert to authenticated
+with check (public.can_admin_event(private.ems_config_event(unit_id)));
+
+create policy "ems unit config admin update"
+on public.ems_unit_config for update to authenticated
+using (public.can_admin_event(private.ems_config_event(unit_id)))
+with check (public.can_admin_event(private.ems_config_event(unit_id)));
+
+create policy "ems unit config admin delete"
+on public.ems_unit_config for delete to authenticated
+using (public.can_admin_event(private.ems_config_event(unit_id)));
+
+create policy "ems treatment areas read"
+on public.ems_treatment_areas for select to authenticated
+using (private.can_read_ems_resource_event(event_id));
+
+create policy "ems treatment areas admin insert"
+on public.ems_treatment_areas for insert to authenticated
+with check (public.can_admin_event(event_id));
+
+create policy "ems treatment areas admin update"
+on public.ems_treatment_areas for update to authenticated
+using (public.can_admin_event(event_id))
+with check (public.can_admin_event(event_id));
+
+create policy "ems treatment areas admin delete"
+on public.ems_treatment_areas for delete to authenticated
+using (public.can_admin_event(event_id));
+
+create policy "treatment own session read"
+on public.treatment_area_sessions for select to authenticated
+using (auth_user_id=auth.uid());
+
+create policy "treatment sessions staff read"
+on public.treatment_area_sessions for select to authenticated
+using (public.has_event_staff_access(event_id));
+
+create policy "ems encounters read"
+on public.ems_encounters for select to authenticated
+using (private.can_read_ems_encounter(id));
+
+create policy "ems handoffs read"
+on public.ems_handoffs for select to authenticated
+using (private.can_read_ems_handoff(id));
+
+-- ============================================================
+-- GRANTS
+-- ============================================================
+
+grant select on public.ems_unit_config,public.ems_treatment_areas,public.treatment_area_sessions,
+  public.ems_encounters,public.ems_handoffs to authenticated;
+
+grant insert,update,delete on public.ems_unit_config,public.ems_treatment_areas to authenticated;
+
+grant execute on function public.treatment_enter_event(text,text,text) to authenticated;
+grant execute on function public.treatment_claim_area(uuid,uuid) to authenticated;
+grant execute on function public.treatment_release_area(uuid) to authenticated;
+grant execute on function public.treatment_end_session(uuid) to authenticated;
+grant execute on function public.treatment_set_status(uuid,text,boolean) to authenticated;
+grant execute on function public.ems_create_encounter(uuid,uuid,uuid,uuid,text) to authenticated;
+grant execute on function public.ems_request_handoff(uuid,uuid,uuid,text) to authenticated;
+grant execute on function public.ems_accept_handoff(uuid) to authenticated;
+grant execute on function public.ems_decline_handoff(uuid,text) to authenticated;
+grant execute on function public.ems_cancel_handoff(uuid) to authenticated;
+grant execute on function public.ems_release_encounter(uuid,text) to authenticated;
+grant execute on function public.ems_mark_transporting(uuid,text) to authenticated;
+grant execute on function public.ems_complete_transport(uuid,text) to authenticated;
+
+-- ============================================================
+-- REALTIME
+-- ============================================================
+
+do $$
+begin
+  if not exists(select 1 from pg_publication_tables where pubname='supabase_realtime' and schemaname='public' and tablename='ems_encounters') then
+    alter publication supabase_realtime add table public.ems_encounters;
+  end if;
+  if not exists(select 1 from pg_publication_tables where pubname='supabase_realtime' and schemaname='public' and tablename='ems_handoffs') then
+    alter publication supabase_realtime add table public.ems_handoffs;
+  end if;
+  if not exists(select 1 from pg_publication_tables where pubname='supabase_realtime' and schemaname='public' and tablename='ems_treatment_areas') then
+    alter publication supabase_realtime add table public.ems_treatment_areas;
+  end if;
+end $$;
+-- CommCenter Pro v0.4.0
+-- Multi-level venue / stadium mapping upgrade.
+-- Safe for an existing v0.3.1 database. Existing maps/incidents/POIs are preserved.
+
+alter table public.events
+  add column if not exists venue_type text not null default 'outdoor'
+  check (venue_type in ('outdoor','multi_level','hybrid')),
+  add column if not exists offline_w3w_path text;
+
+create table if not exists public.event_map_layers (
+  id uuid primary key default gen_random_uuid(),
+  event_id uuid not null references public.events(id) on delete cascade,
+  name text not null,
+  short_name text,
+  level_code text,
+  level_number integer,
+  level_type text not null default 'venue'
+    check (level_type in ('exterior','field','concourse','suite','deck','back_of_house','parking','venue','other')),
+  sort_order integer not null default 100,
+  source_pdf_path text,
+  rendered_image_path text,
+  image_width integer,
+  image_height integer,
+  georef_method text,
+  georef_coefficients jsonb,
+  georef_rmse_m double precision,
+  georef_max_error_m double precision,
+  status text not null default 'draft' check(status in ('draft','calibrated','published')),
+  is_default boolean not null default false,
+  active boolean not null default true,
+  published_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique(event_id,name)
+);
+
+create unique index if not exists event_map_layers_one_default_idx
+  on public.event_map_layers(event_id)
+  where is_default=true and active=true;
+
+alter table public.map_control_points
+  add column if not exists map_layer_id uuid references public.event_map_layers(id) on delete cascade;
+
+alter table public.event_pois
+  add column if not exists map_layer_id uuid references public.event_map_layers(id) on delete set null;
+
+create table if not exists public.event_zones (
+  id uuid primary key default gen_random_uuid(),
+  event_id uuid not null references public.events(id) on delete cascade,
+  map_layer_id uuid references public.event_map_layers(id) on delete cascade,
+  name text not null,
+  short_name text,
+  category text,
+  notes text,
+  sort_order integer not null default 100,
+  active boolean not null default true,
+  unique(event_id,map_layer_id,name)
+);
+
+alter table public.event_pois
+  add column if not exists zone_id uuid references public.event_zones(id) on delete set null;
+
+alter table public.incidents
+  add column if not exists map_layer_id uuid references public.event_map_layers(id) on delete set null,
+  add column if not exists zone_id uuid references public.event_zones(id) on delete set null;
+
+alter table public.units
+  add column if not exists current_map_layer_id uuid references public.event_map_layers(id) on delete set null,
+  add column if not exists current_zone_id uuid references public.event_zones(id) on delete set null,
+  add column if not exists current_poi_id uuid references public.event_pois(id) on delete set null;
+
+create table if not exists public.venue_access_points (
+  id uuid primary key default gen_random_uuid(),
+  event_id uuid not null references public.events(id) on delete cascade,
+  name text not null,
+  access_type text not null
+    check(access_type in ('elevator','stairwell','escalator','ramp','portal','vomitory','tunnel','gate','corridor','other')),
+  notes text,
+  active boolean not null default true,
+  created_at timestamptz not null default now(),
+  unique(event_id,name)
+);
+
+create table if not exists public.venue_access_point_nodes (
+  id uuid primary key default gen_random_uuid(),
+  access_point_id uuid not null references public.venue_access_points(id) on delete cascade,
+  map_layer_id uuid not null references public.event_map_layers(id) on delete cascade,
+  zone_id uuid references public.event_zones(id) on delete set null,
+  map_x double precision not null,
+  map_y double precision not null,
+  latitude double precision,
+  longitude double precision,
+  w3w text,
+  instructions text,
+  created_at timestamptz not null default now(),
+  unique(access_point_id,map_layer_id)
+);
+
+create index if not exists event_map_layers_event_idx on public.event_map_layers(event_id,sort_order);
+create index if not exists event_zones_event_layer_idx on public.event_zones(event_id,map_layer_id,sort_order);
+create index if not exists venue_access_points_event_idx on public.venue_access_points(event_id);
+create index if not exists venue_access_nodes_layer_idx on public.venue_access_point_nodes(map_layer_id);
+
+-- Migrate the existing single event map into a default map layer once.
+insert into public.event_map_layers(
+  event_id,name,short_name,level_code,level_type,sort_order,
+  source_pdf_path,rendered_image_path,image_width,image_height,
+  georef_method,georef_coefficients,georef_rmse_m,georef_max_error_m,
+  status,is_default,published_at,updated_at
+)
+select
+  em.event_id,'Event / Site Level','EVENT','EVENT','venue',10,
+  em.source_pdf_path,em.rendered_image_path,em.image_width,em.image_height,
+  em.georef_method,em.georef_coefficients,em.georef_rmse_m,em.georef_max_error_m,
+  em.status,true,em.published_at,em.updated_at
+from public.event_maps em
+where not exists(select 1 from public.event_map_layers l where l.event_id=em.event_id);
+
+-- Attach legacy control points/POIs to the default layer when possible.
+update public.map_control_points cp
+set map_layer_id=l.id
+from public.event_map_layers l
+where cp.event_id=l.event_id and l.is_default=true and cp.map_layer_id is null;
+
+update public.event_pois p
+set map_layer_id=l.id
+from public.event_map_layers l
+where p.event_id=l.event_id and l.is_default=true and p.map_layer_id is null;
+
+update public.incidents i
+set map_layer_id=l.id
+from public.event_map_layers l
+where i.event_id=l.event_id and l.is_default=true and i.map_layer_id is null;
+
+-- ---------------- Access helpers / RLS ----------------
+alter table public.event_map_layers enable row level security;
+alter table public.event_zones enable row level security;
+alter table public.venue_access_points enable row level security;
+alter table public.venue_access_point_nodes enable row level security;
+
+create policy "map layers read" on public.event_map_layers for select
+using(public.has_event_staff_access(event_id) or public.field_has_event_access(event_id));
+create policy "map layers admin insert" on public.event_map_layers for insert
+with check(public.can_admin_event(event_id));
+create policy "map layers admin update" on public.event_map_layers for update
+using(public.can_admin_event(event_id)) with check(public.can_admin_event(event_id));
+create policy "map layers admin delete" on public.event_map_layers for delete
+using(public.can_admin_event(event_id));
+
+create policy "zones read" on public.event_zones for select
+using(public.has_event_staff_access(event_id) or public.field_has_event_access(event_id));
+create policy "zones admin insert" on public.event_zones for insert
+with check(public.can_admin_event(event_id));
+create policy "zones admin update" on public.event_zones for update
+using(public.can_admin_event(event_id)) with check(public.can_admin_event(event_id));
+create policy "zones admin delete" on public.event_zones for delete
+using(public.can_admin_event(event_id));
+
+create policy "access points read" on public.venue_access_points for select
+using(public.has_event_staff_access(event_id) or public.field_has_event_access(event_id));
+create policy "access points admin insert" on public.venue_access_points for insert
+with check(public.can_admin_event(event_id));
+create policy "access points admin update" on public.venue_access_points for update
+using(public.can_admin_event(event_id)) with check(public.can_admin_event(event_id));
+create policy "access points admin delete" on public.venue_access_points for delete
+using(public.can_admin_event(event_id));
+
+create policy "access nodes read" on public.venue_access_point_nodes for select
+using(exists(
+  select 1 from public.venue_access_points ap
+  where ap.id=access_point_id and (public.has_event_staff_access(ap.event_id) or public.field_has_event_access(ap.event_id))
+));
+create policy "access nodes admin insert" on public.venue_access_point_nodes for insert
+with check(exists(
+  select 1 from public.venue_access_points ap
+  where ap.id=access_point_id and public.can_admin_event(ap.event_id)
+));
+create policy "access nodes admin update" on public.venue_access_point_nodes for update
+using(exists(select 1 from public.venue_access_points ap where ap.id=access_point_id and public.can_admin_event(ap.event_id)))
+with check(exists(select 1 from public.venue_access_points ap where ap.id=access_point_id and public.can_admin_event(ap.event_id)));
+create policy "access nodes admin delete" on public.venue_access_point_nodes for delete
+using(exists(select 1 from public.venue_access_points ap where ap.id=access_point_id and public.can_admin_event(ap.event_id)));
+
+grant select,insert,update,delete on public.event_map_layers,public.event_zones,public.venue_access_points,public.venue_access_point_nodes to authenticated;
+
+-- ---------------- v2 incident creation ----------------
+create or replace function public.create_incident_v2(
+  p_event_id uuid,
+  p_department_ids uuid[],
+  p_call_type text,
+  p_priority text,
+  p_latitude double precision,
+  p_longitude double precision,
+  p_map_x double precision,
+  p_map_y double precision,
+  p_w3w text,
+  p_landmark text,
+  p_notes text,
+  p_poi_id uuid default null,
+  p_map_layer_id uuid default null,
+  p_zone_id uuid default null
+) returns uuid
+language plpgsql security definer set search_path=public
+as $$
+declare n integer; prefix text; number text; iid uuid; d uuid;
+begin
+  if not public.can_dispatch_event(p_event_id) then raise exception 'Dispatch access required'; end if;
+  if array_length(p_department_ids,1) is null then raise exception 'At least one department is required'; end if;
+
+  if p_map_layer_id is not null and not exists(select 1 from public.event_map_layers where id=p_map_layer_id and event_id=p_event_id and active=true) then
+    raise exception 'Map layer is not part of this event';
+  end if;
+  if p_zone_id is not null and not exists(select 1 from public.event_zones where id=p_zone_id and event_id=p_event_id and active=true) then
+    raise exception 'Zone is not part of this event';
+  end if;
+
+  update public.events set next_incident_number=next_incident_number+1 where id=p_event_id
+  returning next_incident_number-1,incident_prefix into n,prefix;
+  number:=prefix||'-'||lpad(n::text,3,'0');
+
+  insert into public.incidents(
+    event_id,incident_number,call_type,priority,poi_id,map_layer_id,zone_id,
+    latitude,longitude,map_x,map_y,w3w,landmark,notes,created_by
+  ) values(
+    p_event_id,number,p_call_type,p_priority,p_poi_id,p_map_layer_id,p_zone_id,
+    p_latitude,p_longitude,p_map_x,p_map_y,p_w3w,p_landmark,p_notes,auth.uid()
+  ) returning id into iid;
+
+  foreach d in array p_department_ids loop
+    insert into public.incident_departments(incident_id,department_id)
+    select iid,d where exists(select 1 from public.event_departments where id=d and event_id=p_event_id);
+  end loop;
+
+  insert into public.cad_activity(event_id,incident_id,action,detail,actor_user_id,actor_kind)
+  values(p_event_id,iid,'INCIDENT_CREATED',jsonb_build_object(
+    'incident_number',number,'call_type',p_call_type,'map_layer_id',p_map_layer_id,'zone_id',p_zone_id
+  ),auth.uid(),'staff');
+  return iid;
+end;
+$$;
+
+grant execute on function public.create_incident_v2(uuid,uuid[],text,text,double precision,double precision,double precision,double precision,text,text,text,uuid,uuid,uuid) to authenticated;
+
+create or replace function public.staff_set_unit_location(
+  p_unit_id uuid,
+  p_map_layer_id uuid default null,
+  p_zone_id uuid default null,
+  p_poi_id uuid default null
+) returns void
+language plpgsql security definer set search_path=public
+as $$
+declare eid uuid;
+begin
+  select event_id into eid from public.units where id=p_unit_id and active=true;
+  if eid is null then raise exception 'Active unit not found'; end if;
+  if not public.can_dispatch_event(eid) then raise exception 'Dispatch access required'; end if;
+
+  if p_map_layer_id is not null and not exists(select 1 from public.event_map_layers where id=p_map_layer_id and event_id=eid) then raise exception 'Invalid map layer'; end if;
+  if p_zone_id is not null and not exists(select 1 from public.event_zones where id=p_zone_id and event_id=eid) then raise exception 'Invalid zone'; end if;
+  if p_poi_id is not null and not exists(select 1 from public.event_pois where id=p_poi_id and event_id=eid) then raise exception 'Invalid POI'; end if;
+
+  update public.units set current_map_layer_id=p_map_layer_id,current_zone_id=p_zone_id,current_poi_id=p_poi_id where id=p_unit_id;
+  insert into public.cad_activity(event_id,unit_id,action,detail,actor_user_id,actor_kind)
+  values(eid,p_unit_id,'UNIT_LOCATION_CHANGED',jsonb_build_object('map_layer_id',p_map_layer_id,'zone_id',p_zone_id,'poi_id',p_poi_id),auth.uid(),'staff');
+end;
+$$;
+
+grant execute on function public.staff_set_unit_location(uuid,uuid,uuid,uuid) to authenticated;
