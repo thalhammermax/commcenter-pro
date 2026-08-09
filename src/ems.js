@@ -6,13 +6,107 @@ const ageMinutes=iso=>iso?Math.max(0,Math.round((Date.now()-new Date(iso).getTim
 const pretty=s=>String(s||"").replaceAll("_"," ");
 
 let treatmentChannel=null;
-let emsOpsChannel=null;
+let treatmentChannelKey=null;
+let treatmentRefreshTimer=null;
+let treatmentRealtimeGeneration=0;
 
-function clearTreatmentRealtime(){
-  if(treatmentChannel){supabase.removeChannel(treatmentChannel);treatmentChannel=null;}
+let emsOpsChannel=null;
+let emsOpsChannelKey=null;
+let emsOpsRefreshTimer=null;
+let emsOpsRealtimeGeneration=0;
+
+async function clearTreatmentRealtime(){
+  treatmentRealtimeGeneration++;
+  if(treatmentRefreshTimer){
+    clearTimeout(treatmentRefreshTimer);
+    treatmentRefreshTimer=null;
+  }
+  const channel=treatmentChannel;
+  treatmentChannel=null;
+  treatmentChannelKey=null;
+  if(channel){
+    try{await supabase.removeChannel(channel);}catch(error){console.warn("Treatment Realtime cleanup warning",error);}
+  }
 }
-function clearEmsOpsRealtime(){
-  if(emsOpsChannel){supabase.removeChannel(emsOpsChannel);emsOpsChannel=null;}
+
+async function clearEmsOpsRealtime(){
+  emsOpsRealtimeGeneration++;
+  if(emsOpsRefreshTimer){
+    clearTimeout(emsOpsRefreshTimer);
+    emsOpsRefreshTimer=null;
+  }
+  const channel=emsOpsChannel;
+  emsOpsChannel=null;
+  emsOpsChannelKey=null;
+  if(channel){
+    try{await supabase.removeChannel(channel);}catch(error){console.warn("EMS Ops Realtime cleanup warning",error);}
+  }
+}
+
+async function ensureTreatmentRealtime(app,ts,area,ctx){
+  const key=`${ts.event_id}:${area.id}`;
+
+  // Re-renders of the treatment dashboard reuse the existing subscribed
+  // channel. Supabase does not allow .on(postgres_changes) callbacks to be
+  // added after subscribe(), which was the source of the v0.5.4 error.
+  if(treatmentChannel&&treatmentChannelKey===key)return;
+
+  await clearTreatmentRealtime();
+  const generation=treatmentRealtimeGeneration;
+  treatmentChannelKey=key;
+
+  const refresh=()=>{
+    if(generation!==treatmentRealtimeGeneration)return;
+    if(treatmentRefreshTimer)clearTimeout(treatmentRefreshTimer);
+    treatmentRefreshTimer=setTimeout(()=>{
+      treatmentRefreshTimer=null;
+      if(generation!==treatmentRealtimeGeneration)return;
+      treatmentDashboard(app,ts,ctx);
+    },250);
+  };
+
+  const channel=supabase.channel(`treatment-${ts.event_id}-${area.id}-${Date.now()}`)
+    .on("postgres_changes",{event:"*",schema:"public",table:"ems_encounters",filter:`event_id=eq.${ts.event_id}`},refresh)
+    .on("postgres_changes",{event:"*",schema:"public",table:"ems_handoffs",filter:`event_id=eq.${ts.event_id}`},refresh)
+    .on("postgres_changes",{event:"*",schema:"public",table:"ems_treatment_areas",filter:`event_id=eq.${ts.event_id}`},refresh);
+
+  treatmentChannel=channel;
+  channel.subscribe(status=>{
+    if(status==="CHANNEL_ERROR"||status==="TIMED_OUT"){
+      console.warn(`Treatment Realtime status: ${status}`);
+    }
+  });
+}
+
+async function ensureEmsOpsRealtime(app,ctx){
+  const key=String(ctx.eventId);
+  if(emsOpsChannel&&emsOpsChannelKey===key)return;
+
+  await clearEmsOpsRealtime();
+  const generation=emsOpsRealtimeGeneration;
+  emsOpsChannelKey=key;
+
+  const refresh=()=>{
+    if(generation!==emsOpsRealtimeGeneration)return;
+    if(emsOpsRefreshTimer)clearTimeout(emsOpsRefreshTimer);
+    emsOpsRefreshTimer=setTimeout(()=>{
+      emsOpsRefreshTimer=null;
+      if(generation!==emsOpsRealtimeGeneration)return;
+      renderEmsOps(app,ctx,{preserveRealtime:true});
+    },250);
+  };
+
+  const channel=supabase.channel(`ems-ops-${ctx.eventId}-${Date.now()}`)
+    .on("postgres_changes",{event:"*",schema:"public",table:"ems_encounters",filter:`event_id=eq.${ctx.eventId}`},refresh)
+    .on("postgres_changes",{event:"*",schema:"public",table:"ems_handoffs",filter:`event_id=eq.${ctx.eventId}`},refresh)
+    .on("postgres_changes",{event:"*",schema:"public",table:"ems_treatment_areas",filter:`event_id=eq.${ctx.eventId}`},refresh);
+
+  emsOpsChannel=channel;
+  channel.subscribe(status=>{
+    if(status==="CHANNEL_ERROR"||status==="TIMED_OUT"){
+      console.warn(`EMS Ops Realtime status: ${status}`);
+    }
+  });
 }
 
 async function getUnitsAndConfigs(eventId){
@@ -53,8 +147,8 @@ function encounterIncidentNature(encounter,incidentMap){
    EMS COMMAND / DISPATCH BOARD
    ============================================================ */
 
-export async function renderEmsOps(app,ctx){
-  clearEmsOpsRealtime();
+export async function renderEmsOps(app,ctx,{preserveRealtime=false}={}){
+  if(!preserveRealtime)await clearEmsOpsRealtime();
   const {eventId,event,header,onBack,onAdmin}=ctx;
   try{
     const [areasRes,encRes,handoffRes,units]=await Promise.all([
@@ -148,8 +242,8 @@ export async function renderEmsOps(app,ctx){
         </section>
       </div></div>`;
 
-    document.querySelector("#emsBack").onclick=()=>{clearEmsOpsRealtime();onBack();};
-    document.querySelector("#emsAdmin").onclick=()=>{clearEmsOpsRealtime();onAdmin();};
+    document.querySelector("#emsBack").onclick=async()=>{await clearEmsOpsRealtime();onBack();};
+    document.querySelector("#emsAdmin").onclick=async()=>{await clearEmsOpsRealtime();onAdmin();};
 
     document.querySelectorAll("[data-dispatch-confirm-treatment]").forEach(btn=>btn.onclick=async()=>{
       const area=areas.find(a=>a.id===btn.dataset.areaId);
@@ -163,16 +257,7 @@ export async function renderEmsOps(app,ctx){
       renderEmsOps(app,ctx);
     });
 
-    let refreshTimer=null;
-    const refresh=()=>{
-      clearTimeout(refreshTimer);
-      refreshTimer=setTimeout(()=>renderEmsOps(app,ctx),250);
-    };
-    emsOpsChannel=supabase.channel(`ems-ops-${eventId}`)
-      .on("postgres_changes",{event:"*",schema:"public",table:"ems_encounters",filter:`event_id=eq.${eventId}`},refresh)
-      .on("postgres_changes",{event:"*",schema:"public",table:"ems_handoffs",filter:`event_id=eq.${eventId}`},refresh)
-      .on("postgres_changes",{event:"*",schema:"public",table:"ems_treatment_areas",filter:`event_id=eq.${eventId}`},refresh)
-      .subscribe();
+    await ensureEmsOpsRealtime(app,ctx);
   }catch(err){
     console.error("EMS Ops load error",err);
     app.innerHTML=`<div class="shell">${header("EMS Operations Error")}<div class="wrap"><div class="notice error"><strong>EMS Operations could not load.</strong><br>${esc(err.message)}</div><button class="btn" id="emsBack">Back to CAD</button></div></div>`;
@@ -524,7 +609,7 @@ export function bindFieldEmsPanel(state,{eventId,unitId,incident,refresh}){
    ============================================================ */
 
 export async function renderTreatmentAreaFlow(app,ctx){
-  clearTreatmentRealtime();
+  await clearTreatmentRealtime();
   const {header,onExit}=ctx;
   let {data:{session}}=await supabase.auth.getSession();
   if(!session||!session.user?.is_anonymous){
@@ -575,7 +660,7 @@ async function treatmentPicker(app,ts,{header,onExit}){
   document.querySelectorAll("[data-claim-area]").forEach(b=>b.onclick=async()=>{
     const {error}=await supabase.rpc("treatment_claim_area",{p_treatment_session_id:ts.id,p_treatment_area_id:b.dataset.claimArea});if(error)alert(error.message);else renderTreatmentAreaFlow(app,{header,onExit});
   });
-  document.querySelector("#tLeave").onclick=async()=>{await supabase.rpc("treatment_end_session",{p_treatment_session_id:ts.id});await supabase.auth.signOut();onExit();};
+  document.querySelector("#tLeave").onclick=async()=>{await clearTreatmentRealtime();await supabase.rpc("treatment_end_session",{p_treatment_session_id:ts.id});await supabase.auth.signOut();onExit();};
 }
 
 async function treatmentDashboard(app,ts,{header,onExit}){
@@ -713,15 +798,10 @@ async function treatmentDashboard(app,ts,{header,onExit}){
     document.querySelectorAll("[data-ta-request-amb]").forEach(b=>b.onclick=async()=>{const id=b.dataset.taRequestAmb,amb=document.querySelector(`#ta-amb-${id}`).value;if(!amb)return alert("Choose an ambulance.");const {error}=await supabase.rpc("ems_request_handoff",{p_encounter_id:id,p_to_unit_id:amb,p_to_treatment_area_id:null,p_note:null});if(error)alert(error.message);else treatmentDashboard(app,ts,{header,onExit});});
     document.querySelectorAll("[data-ta-release]").forEach(b=>b.onclick=async()=>{const disp=prompt("Operational disposition:","RELEASED_FROM_TREATMENT")||"RELEASED_FROM_TREATMENT";const {error}=await supabase.rpc("ems_release_encounter",{p_encounter_id:b.dataset.taRelease,p_disposition:disp});if(error)alert(error.message);else treatmentDashboard(app,ts,{header,onExit});});
     document.querySelector("#taRefresh").onclick=()=>treatmentDashboard(app,ts,{header,onExit});
-    document.querySelector("#taChange").onclick=async()=>{clearTreatmentRealtime();await supabase.rpc("treatment_release_area",{p_treatment_session_id:ts.id});renderTreatmentAreaFlow(app,{header,onExit});};
-    document.querySelector("#taLeave").onclick=async()=>{clearTreatmentRealtime();await supabase.rpc("treatment_end_session",{p_treatment_session_id:ts.id});await supabase.auth.signOut();onExit();};
+    document.querySelector("#taChange").onclick=async()=>{await clearTreatmentRealtime();await supabase.rpc("treatment_release_area",{p_treatment_session_id:ts.id});renderTreatmentAreaFlow(app,{header,onExit});};
+    document.querySelector("#taLeave").onclick=async()=>{await clearTreatmentRealtime();await supabase.rpc("treatment_end_session",{p_treatment_session_id:ts.id});await supabase.auth.signOut();onExit();};
 
-    let timer=null;const refresh=()=>{clearTimeout(timer);timer=setTimeout(()=>treatmentDashboard(app,ts,{header,onExit}),250);};
-    treatmentChannel=supabase.channel(`treatment-${ts.event_id}-${area.id}`)
-      .on("postgres_changes",{event:"*",schema:"public",table:"ems_encounters",filter:`event_id=eq.${ts.event_id}`},refresh)
-      .on("postgres_changes",{event:"*",schema:"public",table:"ems_handoffs",filter:`event_id=eq.${ts.event_id}`},refresh)
-      .on("postgres_changes",{event:"*",schema:"public",table:"ems_treatment_areas",filter:`event_id=eq.${ts.event_id}`},refresh)
-      .subscribe();
+    await ensureTreatmentRealtime(app,ts,area,{header,onExit});
   }catch(err){
     console.error("Treatment area dashboard error",err);treatmentError(app,header,err.message,onExit);
   }

@@ -757,3 +757,107 @@ body.modal-open{
     flex:1 1 46%;
   }
 }
+
+
+/* v0.5.4 — field-unit status buttons clearly show current state */
+.status-buttons{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(120px,1fr));
+  gap:8px;
+}
+.status-buttons .field-status-button{
+  position:relative;
+  min-height:46px;
+  border-width:1px;
+  font-weight:800;
+  letter-spacing:.01em;
+  transition:background-color .12s ease,border-color .12s ease,color .12s ease,box-shadow .12s ease,transform .12s ease;
+}
+
+/* Unselected options keep a subtle semantic tint. */
+.status-buttons .field-status-green{
+  border-color:#166534;
+  background:#0c1f17;
+  color:#bbf7d0;
+}
+.status-buttons .field-status-blue{
+  border-color:#1d4ed8;
+  background:#0c1830;
+  color:#bfdbfe;
+}
+.status-buttons .field-status-amber{
+  border-color:#a16207;
+  background:#241806;
+  color:#fde68a;
+}
+.status-buttons .field-status-purple{
+  border-color:#7e22ce;
+  background:#21102f;
+  color:#e9d5ff;
+}
+.status-buttons .field-status-red{
+  border-color:#991b1b;
+  background:#2a0d0d;
+  color:#fecaca;
+}
+.status-buttons .field-status-neutral{
+  border-color:#475569;
+  background:#111827;
+  color:#e2e8f0;
+}
+
+/* The current status is a strong filled button, not just an outline. */
+.status-buttons .field-status-active{
+  outline:3px solid rgba(255,255,255,.9);
+  outline-offset:2px;
+  transform:translateY(-1px);
+  box-shadow:0 0 0 4px rgba(96,165,250,.20);
+}
+.status-buttons .field-status-green.field-status-active{
+  background:#15803d;
+  border-color:#4ade80;
+  color:#fff;
+}
+.status-buttons .field-status-blue.field-status-active{
+  background:#2563eb;
+  border-color:#60a5fa;
+  color:#fff;
+}
+.status-buttons .field-status-amber.field-status-active{
+  background:#b45309;
+  border-color:#fbbf24;
+  color:#fff;
+}
+.status-buttons .field-status-purple.field-status-active{
+  background:#7e22ce;
+  border-color:#c084fc;
+  color:#fff;
+}
+.status-buttons .field-status-red.field-status-active{
+  background:#b91c1c;
+  border-color:#f87171;
+  color:#fff;
+}
+.status-buttons .field-status-neutral.field-status-active{
+  background:#475569;
+  border-color:#94a3b8;
+  color:#fff;
+}
+.status-buttons .field-status-active::after{
+  content:"CURRENT";
+  position:absolute;
+  top:3px;
+  right:5px;
+  font-size:8px;
+  font-weight:900;
+  letter-spacing:.08em;
+  opacity:.9;
+}
+.status-buttons .field-status-button:not(.field-status-active):hover{
+  filter:brightness(1.18);
+}
+@media(max-width:520px){
+  .status-buttons{
+    grid-template-columns:repeat(2,minmax(0,1fr));
+  }
+}

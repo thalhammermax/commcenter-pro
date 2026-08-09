@@ -2092,7 +2092,7 @@ async function fieldUnitCad(){
         </div>
       </div>`:""}
       ${fieldEmsPanelHtml(emsState,incident)}
-      <div class="status-buttons">${statuses.map(s=>`<button class="btn ${["AVAILABLE","CLEAR","COMPLETE"].includes(s)?"good":""} ${s===fs.units?.status?"field-status-active":""}" data-status="${esc(s)}">${esc(s.replaceAll("_"," "))}</button>`).join("")}</div>
+      <div class="status-buttons">${statuses.map(status=>`<button class="btn field-status-button ${fieldStatusColorClass(status)} ${status===fs.units?.status?"field-status-active":""}" data-status="${esc(status)}" aria-pressed="${status===fs.units?.status?"true":"false"}">${esc(status.replaceAll("_"," "))}</button>`).join("")}</div>
       <div class="notice ${navigator.onLine?"ok":""}">${navigator.onLine?"Connected":"Offline — CAD changes cannot reach dispatch until connectivity returns."}</div>
       <button class="btn secondary" id="downloadOffline">Download Event Map + W3W for Offline Use</button>
       <div id="offlineStatus" class="small muted"></div>
@@ -2298,6 +2298,16 @@ function bindFieldLocationControls(fs,mapLayers,zones){
   }
 }
 
+function fieldStatusColorClass(status){
+  const key=String(status||"").toUpperCase();
+  if(["AVAILABLE","CLEAR","COMPLETE"].includes(key))return "field-status-green";
+  if(["ASSIGNED","RESPONDING","EN_ROUTE","RETURNING"].includes(key))return "field-status-blue";
+  if(["ON_SCENE","WORKING","LOADING"].includes(key))return "field-status-amber";
+  if(["TRANSPORTING","AT_HOSPITAL"].includes(key))return "field-status-purple";
+  if(["OUT_OF_SERVICE","OOS"].includes(key))return "field-status-red";
+  return "field-status-neutral";
+}
+
 function updateFieldUnitStatusUI(status){
   const badge=document.querySelector("[data-field-unit-status]");
   if(badge){
@@ -2307,8 +2317,17 @@ function updateFieldUnitStatusUI(status){
   }
 
   document.querySelectorAll("[data-status]").forEach(btn=>{
-    btn.classList.toggle("field-status-active",btn.dataset.status===status);
-    btn.setAttribute("aria-pressed",btn.dataset.status===status?"true":"false");
+    const active=btn.dataset.status===status;
+    btn.classList.toggle("field-status-active",active);
+    btn.setAttribute("aria-pressed",active?"true":"false");
+
+    // Keep every option lightly color-coded, while the current status receives
+    // the strong filled treatment. This makes the selected state unmistakable.
+    [
+      "field-status-green","field-status-blue","field-status-amber",
+      "field-status-purple","field-status-red","field-status-neutral"
+    ].forEach(c=>btn.classList.remove(c));
+    btn.classList.add(fieldStatusColorClass(btn.dataset.status));
   });
 }
 
