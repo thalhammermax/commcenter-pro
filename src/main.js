@@ -6,6 +6,7 @@ import { pixelToGeo, pixelToLeaflet, leafletToPixel, geoToPixel, distanceMeters 
 import { saveOfflineEvent, getOfflineEvent } from "./offlineStore.js";
 import { renderEmsOps, renderEmsAdmin, renderTreatmentAreaFlow, loadFieldEmsState, fieldEmsPanelHtml, bindFieldEmsPanel, renderDispatchIncidentTreatmentPanel } from "./ems.js";
 import { loadVenueChoices, applyVenueVersionToEvent, saveEventToVenueLibrary, renderVenueLibrary } from "./venueLibrary.js";
+import { renderGuestLogistics, loadFieldLogisticsState, fieldLogisticsPanelHtml, bindFieldLogisticsPanel } from "./logistics.js";
 
 const app=document.querySelector("#app");
 const S={
@@ -13,6 +14,7 @@ const S={
   departments:[],units:[],incidents:[],pois:[],eventMap:null,mapLayers:[],zones:[],accessPoints:[],accessNodes:[],
   operationalPeriods:[],activeOperationalPeriod:null,
   dispositions:[],
+  guestLogisticsMovements:[],
   emsUnitConfigs:[],treatmentAreas:[],activeMapLayerId:null,map:null,realtime:[],
   fieldSession:null,currentLocation:null,isPlatformAdmin:false,callTimerInterval:null,
   unitLocations:[],unitLocationMarkers:new Map(),locationAgeInterval:null,
@@ -510,6 +512,26 @@ function dispatchHasEmsEnabled(){
   return (S.dispatchDepartmentIds||[]).some(id=>emsDepartments.has(id));
 }
 
+function guestLogisticsEnabledDepartmentIds(){
+  return new Set(
+    (S.departments||[])
+      .filter(d=>d.active!==false&&d.guest_logistics_enabled===true)
+      .map(d=>d.id)
+  );
+}
+
+function dispatchHasGuestLogisticsEnabled(){
+  const logisticsDepartments=guestLogisticsEnabledDepartmentIds();
+  return (S.dispatchDepartmentIds||[]).some(id=>logisticsDepartments.has(id));
+}
+
+function activeLogisticsMovementForUnit(unitId){
+  return (S.guestLogisticsMovements||[]).find(m=>
+    m.assigned_unit_id===unitId
+    &&["EN_ROUTE_PICKUP","AT_PICKUP","PASSENGER_ONBOARD","EN_ROUTE_DESTINATION"].includes(m.status)
+  )||null;
+}
+
 function dispatchWalkInTreatmentAreas(){
   if(!dispatchHasEmsEnabled())return [];
 
@@ -663,6 +685,9 @@ function updateDispatchScopeUi(){
     actions.innerHTML=dispatchPrimaryActionsHtml();
     bindDispatchPrimaryActions();
   }
+
+  const logisticsButton=document.querySelector("#guestLogisticsBtn");
+  if(logisticsButton)logisticsButton.classList.toggle("hidden",!dispatchHasGuestLogisticsEnabled());
 }
 
 const NAV_STATE_KEY="commcenter-pro-navigation-v1";
@@ -1070,6 +1095,7 @@ async function loadEventOps(){
     unitLocationsRes,
     operationalPeriodsRes,
     dispositionsRes,
+    guestLogisticsMovementsRes,
     emsUnitConfigsRes,
     treatmentAreasRes
   ] = await Promise.all([
@@ -1093,6 +1119,7 @@ async function loadEventOps(){
     supabase.from("unit_locations").select("*").eq("event_id",S.eventId),
     supabase.from("operational_periods").select("*").eq("event_id",S.eventId).order("created_at"),
     supabase.from("event_dispositions").select("*").eq("event_id",S.eventId).eq("active",true).order("scope").order("sort_order").order("label"),
+    supabase.from("guest_logistics_movements").select("id,event_id,department_id,movement_number,guest_name,status,scheduled_at,assigned_unit_id").eq("event_id",S.eventId).not("status","in","(COMPLETE,NO_SHOW,CANCELLED)").order("scheduled_at"),
     supabase.from("ems_unit_config").select("*"),
     supabase.from("ems_treatment_areas").select("*").eq("event_id",S.eventId).eq("active",true).order("name")
   ]);
@@ -1111,6 +1138,7 @@ async function loadEventOps(){
     unitLocations: unitLocationsRes,
     operationalPeriods: operationalPeriodsRes,
     dispositions: dispositionsRes,
+    guestLogisticsMovements: guestLogisticsMovementsRes,
     emsUnitConfigs: emsUnitConfigsRes,
     treatmentAreas: treatmentAreasRes
   };
@@ -1167,6 +1195,7 @@ async function loadEventOps(){
   S.operationalPeriods=operationalPeriodsRes.data||[];
   S.activeOperationalPeriod=S.operationalPeriods.find(op=>op.status==="ACTIVE")||null;
   S.dispositions=dispositionsRes.data||[];
+  S.guestLogisticsMovements=guestLogisticsMovementsRes.data||[];
   S.emsUnitConfigs=emsUnitConfigsRes.data||[];
   S.treatmentAreas=treatmentAreasRes.data||[];
   const apIds=new Set(S.accessPoints.map(a=>a.id));
@@ -1697,6 +1726,10 @@ async function dispatchPage(){
           <strong>EMS Operations</strong>
           <span>Patient flow and treatment resources</span>
         </button>
+        <button class="topbar-menu-item ${dispatchHasGuestLogisticsEnabled()?"":"hidden"}" id="guestLogisticsBtn">
+          <strong>Guest Logistics</strong>
+          <span>Prescheduled transportation and driver dispatch</span>
+        </button>
         <button class="topbar-menu-item" id="adminBtn">
           <strong>Event Admin</strong>
           <span>Event configuration</span>
@@ -1724,6 +1757,7 @@ async function dispatchPage(){
   document.querySelector("#layoutButton").onclick=()=>{closeDispatchMenu();renderDispatchLayoutModal();};
   document.querySelector("#operationalPeriodsBtn").onclick=()=>{closeDispatchMenu();eventAdmin("periods");};
   document.querySelector("#emsOpsBtn").onclick=()=>{closeDispatchMenu();renderEmsOps(app,{eventId:S.eventId,event:S.event,header,onBack:()=>dispatchPage(),onAdmin:()=>eventAdmin("ems")});};
+  document.querySelector("#guestLogisticsBtn")?.addEventListener("click",()=>{closeDispatchMenu();guestLogisticsPage();});
   document.querySelector("#adminBtn").onclick=()=>{closeDispatchMenu();eventAdmin();};
   document.querySelector("#reportsBtn").onclick=()=>{closeDispatchMenu();reportsPage();};
   document.querySelector("#eventsBtn").onclick=()=>{closeDispatchMenu();closeIncidentModal();S.eventId=null;staffFlow();};
@@ -1740,6 +1774,38 @@ async function dispatchPage(){
   subscribeDispatch();
 }
 
+
+
+async function guestLogisticsPage({allDepartments=false}={}){
+  closeIncidentModal();
+  await loadEventOps();
+
+  const logisticsScope=allDepartments
+    ?S.departments.filter(d=>d.active!==false&&d.guest_logistics_enabled===true).map(d=>d.id)
+    :S.dispatchDepartmentIds;
+
+  return renderGuestLogistics(app,{
+    eventId:S.eventId,
+    event:S.event,
+    header,
+    departments:S.departments,
+    units:S.units,
+    incidents:S.incidents,
+    operationalPeriods:S.operationalPeriods,
+    dispatchDepartmentIds:logisticsScope,
+    onBack:()=>dispatchPage(),
+    onOpenIncident:id=>selectIncident(id),
+    onNewCadTask:(departmentId,movement=null)=>incidentForm(null,{
+      departmentIds:[departmentId],
+      callType:movement?"Guest Logistics Support":"Guest Logistics Task",
+      priority:"Standard",
+      landmark:movement?.origin||"",
+      notes:movement
+        ?`${movement.movement_number} · ${movement.guest_name} · ${movement.origin} → ${movement.destination}${movement.flight_number?` · Flight ${movement.flight_number}`:""}`
+        :""
+    })
+  });
+}
 
 
 function locationAgeSeconds(location){
@@ -1927,12 +1993,17 @@ function unitList(){
     <div class="section-title">${esc(department)}</div>
     ${units.map(u=>{
       const active=activeAssignmentForUnit(u.id);
+      const logistics=activeLogisticsMovementForUnit(u.id);
       return `<button class="unit unit-button" data-unit-detail="${u.id}">
         <div class="row">
           <strong>${esc(u.name)}</strong>
           <span class="badge status-${esc(u.status)}" data-dispatch-unit-status="${u.id}">${esc(u.status.replaceAll("_"," "))}</span>
         </div>
-        <div class="small muted">${active?`Assigned: ${esc(active.incident.incident_number)} · ${esc(active.incident.call_type)}`:"Unassigned"}</div>
+        <div class="small muted">${active
+          ?`Assigned: ${esc(active.incident.incident_number)} · ${esc(active.incident.call_type)}`
+          :logistics
+            ?`Guest Move: ${esc(logistics.movement_number)} · ${esc(logistics.guest_name)}`
+            :"Unassigned"}</div>
         ${unitTransportDestinationLabel(u)?`<div class="small transport-destination-readout">Transport → ${esc(unitTransportDestinationLabel(u))}</div>`:""}
         <div class="small unit-gps-readout ${unitLocation(u.id)?`gps-${locationFreshness(unitLocation(u.id))}`:"muted"}" data-unit-gps="${u.id}">${unitLocation(u.id)?`${locationAgeLabel(unitLocation(u.id))}${unitLocation(u.id).accuracy_m!=null?` · ±${Math.round(unitLocation(u.id).accuracy_m)}m`:""}`:(S.event?.field_location_enabled?"GPS not shared":"GPS disabled")}</div>
       </button>`;
@@ -2991,6 +3062,7 @@ function selectUnit(unitId){
   if(!u)return;
 
   const active=activeAssignmentForUnit(unitId);
+  const logistics=activeLogisticsMovementForUnit(unitId);
   const location=unitLocation(unitId);
   const layerId=unitLocationLayerId(u);
   const layer=layerId?S.mapLayers.find(l=>l.id===layerId):null;
@@ -3008,7 +3080,11 @@ function selectUnit(unitId){
         <h2 id="incidentModalTitle">${esc(u.name)}</h2>
         <span class="badge status-${esc(u.status)}" data-dispatch-unit-status="${u.id}" data-unit-current-status="${u.id}">${esc(u.status.replaceAll("_"," "))}</span>
       </div>
-      <div class="incident-modal-nature">${active?`Committed to ${esc(active.incident.incident_number)}`:"Available for assignment"}${unitTransportDestinationLabel(u)?` · Transporting to ${esc(unitTransportDestinationLabel(u))}`:""}</div>
+      <div class="incident-modal-nature">${active
+        ?`Committed to ${esc(active.incident.incident_number)}`
+        :logistics
+          ?`Guest Logistics · ${esc(logistics.movement_number)} · ${esc(logistics.guest_name)}`
+          :"Available for assignment"}${unitTransportDestinationLabel(u)?` · Transporting to ${esc(unitTransportDestinationLabel(u))}`:""}</div>
     </div>
     <button class="incident-modal-close" id="closeIncidentModal" aria-label="Close unit controls">×</button>
   </div>
@@ -3017,9 +3093,17 @@ function selectUnit(unitId){
     <section class="unit-command-main stack">
       <div class="incident-info-section">
         <div class="section-title">Unit Status</div>
-        ${unitStatusButtonsHtml(u,active)}
-        ${transportDestinationEditorHtml(u)}
-        ${active&&!isAmbulanceUnit(u)&&u.status==="TRANSPORTING"&&u.current_transport_treatment_area_id?`
+        ${logistics?`
+          <div class="notice">
+            <strong>Status controlled by Guest Logistics.</strong><br>
+            ${esc(logistics.movement_number)} · ${esc(logistics.guest_name)}. Use the Guest Logistics movement workflow to update this driver's status.
+          </div>
+          <button class="btn secondary block" id="openUnitGuestLogistics">Open Guest Logistics</button>
+        `:`
+          ${unitStatusButtonsHtml(u,active)}
+          ${transportDestinationEditorHtml(u)}
+        `}
+        ${!logistics&&active&&!isAmbulanceUnit(u)&&u.status==="TRANSPORTING"&&u.current_transport_treatment_area_id?`
           <div class="treatment-arrival-action">
             <div>
               <div class="section-title">Treatment Area Arrival</div>
@@ -3042,6 +3126,12 @@ function selectUnit(unitId){
             <button class="btn" id="openAssignedIncident">Open Incident</button>
             <button class="btn danger" id="removeAssignment">Clear Unit from Incident</button>
           </div>
+        `:logistics?`
+          <div class="unit-current-assignment">
+            <strong>${esc(logistics.movement_number)} · ${esc(logistics.guest_name)}</strong>
+            <div class="small muted">This unit cannot be committed to a CAD incident until the guest movement is complete, cancelled, or reassigned.</div>
+          </div>
+          <button class="btn secondary block" id="openUnitGuestLogisticsAssignment">Open Guest Logistics</button>
         `:`
           <div>
             <label>Assign to incident</label>
@@ -3086,6 +3176,8 @@ function selectUnit(unitId){
   </div>`;
 
   document.querySelector("#closeIncidentModal").onclick=()=>closeIncidentModal();
+  document.querySelector("#openUnitGuestLogistics")?.addEventListener("click",()=>{closeIncidentModal();guestLogisticsPage();});
+  document.querySelector("#openUnitGuestLogisticsAssignment")?.addEventListener("click",()=>{closeIncidentModal();guestLogisticsPage();});
 
   document.querySelectorAll(`[data-dispatch-status-option="${u.id}"]`).forEach(btn=>btn.onclick=async()=>{
     const status=btn.dataset.status;
@@ -4617,6 +4709,68 @@ function renderOperationalPeriodsAdmin(editId=null){
   });
 }
 
+function renderGuestLogisticsAdmin(){
+  const host=document.querySelector("#adminContent");
+  if(!host)return;
+
+  const enabled=S.departments.filter(d=>d.active!==false&&d.guest_logistics_enabled===true);
+  const driverCount=S.units.filter(u=>enabled.some(d=>d.id===u.department_id)).length;
+
+  host.innerHTML=`<div class="stack">
+    <div class="card">
+      <div class="section-title">GUEST LOGISTICS MODULE</div>
+      <h2>Special Guest Movement</h2>
+      <p class="muted">Use Guest Logistics for prescheduled airport, hotel, venue, and local transportation. Use normal CAD incidents for unscheduled errands and operational requests.</p>
+
+      <div class="ems-metrics">
+        <div class="card"><div class="metric">${enabled.length}</div><div class="small muted">Enabled Departments</div></div>
+        <div class="card"><div class="metric">${driverCount}</div><div class="small muted">Driver / Vehicle Units</div></div>
+      </div>
+
+      ${enabled.length?`
+        <div class="section-title">Enabled Departments</div>
+        <div class="admin-resource-list">
+          ${enabled.map(dep=>`
+            <div class="admin-resource-row">
+              <div><strong>${esc(dep.name)}</strong><div class="small muted">${esc(dep.short_name||"")}</div></div>
+              <span class="badge logistics-enabled-badge">GUEST LOGISTICS</span>
+            </div>
+          `).join("")}
+        </div>
+      `:`
+        <div class="notice">
+          No department is currently Guest Logistics enabled. Go to Setup → Edit Department and enable <strong>Guest Logistics Enabled Department</strong>.
+        </div>
+      `}
+
+      <div class="grid2">
+        <button class="btn" id="openGuestLogisticsAdminBoard" ${enabled.length?"":"disabled"}>Open Guest Logistics Board</button>
+        <button class="btn secondary" id="guestLogisticsSetupDepartments">Configure Departments</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="section-title">WORKFLOW</div>
+      <h3>Scheduled Movement vs CAD Task</h3>
+      <div class="grid2">
+        <div class="notice">
+          <strong>Guest Logistics Movement</strong><br>
+          Planned guest transportation imported from the convention transportation spreadsheet.
+        </div>
+        <div class="notice">
+          <strong>Normal CAD Incident</strong><br>
+          Unscheduled errand, special request, luggage run, credential run, or other ad-hoc work.
+        </div>
+      </div>
+    </div>
+  </div>`;
+
+  document.querySelector("#openGuestLogisticsAdminBoard")?.addEventListener("click",()=>guestLogisticsPage({allDepartments:true}));
+  document.querySelector("#guestLogisticsSetupDepartments").onclick=()=>{
+    document.querySelector("#setupTab")?.click();
+  };
+}
+
 async function eventAdmin(initialTab="setup"){
   closeIncidentModal();
   await loadEventOps();
@@ -4626,6 +4780,7 @@ async function eventAdmin(initialTab="setup"){
         <button class="${initialTab==="setup"?"active":""}" id="setupTab">Setup</button>
         <button class="${initialTab==="periods"?"active":""}" id="periodsTab">Operational Periods</button>
         <button class="${initialTab==="ems"?"active":""}" id="emsTab">EMS Setup</button>
+        <button class="${initialTab==="logistics"?"active":""}" id="logisticsTab">Guest Logistics</button>
         <button id="mapTab">Map Builder</button>
         <button id="backDispatch">Back to CAD</button>
       </aside>
@@ -4656,9 +4811,11 @@ async function eventAdmin(initialTab="setup"){
   document.querySelector("#setupTab").onclick=()=>{markAdminTab("setupTab");renderEventSetup();};
   document.querySelector("#periodsTab").onclick=()=>{markAdminTab("periodsTab");renderOperationalPeriodsAdmin();};
   document.querySelector("#emsTab").onclick=showEmsAdmin;
+  document.querySelector("#logisticsTab").onclick=()=>{markAdminTab("logisticsTab");renderGuestLogisticsAdmin();};
 
   if(initialTab==="ems")showEmsAdmin();
   else if(initialTab==="periods")renderOperationalPeriodsAdmin();
+  else if(initialTab==="logistics")renderGuestLogisticsAdmin();
   else renderEventSetup();
 }
 
@@ -4684,6 +4841,7 @@ function renderEventSetup(){
           <div>
             <strong>${esc(d.name)}</strong> <span class="muted">${esc(d.short_name||"")}</span>
             ${d.ems_enabled?`<span class="badge ems-enabled-badge">EMS ENABLED</span>`:""}
+            ${d.guest_logistics_enabled?`<span class="badge logistics-enabled-badge">GUEST LOGISTICS</span>`:""}
           </div>
           <div class="nav">
             <button class="btn secondary compact" data-edit-dept-statuses="${d.id}">Edit Department</button>
@@ -4708,6 +4866,14 @@ function renderEventSetup(){
         <span>
           <strong>EMS Enabled Department</strong>
           <small>Enables EMS-specific dispatcher workflows such as + Walk-In Patient when this department is in the Dispatch Scope.</small>
+        </span>
+      </label>
+
+      <label class="ems-department-toggle guest-logistics-department-toggle">
+        <input id="newDeptGuestLogisticsEnabled" type="checkbox">
+        <span>
+          <strong>Guest Logistics Enabled Department</strong>
+          <small>Enables prescheduled guest transportation, driver dispatch, spreadsheet import, and Guest Logistics field workflows for this department.</small>
         </span>
       </label>
 
@@ -4882,7 +5048,8 @@ function renderEventSetup(){
       name,
       short_name:shortName,
       status_profile:statuses,
-      ems_enabled:document.querySelector("#newDeptEmsEnabled").checked
+      ems_enabled:document.querySelector("#newDeptEmsEnabled").checked,
+      guest_logistics_enabled:document.querySelector("#newDeptGuestLogisticsEnabled").checked
     });
     if(error)alert(error.message);else{await loadEventOps();renderEventSetup();}
   };
@@ -4996,6 +5163,14 @@ function renderDepartmentStatusEditor(departmentId){
       </span>
     </label>
 
+    <label class="ems-department-toggle guest-logistics-department-toggle">
+      <input id="editDeptGuestLogisticsEnabled" type="checkbox" ${dep.guest_logistics_enabled?"checked":""}>
+      <span>
+        <strong>Guest Logistics Enabled Department</strong>
+        <small>Shows Guest Logistics to dispatchers in this department and allows its units to be assigned as guest-movement drivers.</small>
+      </span>
+    </label>
+
     <p class="small muted">These become the selectable status buttons on field devices assigned to ${esc(dep.name)}.</p>
     ${departmentStatusPicker("editDeptStatuses",dep.status_profile)}
     <button class="btn" id="saveDeptStatuses">Save Department</button>
@@ -5009,7 +5184,8 @@ function renderDepartmentStatusEditor(departmentId){
     const {error}=await supabase.from("event_departments")
       .update({
         status_profile:statuses,
-        ems_enabled:document.querySelector("#editDeptEmsEnabled").checked
+        ems_enabled:document.querySelector("#editDeptEmsEnabled").checked,
+        guest_logistics_enabled:document.querySelector("#editDeptGuestLogisticsEnabled").checked
       })
       .eq("id",departmentId)
       .eq("event_id",S.eventId);
@@ -6043,6 +6219,13 @@ async function fieldUnitCad(){
   ]);
   let emsState=null;
   try{emsState=await loadFieldEmsState(S.eventId,fs.unit_id,incident?.id||null);}catch(err){console.error("Field EMS panel failed to load",err);}
+
+  let logisticsState=null;
+  try{
+    logisticsState=await loadFieldLogisticsState(S.eventId,fs.unit_id);
+    if(logisticsState)logisticsState.blockedByCad=!!incident;
+  }catch(err){console.error("Field Guest Logistics panel failed to load",err);}
+
   const fieldIsAmbulance=!!(emsState?.config?.active&&(emsState.config.ems_role==="ambulance"||emsState.config.transport_capable));
 
   app.innerHTML=`<div class="shell">${header(`${esc(fs.events?.name||"")} · ${esc(fs.units?.event_departments?.name||"")}`)}
@@ -6053,7 +6236,8 @@ async function fieldUnitCad(){
         ${incident.latitude!=null&&incident.longitude!=null?`<br><span class="small mono">${Number(incident.latitude).toFixed(6)}, ${Number(incident.longitude).toFixed(6)}</span>`:""}</p><p>${esc(incident.notes||"")}</p>
         ${fieldLayer&&incident.map_x!=null&&incident.map_y!=null?`<button class="btn secondary block" id="viewFieldMap">View on Event Map</button>`:""}
         <div id="fieldMapHolder"></div>
-      </div>`:`<div class="card"><strong>No current assignment</strong><p class="muted">Remain available for dispatch.</p></div>`}
+      </div>`:logisticsState?.underway?`<div class="card"><strong>No CAD incident assignment</strong><p class="muted">This unit is currently committed to the Guest Logistics movement below.</p></div>`:`<div class="card"><strong>No current CAD assignment</strong><p class="muted">${logisticsState?.current?"A future Guest Logistics movement is preassigned below; the unit remains available until that movement begins.":"Remain available for dispatch."}</p></div>`}
+      ${fieldLogisticsPanelHtml(logisticsState)}
       ${fs.events?.field_location_enabled?`<div class="card field-location-card">
         <div class="row">
           <div>
@@ -6080,8 +6264,8 @@ async function fieldUnitCad(){
         </div>
       </div>`:""}
       ${fieldEmsPanelHtml(emsState,incident)}
-      <div class="status-buttons">${statuses.map(status=>`<button class="btn field-status-button ${fieldStatusColorClass(status)} ${status===fs.units?.status?"field-status-active":""}" data-status="${esc(status)}" aria-pressed="${status===fs.units?.status?"true":"false"}">${esc(status.replaceAll("_"," "))}</button>`).join("")}</div>
-      <div class="card transport-destination-editor ${fs.units?.status==="TRANSPORTING"?"":"hidden"}" id="fieldTransportDestinationPanel">
+      ${logisticsState?.underway?"":`<div class="status-buttons">${statuses.map(status=>`<button class="btn field-status-button ${fieldStatusColorClass(status)} ${status===fs.units?.status?"field-status-active":""}" data-status="${esc(status)}" aria-pressed="${status===fs.units?.status?"true":"false"}">${esc(status.replaceAll("_"," "))}</button>`).join("")}</div>`}
+      ${logisticsState?.underway?"":`<div class="card transport-destination-editor ${fs.units?.status==="TRANSPORTING"?"":"hidden"}" id="fieldTransportDestinationPanel">
         <div class="section-title">Transport Destination</div>
         ${emsState?.config?.active&&(emsState.config.ems_role==="ambulance"||emsState.config.transport_capable)?`
           <label>Destination facility</label>
@@ -6109,7 +6293,7 @@ async function fieldUnitCad(){
             <button class="btn good block" id="fieldArriveTreatmentArea">Arrived at Treatment Area</button>
           </div>
         `:""}
-      </div>
+      </div>`}
       <div class="card field-report-reference-card">
         <div class="row">
           <div>
@@ -6219,6 +6403,7 @@ async function fieldUnitCad(){
     bindFieldLocationControls(fs,fieldMapLayers||[],fieldZones||[]);
   }
   bindFieldEmsPanel(emsState,{eventId:S.eventId,unitId:fs.unit_id,incident,refresh:()=>fieldUnitCad()});
+  bindFieldLogisticsPanel(logisticsState,{refresh:()=>fieldUnitCad()});
   document.querySelector("#fieldCallTimes")?.addEventListener("click",()=>fieldCallTimesPage({
     unitId:fs.unit_id,
     standalone:false
@@ -6578,6 +6763,7 @@ function subscribeDispatch(){
     // deferred rather than destroying dispatcher input.
     .on("postgres_changes",{event:"*",schema:"public",table:"incidents",filter:`event_id=eq.${S.eventId}`},()=>refreshDispatchStructure())
     .on("postgres_changes",{event:"*",schema:"public",table:"operational_periods",filter:`event_id=eq.${S.eventId}`},()=>refreshDispatchStructure())
+    .on("postgres_changes",{event:"*",schema:"public",table:"guest_logistics_movements",filter:`event_id=eq.${S.eventId}`},()=>refreshDispatchStructure())
     .on("postgres_changes",{event:"*",schema:"public",table:"incident_units"},()=>refreshDispatchStructure())
     // GPS changes update only the unit's map marker/readout.
     .on("postgres_changes",{event:"*",schema:"public",table:"unit_locations"},payload=>updateDispatcherUnitLocation(payload))
@@ -6602,6 +6788,7 @@ function subscribeField(unitId){
     })
     .on("postgres_changes",{event:"*",schema:"public",table:"incident_units",filter:`unit_id=eq.${unitId}`},()=>fieldUnitCad())
     .on("postgres_changes",{event:"*",schema:"public",table:"ems_encounters",filter:`event_id=eq.${S.eventId}`},()=>fieldUnitCad())
+    .on("postgres_changes",{event:"*",schema:"public",table:"guest_logistics_movements",filter:`event_id=eq.${S.eventId}`},()=>fieldUnitCad())
     .subscribe();
 
   S.realtime.push(ch);
@@ -6629,6 +6816,7 @@ function reset(){
   S.operationalPeriods=[];
   S.activeOperationalPeriod=null;
   S.dispositions=[];
+  S.guestLogisticsMovements=[];
   S.dispatchLayout=null;
   S.fieldReportSessionOwned=false;
   S.dispatchDepartmentIds=[];
