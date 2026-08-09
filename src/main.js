@@ -1170,6 +1170,106 @@ function fieldIncidentMapIcon(){
   });
 }
 
+function poiMapPopupHtml(p){
+  const aliases=(p.poi_aliases||[]).map(a=>a.alias).filter(Boolean);
+  const context=[
+    p.category,
+    layerName(p.map_layer_id),
+    p.zone_id?zoneName(p.zone_id):""
+  ].filter(Boolean).join(" · ");
+
+  return `<div class="poi-map-popup-card">
+    <div class="poi-map-popup-title">${esc(p.name)}</div>
+    ${context?`<div class="poi-map-popup-context">${esc(context)}</div>`:""}
+    ${aliases.length?`<div class="poi-map-popup-aliases">Aliases: ${esc(aliases.join(", "))}</div>`:""}
+
+    <div class="poi-map-popup-actions">
+      <button
+        type="button"
+        class="btn compact poi-map-new-incident"
+        data-poi-start-incident="${p.id}"
+        ${S.activeOperationalPeriod?"":"disabled"}
+      >+ Start New Incident</button>
+    </div>
+
+    ${S.activeOperationalPeriod?"":`
+      <div class="small muted poi-map-popup-disabled-note">
+        Activate an Operational Period before creating a new incident.
+      </div>
+    `}
+  </div>`;
+}
+
+function openPoiMapPopup(p,latlng=null){
+  if(!p||!S.map)return null;
+
+  const layer=activeMapLayer();
+  const point=latlng||(
+    layer
+    &&p.map_x!=null
+    &&p.map_y!=null
+      ?pixelToLeaflet(p.map_x,p.map_y,layer.image_height)
+      :null
+  );
+
+  if(!point)return null;
+
+  const popup=L.popup({
+    className:"cc-poi-map-popup",
+    closeButton:true,
+    autoPan:true,
+    offset:[0,-18]
+  })
+    .setLatLng(point)
+    .setContent(poiMapPopupHtml(p))
+    .openOn(S.map);
+
+  requestAnimationFrame(()=>{
+    const popupElement=popup.getElement();
+    const button=popupElement?.querySelector(`[data-poi-start-incident="${p.id}"]`);
+
+    button?.addEventListener("click",event=>{
+      event.preventDefault();
+      event.stopPropagation();
+
+      if(!S.activeOperationalPeriod){
+        alert("No Operational Period is active. Event Admin must activate one before creating a new incident.");
+        return;
+      }
+
+      S.map?.closePopup(popup);
+      incidentForm(poiLocationObject(p));
+    });
+  });
+
+  return popup;
+}
+
+function addDispatchPoiMarker(p,layer){
+  if(!S.map||!p||!layer||p.map_x==null||p.map_y==null)return null;
+
+  const marker=L.marker(
+    pixelToLeaflet(p.map_x,p.map_y,layer.image_height),
+    {
+      icon:poiMapIcon(),
+      title:p.name,
+      keyboard:true,
+      bubblingMouseEvents:false
+    }
+  ).addTo(S.map);
+
+  marker.bindTooltip(p.name,{direction:"top",offset:[0,-4]});
+
+  marker.on("click",event=>{
+    if(event.originalEvent){
+      try{L.DomEvent.stopPropagation(event.originalEvent);}catch{}
+    }
+    openPoiMapPopup(p,marker.getLatLng());
+  });
+
+  return marker;
+}
+
 function poiSearchText(p){
   return [
     p.name,
@@ -1253,9 +1353,7 @@ async function focusPoiOnMap(p){
   if(S.map&&layer&&p.map_x!=null&&p.map_y!=null){
     const point=pixelToLeaflet(p.map_x,p.map_y,layer.image_height);
     S.map.setView(point,Math.max(S.map.getZoom(),1));
-    L.popup().setLatLng(point).setContent(
-      `<strong>${esc(p.name)}</strong><br>${esc(layerName(p.map_layer_id)||"")}${p.zone_id?` · ${esc(zoneName(p.zone_id))}`:""}`
-    ).openOn(S.map);
+    openPoiMapPopup(p,point);
   }
 }
 
@@ -1369,9 +1467,7 @@ async function handleRealtimePoiInsert(payload){
 
   const layer=activeMapLayer();
   if(S.map&&layer&&data.map_layer_id===layer.id&&data.map_x!=null&&data.map_y!=null){
-    L.marker(pixelToLeaflet(data.map_x,data.map_y,layer.image_height),{icon:poiMapIcon()})
-      .addTo(S.map)
-      .bindTooltip(data.name,{direction:"top",offset:[0,-4]});
+    addDispatchPoiMarker(data,layer);
   }
 
   const count=S.incidentModalMode==="poi-search"
@@ -2823,7 +2919,7 @@ async function setupDispatchMap(){
   L.imageOverlay(url,bounds).addTo(S.map);S.map.fitBounds(bounds);
 
   for(const p of S.pois.filter(p=>p.map_layer_id===layer.id)){
-    L.marker(pixelToLeaflet(p.map_x,p.map_y,layer.image_height),{icon:poiMapIcon()}).addTo(S.map).bindTooltip(p.name,{direction:"top",offset:[0,-4]});
+    addDispatchPoiMarker(p,layer);
   }
   for(const n of S.accessNodes.filter(n=>n.map_layer_id===layer.id)){
     const ap=S.accessPoints.find(a=>a.id===n.access_point_id);
@@ -3027,7 +3123,7 @@ function incidentForm(loc,draft=null){
             ?`<button class="btn secondary compact" id="pickIncidentMapLocation">Pick on Map</button>`
             :`<span class="small muted">Map not in use</span>`}
         </div>
-        <input id="poiSearchNew" autocomplete="off" placeholder="Search POIs (optional)">
+        <input id="poiSearchNew" autocomplete="off" placeholder="Search POIs (optional)" value="${esc(loc?.poi_id?loc.landmark:"")}">
         <div id="poiSearchNewResults" class="poi-search-results"></div>
       </div>
 
@@ -3036,7 +3132,7 @@ function incidentForm(loc,draft=null){
       <div class="notice">
         <strong>Selected location</strong><br>
         <span id="locSummary">${loc
-          ?`${loc.map_layer_id?`${esc(layerName(loc.map_layer_id))} · `:""}${loc.latitude!=null&&loc.longitude!=null?`${Number(loc.latitude).toFixed(6)}, ${Number(loc.longitude).toFixed(6)}`:esc(loc.landmark||"Selected location")}`
+          ?`${loc.poi_id?`${esc(loc.landmark||"Selected POI")} · `:""}${loc.map_layer_id?`${esc(layerName(loc.map_layer_id))} · `:""}${loc.latitude!=null&&loc.longitude!=null?`${Number(loc.latitude).toFixed(6)}, ${Number(loc.longitude).toFixed(6)}`:esc(loc.landmark||"Selected location")}`
           :(S.dispatchLayout?.mapVisible===false
             ?"Map is hidden. Enter a Location Description or select an existing POI."
             :"Search for a POI, choose Pick on Map, or enter a Location Description.")}</span>
