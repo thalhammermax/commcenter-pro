@@ -3,6 +3,6 @@
   "short_name": "CommCenter",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#111827",
-  "theme_color": "#111827"
+  "background_color": "#07111d",
+  "theme_color": "#07111d"
 }
