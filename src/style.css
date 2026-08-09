@@ -1262,3 +1262,58 @@ body.modal-open{
 .direct-handoff-option .btn{
   margin-top:2px;
 }
+
+
+/* v0.7.2 — dispatcher unit controls in modal */
+.unit-command-modal{
+  display:grid;
+  grid-template-columns:minmax(0,1.45fr) minmax(300px,.75fr);
+}
+.unit-command-main{
+  padding:20px;
+  border-right:1px solid #253249;
+}
+.unit-command-side{
+  padding:20px;
+  background:#091321;
+}
+.dispatcher-status-grid{
+  margin-top:8px;
+}
+.dispatcher-status-grid .field-status-button{
+  min-height:52px;
+}
+.unit-current-assignment{
+  margin:8px 0 12px;
+  padding:12px;
+  border:1px solid #334155;
+  border-radius:10px;
+  background:#0f172a;
+}
+.unit-location-large{
+  display:grid;
+  gap:4px;
+  margin:8px 0 12px;
+}
+.unit-location-large>strong{
+  font-size:18px;
+}
+.poi-finder-modal{
+  padding:20px;
+}
+.poi-finder-modal .poi-search-results{
+  max-height:320px;
+  overflow:auto;
+}
+.panel.right #unitList{
+  margin-top:8px;
+}
+@media(max-width:850px){
+  .unit-command-modal{
+    grid-template-columns:1fr;
+  }
+  .unit-command-main{
+    border-right:0;
+    border-bottom:1px solid #253249;
+  }
+}

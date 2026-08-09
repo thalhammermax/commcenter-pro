@@ -14,7 +14,7 @@ const S={
   fieldSession:null,currentLocation:null,isPlatformAdmin:false,callTimerInterval:null,
   unitLocations:[],unitLocationMarkers:new Map(),locationAgeInterval:null,
   locationWatchId:null,locationLastSentAt:0,locationLastSent:null,locationWriteInFlight:false,
-  openIncidentId:null,incidentModalMode:null,
+  openIncidentId:null,openUnitId:null,incidentModalMode:null,
   dispatchDepartmentIds:[],
   commandDepartmentIds:[],
   commandDisplayMode:"calls",
@@ -732,20 +732,33 @@ async function focusPoiOnMap(p){
   }
 }
 
+
 function showPoiFinder(){
-  const detail=document.querySelector("#detail");
-  if(!detail)return;
-  detail.innerHTML=`<div class="card stack" data-dispatch-editor="poi-search">
-    <div class="row"><strong>Find POI</strong><span class="badge">${S.pois.length} locations</span></div>
-    <button class="btn secondary" id="addPoiFromMap">+ Add POI from Map</button>
+  S.openIncidentId=null;
+  S.openUnitId=null;
+  S.incidentModalMode="poi-search";
+
+  const detail=openIncidentModalShell();
+  detail.innerHTML=`<div class="incident-modal-header">
     <div>
-      <label>Search name, alias, category, level, or zone</label>
-      <input id="dispatcherPoiSearch" autocomplete="off" placeholder="Search POIs">
-      <div id="dispatcherPoiResults" class="poi-search-results"></div>
+      <div class="incident-modal-eyebrow">DISPATCH MAP</div>
+      <div class="incident-modal-title-row"><h2 id="incidentModalTitle">Find POI</h2><span class="badge">${S.pois.length} locations</span></div>
+      <div class="incident-modal-nature">Search the active event map.</div>
     </div>
+    <button class="incident-modal-close" id="closeIncidentModal" aria-label="Close POI finder">×</button>
+  </div>
+
+  <div class="poi-finder-modal stack" data-dispatch-editor="poi-search">
+    <div class="row">
+      <label>Search name, alias, category, level, or zone</label>
+      <button class="btn secondary" id="addPoiFromMap">+ Add POI from Map</button>
+    </div>
+    <input id="dispatcherPoiSearch" autocomplete="off" placeholder="Search POIs">
+    <div id="dispatcherPoiResults" class="poi-search-results"></div>
     <div id="dispatcherPoiSelected" class="small muted">Start typing to search event POIs.</div>
   </div>`;
 
+  document.querySelector("#closeIncidentModal").onclick=()=>closeIncidentModal();
   document.querySelector("#addPoiFromMap").onclick=()=>startPoiPlacement();
 
   bindPoiSearch({
@@ -762,14 +775,18 @@ function showPoiFinder(){
             <button class="btn" id="createAtPoi">Create Incident Here</button>
           </div>
         </div>`;
-      document.querySelector("#showPoiOnMap").onclick=()=>focusPoiOnMap(p);
-      document.querySelector("#createAtPoi").onclick=()=>{
-        focusPoiOnMap(p);
+      document.querySelector("#showPoiOnMap").onclick=async()=>{
+        await focusPoiOnMap(p);
+        closeIncidentModal();
+      };
+      document.querySelector("#createAtPoi").onclick=async()=>{
+        await focusPoiOnMap(p);
         incidentForm(poiLocationObject(p));
       };
-      await focusPoiOnMap(p);
     }
   });
+
+  setTimeout(()=>document.querySelector("#dispatcherPoiSearch")?.focus(),0);
 }
 
 
@@ -923,7 +940,9 @@ async function handleRealtimePoiInsert(payload){
       .bindTooltip(data.name);
   }
 
-  const count=document.querySelector('[data-dispatch-editor="poi-search"] .badge');
+  const count=S.incidentModalMode==="poi-search"
+    ? document.querySelector("#incidentModal .incident-modal-title-row .badge")
+    : document.querySelector('[data-dispatch-editor="poi-search"] .badge');
   if(count)count.textContent=`${S.pois.length} locations`;
 }
 
@@ -973,9 +992,8 @@ async function dispatchPage(){
         <div id="map"></div>
       </div>
       <aside class="panel right">
-        <div class="row"><div class="section-title">Units</div></div>
+        <div class="row"><div><div class="section-title">Units</div><div class="small muted">Select a unit to open controls.</div></div></div>
         <div id="unitList">${unitList()}</div>
-        <div class="section-title">Unit / Dispatch Tools</div><div id="detail" class="muted">Select a unit, search POIs, or use the map.</div>
       </aside>
     </div></div>`;
   document.querySelector("#topActions").innerHTML=`
@@ -1240,6 +1258,7 @@ function closeIncidentModal(){
   }
   document.body.classList.remove("modal-open");
   S.openIncidentId=null;
+  S.openUnitId=null;
   S.incidentModalMode=null;
 }
 
@@ -1431,11 +1450,14 @@ function updateDispatcherUnitStatusUI(unitId,status){
     if([...select.options].some(o=>o.value===status))select.value=status;
   });
 
-  const openUnit=document.querySelector(`[data-unit-detail-id="${unitId}"]`);
-  if(openUnit){
-    const select=document.querySelector("#unitStatus");
-    if(select && [...select.options].some(o=>o.value===status))select.value=status;
-  }
+  document.querySelectorAll(`[data-dispatch-status-option="${unitId}"]`).forEach(btn=>{
+    const active=btn.dataset.status===status;
+    btn.classList.toggle("field-status-active",active);
+    btn.setAttribute("aria-pressed",active?"true":"false");
+  });
+
+  const currentLabel=document.querySelector(`[data-unit-current-status="${unitId}"]`);
+  if(currentLabel)currentLabel.textContent=String(status||"").replaceAll("_"," ");
 }
 
 async function dispatcherSetUnitStatus(unitId,status,incidentId=null){
@@ -1458,7 +1480,8 @@ async function dispatcherUnassign(incidentId,unitId){
   if(error)return alert(error.message);
   await loadEventOps();
   refreshDispatchBoards();
-  if(S.openIncidentId===incidentId&&S.incidentModalMode!=="edit")selectIncident(incidentId);
+  if(S.openUnitId===unitId)selectUnit(unitId);
+  else if(S.openIncidentId===incidentId&&S.incidentModalMode!=="edit")selectIncident(incidentId);
 }
 
 async function dispatcherAssign(incidentId,unitId){
@@ -1470,7 +1493,8 @@ async function dispatcherAssign(incidentId,unitId){
   if(error)return alert(error.message);
   await loadEventOps();
   refreshDispatchBoards();
-  if(S.openIncidentId===incidentId&&S.incidentModalMode!=="edit")selectIncident(incidentId);
+  if(S.openUnitId===unitId)selectUnit(unitId);
+  else if(S.openIncidentId===incidentId&&S.incidentModalMode!=="edit")selectIncident(incidentId);
 }
 
 
@@ -1479,6 +1503,7 @@ async function selectIncident(id){
   if(!i)return;
 
   S.openIncidentId=id;
+  S.openUnitId=null;
   S.incidentModalMode="overview";
 
   const content=openIncidentModalShell();
@@ -1678,58 +1703,191 @@ function refreshDispatchBoards(){
   refreshLocationAges();
 }
 
+
+async function focusUnitOnDispatchMap(unitId){
+  const unit=S.units.find(u=>u.id===unitId);
+  const location=unitLocation(unitId);
+  if(!unit||!location)return alert("This unit is not currently sharing a GPS location.");
+
+  const layerId=unitLocationLayerId(unit);
+  if(layerId&&layerId!==S.activeMapLayerId){
+    S.activeMapLayerId=layerId;
+    saveNavigationState();
+    const selector=document.querySelector("#dispatchLayerSelect");
+    if(selector)selector.value=layerId;
+    await setupDispatchMap();
+  }
+
+  const layer=activeMapLayer();
+  if(!S.map||!layer?.georef_coefficients)return;
+
+  let pixel;
+  try{
+    pixel=geoToPixel(Number(location.latitude),Number(location.longitude),layer.georef_coefficients);
+  }catch{
+    return;
+  }
+
+  S.map.setView(pixelToLeaflet(pixel.x,pixel.y,layer.image_height),Math.max(S.map.getZoom(),1));
+  const marker=S.unitLocationMarkers.get(unitId)?.marker;
+  if(marker)marker.openTooltip();
+}
+
+function unitStatusButtonsHtml(u,active){
+  return `<div class="status-buttons dispatcher-status-grid">
+    ${unitStatusOptions(u).map(status=>`
+      <button
+        class="btn field-status-button ${fieldStatusColorClass(status)} ${status===u.status?"field-status-active":""}"
+        data-dispatch-status-option="${u.id}"
+        data-status="${esc(status)}"
+        aria-pressed="${status===u.status?"true":"false"}"
+      >${esc(status.replaceAll("_"," "))}</button>
+    `).join("")}
+  </div>
+  <div class="small muted">${active?"Status changes are associated with the current incident.":"Choose a status for this unit."}</div>`;
+}
+
 function selectUnit(unitId){
-  const u=S.units.find(x=>x.id===unitId);if(!u)return;
+  const u=S.units.find(x=>x.id===unitId);
+  if(!u)return;
+
   const active=activeAssignmentForUnit(unitId);
+  const location=unitLocation(unitId);
+  const layerId=unitLocationLayerId(u);
+  const layer=layerId?S.mapLayers.find(l=>l.id===layerId):null;
+  const zone=u.current_zone_id?S.zones.find(z=>z.id===u.current_zone_id):null;
 
-  document.querySelector("#detail").innerHTML=`<div class="card stack" data-unit-detail-id="${u.id}">
-    <div class="row">
-      <div><div class="section-title">${esc(u.event_departments?.name||"Unit")}</div><div class="big" style="font-size:20px">${esc(u.name)}</div></div>
-      <span class="badge status-${esc(u.status)}" data-dispatch-unit-status="${u.id}">${esc(u.status.replaceAll("_"," "))}</span>
-    </div>
+  S.openIncidentId=null;
+  S.openUnitId=unitId;
+  S.incidentModalMode="unit";
 
-    ${active?`<div class="notice">
-      <strong>Current assignment</strong><br>
-      ${esc(active.incident.incident_number)} · ${esc(active.incident.call_type)}<br>
-      ${esc(active.incident.landmark||"")}
-    </div>`:`<div class="notice ok"><strong>Unassigned</strong></div>`}
-
+  const content=openIncidentModalShell();
+  content.innerHTML=`<div class="incident-modal-header">
     <div>
-      <label>Dispatcher status</label>
-      <select id="unitStatus">
-        ${unitStatusOptions(u).map(st=>`<option value="${esc(st)}" ${st===u.status?"selected":""}>${esc(st.replaceAll("_"," "))}</option>`).join("")}
-      </select>
-    </div>
-    <button class="btn secondary" id="setUnitStatus">Set Status</button>
-
-    <div class="venue-unit-location"><div class="section-title">Current Venue Location</div><select id="unitLayer"><option value="">No level/post</option>${S.mapLayers.filter(l=>l.status==="published").map(l=>`<option value="${l.id}" ${u.current_map_layer_id===l.id?"selected":""}>${esc(l.name)}</option>`).join("")}</select><select id="unitZone"><option value="">No zone</option>${S.zones.filter(z=>!u.current_map_layer_id||z.map_layer_id===u.current_map_layer_id).map(z=>`<option value="${z.id}" ${u.current_zone_id===z.id?"selected":""}>${esc(z.name)}</option>`).join("")}</select><button class="btn secondary" id="saveUnitLocation">Update Post</button></div>
-
-    ${active?`
-      <button class="btn" id="openAssignedIncident">Open ${esc(active.incident.incident_number)}</button>
-      <button class="btn danger" id="removeAssignment">Unassign from ${esc(active.incident.incident_number)}</button>
-    `:`
-      <div>
-        <label>Assign to incident</label>
-        <select id="unitIncident">
-          <option value="">Choose active incident</option>
-          ${S.incidents.filter(incidentInDispatchScope).map(i=>`<option value="${i.id}">${esc(i.incident_number)} · ${esc(i.call_type)} · ${esc(i.landmark||"")}</option>`).join("")}
-        </select>
+      <div class="incident-modal-eyebrow">${esc(u.event_departments?.name||"UNIT")}</div>
+      <div class="incident-modal-title-row">
+        <h2 id="incidentModalTitle">${esc(u.name)}</h2>
+        <span class="badge status-${esc(u.status)}" data-dispatch-unit-status="${u.id}" data-unit-current-status="${u.id}">${esc(u.status.replaceAll("_"," "))}</span>
       </div>
-      <button class="btn" id="assignFromUnit">Assign to Incident</button>
-    `}
+      <div class="incident-modal-nature">${active?`Committed to ${esc(active.incident.incident_number)}`:"Available for assignment"}</div>
+    </div>
+    <button class="incident-modal-close" id="closeIncidentModal" aria-label="Close unit controls">×</button>
+  </div>
+
+  <div class="unit-command-modal" data-unit-detail-id="${u.id}">
+    <section class="unit-command-main stack">
+      <div class="incident-info-section">
+        <div class="section-title">Unit Status</div>
+        ${unitStatusButtonsHtml(u,active)}
+      </div>
+
+      <div class="incident-info-section">
+        <div class="row"><div class="section-title">CAD Assignment</div>${active?`<span class="badge">COMMITTED</span>`:`<span class="badge">UNASSIGNED</span>`}</div>
+        ${active?`
+          <div class="unit-current-assignment">
+            <strong>${esc(active.incident.incident_number)} · ${esc(active.incident.call_type)}</strong>
+            <div class="small muted">${esc(active.incident.landmark||"")}</div>
+          </div>
+          <div class="grid2">
+            <button class="btn" id="openAssignedIncident">Open Incident</button>
+            <button class="btn danger" id="removeAssignment">Clear Unit from Incident</button>
+          </div>
+        `:`
+          <div>
+            <label>Assign to incident</label>
+            <select id="unitIncident">
+              <option value="">Choose active incident</option>
+              ${S.incidents.filter(incidentInDispatchScope).map(i=>`<option value="${i.id}">${esc(i.incident_number)} · ${esc(i.call_type)} · ${esc(i.landmark||"")}</option>`).join("")}
+            </select>
+          </div>
+          <button class="btn" id="assignFromUnit">Commit Unit to Incident</button>
+        `}
+      </div>
+    </section>
+
+    <aside class="unit-command-side stack">
+      <div class="incident-info-section">
+        <div class="section-title">Live Location</div>
+        ${location?`
+          <div class="unit-location-large ${`gps-${locationFreshness(location)}`}">
+            <strong data-unit-gps="${u.id}">${esc(locationAgeLabel(location))}${location.accuracy_m!=null?` · ±${Math.round(location.accuracy_m)}m`:""}</strong>
+            <div class="small muted">${layer?esc(layer.name):"Map layer not set"}${zone?` · ${esc(zone.name)}`:""}</div>
+            <div class="small mono muted">${Number(location.latitude).toFixed(6)}, ${Number(location.longitude).toFixed(6)}</div>
+          </div>
+          <button class="btn secondary block" id="showUnitOnMap">Show Unit on Map</button>
+        `:`<div class="small muted">${S.event?.field_location_enabled?"This unit is not currently sharing GPS.":"Field GPS sharing is disabled for this event."}</div>`}
+      </div>
+
+      <div class="incident-info-section">
+        <div class="section-title">Venue Post</div>
+        <label>Map layer</label>
+        <select id="unitLayer">
+          <option value="">No level/post</option>
+          ${S.mapLayers.filter(l=>l.status==="published").map(l=>`<option value="${l.id}" ${u.current_map_layer_id===l.id?"selected":""}>${esc(l.name)}</option>`).join("")}
+        </select>
+        <label>Zone</label>
+        <select id="unitZone">
+          <option value="">No zone</option>
+          ${S.zones.filter(z=>!u.current_map_layer_id||z.map_layer_id===u.current_map_layer_id).map(z=>`<option value="${z.id}" ${u.current_zone_id===z.id?"selected":""}>${esc(z.name)}</option>`).join("")}
+        </select>
+        <button class="btn secondary block" id="saveUnitLocation">Update Post</button>
+      </div>
+    </aside>
   </div>`;
 
-  document.querySelector("#setUnitStatus").onclick=()=>dispatcherSetUnitStatus(unitId,document.querySelector("#unitStatus").value,active?.incident.id||null);
-  document.querySelector("#unitLayer").onchange=e=>{const layer=e.target.value;document.querySelector("#unitZone").innerHTML=`<option value="">No zone</option>${S.zones.filter(z=>z.map_layer_id===layer).map(z=>`<option value="${z.id}">${esc(z.name)}</option>`).join("")}`;};
-  document.querySelector("#saveUnitLocation").onclick=async()=>{const {error}=await supabase.rpc("staff_set_unit_location",{p_unit_id:unitId,p_map_layer_id:document.querySelector("#unitLayer").value||null,p_zone_id:document.querySelector("#unitZone").value||null,p_poi_id:null});if(error)alert(error.message);else dispatchPage();};
+  document.querySelector("#closeIncidentModal").onclick=()=>closeIncidentModal();
+
+  document.querySelectorAll(`[data-dispatch-status-option="${u.id}"]`).forEach(btn=>btn.onclick=async()=>{
+    const status=btn.dataset.status;
+    if(status===u.status)return;
+
+    document.querySelectorAll(`[data-dispatch-status-option="${u.id}"]`).forEach(b=>b.disabled=true);
+    await dispatcherSetUnitStatus(unitId,status,active?.incident.id||null);
+    document.querySelectorAll(`[data-dispatch-status-option="${u.id}"]`).forEach(b=>b.disabled=false);
+  });
+
+  document.querySelector("#unitLayer").onchange=e=>{
+    const selectedLayer=e.target.value;
+    document.querySelector("#unitZone").innerHTML=`<option value="">No zone</option>${S.zones.filter(z=>z.map_layer_id===selectedLayer).map(z=>`<option value="${z.id}">${esc(z.name)}</option>`).join("")}`;
+  };
+
+  document.querySelector("#saveUnitLocation").onclick=async()=>{
+    const button=document.querySelector("#saveUnitLocation");
+    button.disabled=true;
+    button.textContent="Saving…";
+    const {error}=await supabase.rpc("staff_set_unit_location",{
+      p_unit_id:unitId,
+      p_map_layer_id:document.querySelector("#unitLayer").value||null,
+      p_zone_id:document.querySelector("#unitZone").value||null,
+      p_poi_id:null
+    });
+    if(error){
+      button.disabled=false;
+      button.textContent="Update Post";
+      return alert(error.message);
+    }
+    await loadEventOps();
+    refreshDispatchBoards();
+    selectUnit(unitId);
+  };
+
+  document.querySelector("#showUnitOnMap")?.addEventListener("click",async()=>{
+    await focusUnitOnDispatchMap(unitId);
+    closeIncidentModal();
+  });
 
   if(active){
     document.querySelector("#openAssignedIncident").onclick=()=>selectIncident(active.incident.id);
     document.querySelector("#removeAssignment").onclick=()=>dispatcherUnassign(active.incident.id,unitId);
   }else{
-    document.querySelector("#assignFromUnit").onclick=()=>dispatcherAssign(document.querySelector("#unitIncident").value,unitId);
+    document.querySelector("#assignFromUnit").onclick=()=>{
+      const incidentId=document.querySelector("#unitIncident").value;
+      if(!incidentId)return alert("Choose an active incident.");
+      dispatcherAssign(incidentId,unitId);
+    };
   }
 }
+
 async function setupDispatchMap(){
   S.unitLocationMarkers.clear();
   if(S.map){try{S.map.remove()}catch{}S.map=null;}
@@ -1789,6 +1947,7 @@ async function setupDispatchMap(){
 
 function incidentForm(loc,draft=null){
   S.openIncidentId=null;
+  S.openUnitId=null;
   S.incidentModalMode="new";
 
   const detail=openIncidentModalShell();
@@ -1962,6 +2121,7 @@ function editIncidentForm(incidentId){
   if(!i)return;
 
   S.openIncidentId=incidentId;
+  S.openUnitId=null;
   S.incidentModalMode="edit";
 
   let chosen={
@@ -3175,12 +3335,15 @@ async function refreshDispatchStructure(){
   }
 
   const reopenIncidentId=S.openIncidentId;
+  const reopenUnitId=S.openUnitId;
   await loadEventOps();
   refreshDispatchBoards();
 
-  if(reopenIncidentId&&S.incidents.some(i=>i.id===reopenIncidentId)){
+  if(reopenUnitId&&S.units.some(u=>u.id===reopenUnitId)){
+    selectUnit(reopenUnitId);
+  }else if(reopenIncidentId&&S.incidents.some(i=>i.id===reopenIncidentId)){
     selectIncident(reopenIncidentId);
-  }else if(reopenIncidentId){
+  }else if(reopenIncidentId||reopenUnitId){
     closeIncidentModal();
   }
 }
@@ -3250,6 +3413,7 @@ function reset(){
   S.commandActiveMapLayerId=null;
   S.mapPickMode=null;
   S.pendingIncidentDraft=null;
+  S.openUnitId=null;
   closeIncidentModal();
   S.orgId=null;S.eventId=null;S.event=null;S.fieldSession=null;S.activeMapLayerId=null;
 }
