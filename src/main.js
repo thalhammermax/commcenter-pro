@@ -2340,7 +2340,7 @@ function updateDispatcherUnitStatusUI(unitId,status){
 
 async function getActiveAmbulanceTransport(unitId,incidentId=null){
   let q=supabase.from("ems_encounters")
-    .select("id,incident_id,current_status,transport_destination,created_at")
+    .select("id,incident_id,current_status,current_unit_id,transport_destination,created_at")
     .eq("event_id",S.eventId)
     .eq("current_unit_id",unitId)
     .eq("current_status","TRANSPORTING")
@@ -2354,26 +2354,45 @@ async function getActiveAmbulanceTransport(unitId,incidentId=null){
   return data||null;
 }
 
+async function getIncidentActiveEventAmbulanceTransport(incidentId){
+  const {data,error}=await supabase.from("ems_encounters")
+    .select("id,incident_id,current_status,current_unit_id,transport_destination,created_at")
+    .eq("event_id",S.eventId)
+    .eq("incident_id",incidentId)
+    .eq("current_status","TRANSPORTING")
+    .not("current_unit_id","is",null)
+    .order("created_at",{ascending:false});
+
+  if(error)throw error;
+
+  return (data||[]).find(encounter=>{
+    const unit=S.units.find(u=>u.id===encounter.current_unit_id);
+    return !!unit&&isAmbulanceUnit(unit);
+  })||null;
+}
+
 function showAmbulanceTransportOutcomeModal({
   unitId,
   incidentId,
   unitName,
   incidentNumber,
   encounter,
+  source="unit-status",
   onComplete,
   onCancel
 }){
   const destination=encounter?.transport_destination
     ||S.units.find(u=>u.id===unitId)?.current_transport_destination_text
     ||"Destination facility";
+  const fromDispatchClose=source==="dispatch-close";
 
   S.incidentModalMode="transport-outcome";
   const content=openIncidentModalShell();
 
   content.innerHTML=`<div class="incident-modal-header">
     <div>
-      <div class="incident-modal-eyebrow">AMBULANCE TRANSPORT</div>
-      <div class="incident-modal-title-row"><h2 id="incidentModalTitle">Complete Transport</h2></div>
+      <div class="incident-modal-eyebrow">${fromDispatchClose?"CLOSE INCIDENT · ":""}AMBULANCE TRANSPORT</div>
+      <div class="incident-modal-title-row"><h2 id="incidentModalTitle">${fromDispatchClose?"Complete Transport & Close Call":"Complete Transport"}</h2></div>
       <div class="incident-modal-nature">${esc(unitName||"Ambulance")}${incidentNumber?` · ${esc(incidentNumber)}`:""}</div>
     </div>
     <button class="incident-modal-close" id="closeIncidentModal" aria-label="Cancel transport outcome">×</button>
@@ -2385,7 +2404,9 @@ function showAmbulanceTransportOutcomeModal({
       ${esc(destination)}
     </div>
 
-    <p>Before this ambulance returns to <strong>AVAILABLE</strong>, confirm how the patient transport ended.</p>
+    <p>${fromDispatchClose
+      ?`This patient is actively being transported by <strong>${esc(unitName||"the event ambulance")}</strong>. Confirm the transport outcome to close the CAD incident and return all committed units to AVAILABLE.`
+      :`Before this ambulance returns to <strong>AVAILABLE</strong>, confirm how the patient transport ended.`}</p>
 
     <div class="transport-outcome-options">
       <button class="transport-outcome-card delivered" id="transportDelivered">
@@ -2524,6 +2545,33 @@ async function dispatcherAssign(incidentId,unitId){
 
 
 async function openCloseIncidentDispositionModal(incident,{hasEms=false}={}){
+  let activeEventAmbulanceTransport=null;
+
+  try{
+    activeEventAmbulanceTransport=await getIncidentActiveEventAmbulanceTransport(incident.id);
+  }catch(error){
+    console.warn("Could not determine active event-ambulance transport before incident close",error);
+    return alert(error.message);
+  }
+
+  if(activeEventAmbulanceTransport){
+    const transportUnit=S.units.find(u=>u.id===activeEventAmbulanceTransport.current_unit_id);
+
+    return showAmbulanceTransportOutcomeModal({
+      unitId:activeEventAmbulanceTransport.current_unit_id,
+      incidentId:incident.id,
+      unitName:transportUnit?.name||"Event Ambulance",
+      incidentNumber:incident.incident_number,
+      encounter:activeEventAmbulanceTransport,
+      source:"dispatch-close",
+      onComplete:async()=>{
+        await loadEventOps();
+        refreshDispatchBoards();
+      },
+      onCancel:()=>selectIncident(incident.id)
+    });
+  }
+
   let existingEmsDisposition="";
   let activeTreatmentCustody=null;
 
@@ -2613,12 +2661,6 @@ async function openCloseIncidentDispositionModal(incident,{hasEms=false}={}){
         </div>
       `:""}
     </div>
-
-    ${hasEms?`
-      <div class="notice close-disposition-ems-note">
-        If an event ambulance is actively TRANSPORTING this patient, use the ambulance's AVAILABLE → Delivered / Refusal workflow instead. CommCenter will prevent this close screen from bypassing that transport outcome.
-      </div>
-    `:""}
 
     <div id="closeDispositionError" class="small destructive-error" role="alert" aria-live="polite"></div>
   </div>
