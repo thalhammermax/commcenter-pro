@@ -43,6 +43,49 @@ function ensureCallTimerTicker(){
   S.callTimerInterval=setInterval(updateCallTimers,1000);
 }
 
+
+const DEPARTMENT_STATUS_CATALOG=[
+  {value:"AVAILABLE",label:"Available"},
+  {value:"RESPONDING",label:"Responding"},
+  {value:"EN_ROUTE",label:"En Route"},
+  {value:"ON_SCENE",label:"On Scene"},
+  {value:"WORKING",label:"Working"},
+  {value:"TRANSPORTING",label:"Transporting"},
+  {value:"AT_HOSPITAL",label:"At Hospital"},
+  {value:"RETURNING",label:"Returning"},
+  {value:"CLEAR",label:"Clear"},
+  {value:"COMPLETE",label:"Complete"},
+  {value:"OUT_OF_SERVICE",label:"Out of Service"}
+];
+
+const DEFAULT_DEPARTMENT_STATUSES=[
+  "AVAILABLE",
+  "RESPONDING",
+  "ON_SCENE",
+  "CLEAR",
+  "OUT_OF_SERVICE"
+];
+
+function statusLabel(value){
+  return DEPARTMENT_STATUS_CATALOG.find(s=>s.value===value)?.label || String(value||"").replaceAll("_"," ");
+}
+
+function departmentStatusPicker(name,selected=DEFAULT_DEPARTMENT_STATUSES){
+  const chosen=new Set(Array.isArray(selected)?selected:[]);
+  return `<div class="department-status-picker">
+    ${DEPARTMENT_STATUS_CATALOG.map(status=>`
+      <label class="status-select-option">
+        <input type="checkbox" name="${esc(name)}" value="${status.value}" ${chosen.has(status.value)?"checked":""}>
+        <span>${esc(status.label)}</span>
+      </label>
+    `).join("")}
+  </div>`;
+}
+
+function selectedDepartmentStatuses(name){
+  return [...document.querySelectorAll(`input[name="${name}"]:checked`)].map(el=>el.value);
+}
+
 async function init(){
   if("serviceWorker"in navigator)navigator.serviceWorker.register("/service-worker.js").catch(console.warn);
   const {data:{session}}=await supabase.auth.getSession();S.session=session;
@@ -782,12 +825,30 @@ function renderEventSetup(){
 
     <div class="card">
       <h2>Departments</h2>
-      <div id="deptList">${S.departments.map(d=>`<div class="poi-row"><strong>${esc(d.name)}</strong> <span class="muted">${esc(d.short_name||"")}</span><br><span class="small mono">${esc(JSON.stringify(d.status_profile))}</span></div>`).join("")}</div>
-      <div class="grid3">
-        <input id="deptName" placeholder="Police">
-        <input id="deptShort" placeholder="PD">
-        <input id="deptStatuses" placeholder="AVAILABLE,RESPONDING,ON_SCENE,CLEAR">
+      <div id="deptList">${S.departments.map(d=>`<div class="poi-row department-row">
+        <div class="row">
+          <div><strong>${esc(d.name)}</strong> <span class="muted">${esc(d.short_name||"")}</span></div>
+          <button class="btn secondary" data-edit-dept-statuses="${d.id}">Edit Statuses</button>
+        </div>
+        <div class="department-status-badges">
+          ${(Array.isArray(d.status_profile)?d.status_profile:[]).map(st=>`<span class="badge status-choice-badge">${esc(statusLabel(st))}</span>`).join("")||`<span class="small muted">No field statuses configured</span>`}
+        </div>
+      </div>`).join("")||`<div class="small muted">No departments configured yet.</div>`}</div>
+
+      <div id="deptStatusEditor"></div>
+
+      <div class="section-title">Add Department</div>
+      <div class="grid2">
+        <div><label>Department Name</label><input id="deptName" placeholder="Police"></div>
+        <div><label>Short Name</label><input id="deptShort" placeholder="PD"></div>
       </div>
+
+      <div style="margin-top:12px">
+        <label>Field Unit Status Options</label>
+        <div class="small muted" style="margin-bottom:8px">Select the buttons field units in this department should have available. ASSIGNED is handled automatically by Dispatch.</div>
+        ${departmentStatusPicker("newDeptStatuses")}
+      </div>
+
       <button class="btn" id="addDept">Add Department</button>
     </div>
 
@@ -816,12 +877,23 @@ function renderEventSetup(){
     document.querySelector("#pinMsg").textContent=error?error.message:"Saved.";
     if(!error){await loadEventOps();renderEventSetup();}
   };
+  document.querySelectorAll("[data-edit-dept-statuses]").forEach(btn=>{
+    btn.onclick=()=>renderDepartmentStatusEditor(btn.dataset.editDeptStatuses);
+  });
+
   document.querySelector("#addDept").onclick=async()=>{
-    const statuses=document.querySelector("#deptStatuses").value.split(",").map(x=>x.trim().toUpperCase()).filter(Boolean);
+    const name=document.querySelector("#deptName").value.trim();
+    const shortName=document.querySelector("#deptShort").value.trim().toUpperCase();
+    const statuses=selectedDepartmentStatuses("newDeptStatuses");
+
+    if(!name)return alert("Enter a department name.");
+    if(!statuses.length)return alert("Select at least one field unit status.");
+
     const {error}=await supabase.from("event_departments").insert({
-      event_id:S.eventId,name:document.querySelector("#deptName").value.trim(),
-      short_name:document.querySelector("#deptShort").value.trim().toUpperCase(),
-      status_profile:statuses.length?statuses:["AVAILABLE","RESPONDING","ON_SCENE","CLEAR","OUT_OF_SERVICE"]
+      event_id:S.eventId,
+      name,
+      short_name:shortName,
+      status_profile:statuses
     });
     if(error)alert(error.message);else{await loadEventOps();renderEventSetup();}
   };
@@ -832,6 +904,44 @@ function renderEventSetup(){
     if(error)alert(error.message);else{await loadEventOps();renderEventSetup();}
   };
   document.querySelector("#openMapBuilder").onclick=()=>renderMapBuilder(app,S.eventId,()=>eventAdmin());
+}
+
+
+function renderDepartmentStatusEditor(departmentId){
+  const dep=S.departments.find(d=>d.id===departmentId);
+  if(!dep)return;
+
+  const host=document.querySelector("#deptStatusEditor");
+  host.innerHTML=`<div class="department-status-editor">
+    <div class="row">
+      <div>
+        <div class="section-title">Edit Field Statuses</div>
+        <strong>${esc(dep.name)}</strong>
+      </div>
+      <button class="btn secondary" id="cancelDeptStatusEdit">Cancel</button>
+    </div>
+    <p class="small muted">These become the selectable status buttons on field devices assigned to ${esc(dep.name)}.</p>
+    ${departmentStatusPicker("editDeptStatuses",dep.status_profile)}
+    <button class="btn" id="saveDeptStatuses">Save Status Options</button>
+  </div>`;
+
+  document.querySelector("#cancelDeptStatusEdit").onclick=()=>{host.innerHTML="";};
+  document.querySelector("#saveDeptStatuses").onclick=async()=>{
+    const statuses=selectedDepartmentStatuses("editDeptStatuses");
+    if(!statuses.length)return alert("Select at least one field unit status.");
+
+    const {error}=await supabase.from("event_departments")
+      .update({status_profile:statuses})
+      .eq("id",departmentId)
+      .eq("event_id",S.eventId);
+
+    if(error)return alert(error.message);
+
+    await loadEventOps();
+    renderEventSetup();
+  };
+
+  host.scrollIntoView({behavior:"smooth",block:"nearest"});
 }
 
 /* ---------------- REPORTS ---------------- */

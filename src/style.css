@@ -273,3 +273,60 @@ input:disabled{opacity:.65}
   opacity:.55;
   cursor:wait;
 }
+/* v0.4.2 — department status selector */
+.department-row .btn{
+  padding:7px 10px;
+  font-size:12px;
+}
+.department-status-badges{
+  display:flex;
+  flex-wrap:wrap;
+  gap:5px;
+  margin-top:8px;
+}
+.status-choice-badge{
+  background:#172033;
+  border:1px solid #334155;
+  color:#cbd5e1;
+}
+.department-status-picker{
+  display:grid;
+  grid-template-columns:repeat(3,minmax(0,1fr));
+  gap:7px;
+  margin-bottom:12px;
+}
+.status-select-option{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  min-height:42px;
+  padding:9px 10px;
+  margin:0;
+  border:1px solid #334155;
+  border-radius:9px;
+  background:#0f172a;
+  font-weight:600;
+  cursor:pointer;
+}
+.status-select-option:hover{
+  border-color:#60a5fa;
+  background:#111c31;
+}
+.status-select-option input{
+  width:auto;
+  margin:0;
+  accent-color:#3b82f6;
+}
+.department-status-editor{
+  margin:12px 0 18px;
+  padding:14px;
+  border:1px solid #3b82f6;
+  border-radius:12px;
+  background:#0b1324;
+}
+@media(max-width:760px){
+  .department-status-picker{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+@media(max-width:460px){
+  .department-status-picker{grid-template-columns:1fr}
+}
