@@ -1,4 +1,4 @@
-const CACHE = "commcenter-pro-v2";
+const CACHE = "commcenter-pro-v4-1";
 const CORE = ["/", "/manifest.webmanifest"];
 
 self.addEventListener("install", event => {
