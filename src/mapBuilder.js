@@ -6,408 +6,104 @@ import { fitAffine, pixelToGeo, geoToPixel, leafletToPixel, pixelToLeaflet } fro
 const esc=(v="")=>String(v).replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m]));
 
 function parseCsv(text){
-  const lines=text.replace(/\r/g,"").split("\n").filter(Boolean);
-  if(!lines.length)return[];
+  const lines=text.replace(/\r/g,"").split("\n").filter(Boolean); if(!lines.length)return[];
   const headers=lines[0].split(",").map(x=>x.trim().toLowerCase());
-  return lines.slice(1).map(line=>{
-    const vals=line.split(",").map(x=>x.trim().replace(/^"|"$/g,""));
-    return Object.fromEntries(headers.map((h,i)=>[h,vals[i]]));
-  });
+  return lines.slice(1).map(line=>{const vals=line.split(",").map(x=>x.trim().replace(/^"|"$/g,""));return Object.fromEntries(headers.map((h,i)=>[h,vals[i]]));});
 }
-
-async function fileToRows(file){
-  const text=await file.text();
-  if(file.name.toLowerCase().endsWith(".json")){
-    const rows=JSON.parse(text);
-    if(!Array.isArray(rows))throw new Error("JSON must be an array.");
-    return rows;
-  }
-  return parseCsv(text);
-}
-
-async function signedMapUrl(path){
-  if(!path)return null;
-  const {data,error}=await supabase.storage.from("event-assets").createSignedUrl(path,3600);
-  if(error)throw error;
-  return data.signedUrl;
-}
+async function fileToRows(file){const text=await file.text();return file.name.toLowerCase().endsWith(".json")?JSON.parse(text):parseCsv(text);}
+async function signedMapUrl(path){if(!path)return null;const {data,error}=await supabase.storage.from("event-assets").createSignedUrl(path,3600);if(error)throw error;return data.signedUrl;}
 
 export async function renderMapBuilder(app,eventId,onBack){
-  let map=null, overlay=null, imageMeta=null, points=[], pois=[], coeff=null, clickMode=null, w3wLayer=L.layerGroup();
-  const event=(await supabase.from("events").select("id,name,event_code").eq("id",eventId).single()).data;
+  let map=null, layerGroup=null, w3wLayer=null, clickMode=null;
+  let event=null,layers=[],activeLayer=null,points=[],pois=[],zones=[],accessPoints=[],accessNodes=[],coeff=null;
 
-  app.innerHTML=`<div class="shell">
-    <div class="topbar">
-      <div class="brand">CommCenter Pro<small>${esc(event?.name||"Event")} · Map Builder</small></div>
-      <div class="nav"><button class="btn secondary" id="backBtn">Back</button></div>
-    </div>
-    <div class="builder-layout">
-      <div class="builder-map-wrap"><div id="builderMap"></div></div>
-      <aside class="builder-side">
-        <div class="stack">
-          <div class="card step" id="stepUpload">
-            <h3>1. Upload PDF map</h3>
-            <p class="small muted">The first PDF page is rendered in your browser to a high-resolution WebP, then both files are stored in Supabase Storage.</p>
-            <input id="pdfFile" type="file" accept="application/pdf">
-            <button class="btn block" id="uploadPdf">Upload & Render PDF</button>
-            <div id="uploadStatus" class="small muted"></div>
-          </div>
-
-          <div class="card step" id="stepGeo">
-            <h3>2. Georeference</h3>
-            <p class="small muted">Add at least 3 control points. More well-distributed points are better.</p>
-            <button class="btn block" id="addControl">Click Map to Add Control Point</button>
-            <div id="pendingControl"></div>
-            <div id="controlList"></div>
-            <button class="btn secondary block" id="calculate">Calculate Georeference</button>
-            <div id="geoMetrics"></div>
-          </div>
-
-          <div class="card step" id="stepW3W">
-            <h3>3. W3W library</h3>
-            <p class="small muted">Import exact W3W square bounds as JSON or CSV with columns: words,south,north,west,east.</p>
-            <input id="w3wFile" type="file" accept=".json,.csv,application/json,text/csv">
-            <button class="btn block" id="importW3W">Import W3W Squares</button>
-            <div class="progress"><div id="w3wProgress"></div></div>
-            <div id="w3wStatus" class="small muted"></div>
-            <button class="btn secondary block" id="showSquares">Show W3W Squares in View</button>
-            <button class="btn secondary block" id="publishW3W">Publish Offline W3W Library</button>
-          </div>
-
-          <div class="card step" id="stepPoi">
-            <h3>4. Points of Interest</h3>
-            <p class="small muted">Click the map, give the point a common name, and CommCenter Pro links it to the W3W square covering that point.</p>
-            <button class="btn block" id="addPoi">Click Map to Add POI</button>
-            <div id="pendingPoi"></div>
-            <div id="poiList"></div>
-          </div>
-
-          <div class="card step" id="stepPublish">
-            <h3>5. Publish map</h3>
-            <button class="btn good block" id="publishMap">Publish Event Map</button>
-            <div id="publishStatus" class="small muted"></div>
-          </div>
-        </div>
-      </aside>
-    </div>
-  </div>`;
-
+  app.innerHTML=`<div class="shell"><div class="topbar"><div class="brand">CommCenter Pro<small id="builderSubtitle">Venue Map Builder</small></div><div class="nav"><button class="btn secondary" id="backBtn">Back</button></div></div>
+  <div class="builder-layout stadium-builder"><div class="builder-map-wrap"><div id="builderMap"></div></div><aside class="builder-side"><div id="builderControls" class="stack"></div></aside></div></div>`;
   document.querySelector("#backBtn").onclick=()=>{if(map)map.remove();onBack();};
 
-  async function loadAll(){
-    const {data:m}=await supabase.from("event_maps").select("*").eq("event_id",eventId).maybeSingle();
-    imageMeta=m||null;
-    coeff=m?.georef_coefficients||null;
-    const [{data:c},{data:p}]=await Promise.all([
-      supabase.from("map_control_points").select("*").eq("event_id",eventId).order("created_at"),
-      supabase.from("event_pois").select("*,poi_aliases(alias)").eq("event_id",eventId).eq("active",true).order("name")
+  async function loadAll(preferredLayerId=null){
+    const [eventRes,layersRes,poisRes,zonesRes,apsRes,nodesRes]=await Promise.all([
+      supabase.from("events").select("*").eq("id",eventId).single(),
+      supabase.from("event_map_layers").select("*").eq("event_id",eventId).eq("active",true).order("sort_order"),
+      supabase.from("event_pois").select("*,poi_aliases(alias)").eq("event_id",eventId).eq("active",true).order("name"),
+      supabase.from("event_zones").select("*").eq("event_id",eventId).eq("active",true).order("sort_order"),
+      supabase.from("venue_access_points").select("*").eq("event_id",eventId).eq("active",true).order("name"),
+      supabase.from("venue_access_point_nodes").select("*")
     ]);
-    points=c||[];pois=p||[];
-    await setupMap();
-    renderControlList();
-    renderPoiList();
-    updateStepState();
-    if(coeff)renderSavedMetrics();
+    for(const r of [eventRes,layersRes,poisRes,zonesRes,apsRes,nodesRes])if(r.error)throw r.error;
+    event=eventRes.data;layers=layersRes.data||[];pois=poisRes.data||[];zones=zonesRes.data||[];accessPoints=apsRes.data||[];
+    const apIds=new Set(accessPoints.map(x=>x.id));accessNodes=(nodesRes.data||[]).filter(n=>apIds.has(n.access_point_id));
+    activeLayer=layers.find(l=>l.id===(preferredLayerId||activeLayer?.id))||layers.find(l=>l.is_default)||layers[0]||null;
+    if(activeLayer){const cp=await supabase.from("map_control_points").select("*").eq("event_id",eventId).eq("map_layer_id",activeLayer.id).order("created_at");if(cp.error)throw cp.error;points=cp.data||[];coeff=activeLayer.georef_coefficients||null;}else{points=[];coeff=null;}
+    document.querySelector("#builderSubtitle").textContent=`${event?.name||"Event"} · ${activeLayer?.name||"No map layer"}`;
+    renderControls(); await setupMap();
   }
 
-  async function setupMap(){
-    if(map){map.remove();map=null;}
-    map=L.map("builderMap",{crs:L.CRS.Simple,minZoom:-4,maxZoom:5,zoomSnap:.25,attributionControl:false});
-    w3wLayer=L.layerGroup().addTo(map);
+  function layerOptionHtml(){return layers.map(l=>`<option value="${l.id}" ${l.id===activeLayer?.id?"selected":""}>${esc(l.name)}${l.level_code?` · ${esc(l.level_code)}`:""}${l.status==="published"?" ✓":""}</option>`).join("");}
+  function currentZones(){return zones.filter(z=>z.map_layer_id===activeLayer?.id);}
+  function currentPois(){return pois.filter(p=>p.map_layer_id===activeLayer?.id);}
 
-    if(!imageMeta?.rendered_image_path){
-      map.setView([0,0],0);
-      return;
-    }
-
-    const url=await signedMapUrl(imageMeta.rendered_image_path);
-    const bounds=[[0,0],[imageMeta.image_height,imageMeta.image_width]];
-    overlay=L.imageOverlay(url,bounds).addTo(map);
-    map.fitBounds(bounds);
-
-    for(const cp of points){
-      L.circleMarker(pixelToLeaflet(cp.map_x,cp.map_y,imageMeta.image_height),{radius:6})
-        .addTo(map).bindTooltip(`CP: ${cp.label}`,{permanent:false});
-    }
-    for(const p of pois){
-      L.marker(pixelToLeaflet(p.map_x,p.map_y,imageMeta.image_height))
-        .addTo(map).bindTooltip(p.name);
-    }
-
-    map.on("click",async e=>{
-      if(!imageMeta)return;
-      const px=leafletToPixel(e.latlng,imageMeta.image_height);
-      if(clickMode==="control"){
-        clickMode=null;
-        showControlForm(px);
-      }else if(clickMode==="poi"){
-        clickMode=null;
-        await showPoiForm(px);
-      }
-    });
+  function renderControls(){
+    const controls=document.querySelector("#builderControls");
+    controls.innerHTML=`
+      <div class="card"><div class="row"><div><div class="section-title">Venue</div><h3 style="margin-bottom:4px">Map Layers</h3></div><span class="badge">${esc(event?.venue_type||"outdoor")}</span></div>
+        <div><label>Venue type</label><select id="venueType"><option value="outdoor" ${event?.venue_type==="outdoor"?"selected":""}>Outdoor / Campus</option><option value="multi_level" ${event?.venue_type==="multi_level"?"selected":""}>Multi-Level Venue</option><option value="hybrid" ${event?.venue_type==="hybrid"?"selected":""}>Hybrid</option></select></div>
+        <div><label>Active map layer</label><select id="layerSelect"><option value="">-- No layers --</option>${layerOptionHtml()}</select></div>
+        <button class="btn secondary block" id="newLayer">+ Add Map Layer / Level</button><div id="newLayerForm"></div>
+      </div>
+      ${activeLayer?`
+      <div class="card step ${activeLayer.rendered_image_path?"complete":""}"><h3>1. ${esc(activeLayer.name)} PDF</h3><p class="small muted">Upload the map for this level only. Stadium levels may overlap geographically; the layer keeps them vertically distinct.</p><input id="pdfFile" type="file" accept="application/pdf"><button class="btn block" id="uploadPdf">Upload & Render PDF</button><div id="uploadStatus" class="small muted"></div></div>
+      <div class="card step ${coeff?"complete":""}"><h3>2. Georeference this level</h3><button class="btn block" id="addControl">Click Map to Add Control Point</button><div id="pendingControl"></div><div id="controlList">${controlHtml()}</div><button class="btn secondary block" id="calculate">Calculate Georeference</button><div id="geoMetrics">${metricHtml()}</div></div>
+      <div class="card"><h3>3. Zones</h3><p class="small muted">Examples: West Concourse, Third Base Side, Suite Corridor.</p><div id="zoneList">${zoneHtml()}</div><div class="grid2"><input id="zoneName" placeholder="West Concourse"><input id="zoneShort" placeholder="WEST"></div><button class="btn secondary block" id="addZone">Add Zone to ${esc(activeLayer.name)}</button></div>
+      <div class="card"><h3>4. POIs / Common Names</h3><button class="btn block" id="addPoi">Click Map to Add POI</button><div id="pendingPoi"></div><div id="poiList">${poiHtml()}</div></div>
+      <div class="card"><h3>5. Vertical Access</h3><p class="small muted">Link elevators, stairs, escalators, portals, ramps and tunnels across levels.</p><button class="btn block" id="addAccess">Click Map to Add / Link Access Point</button><div id="pendingAccess"></div><div id="accessList">${accessHtml()}</div></div>
+      <div class="card"><h3>6. W3W Event Library</h3><p class="small muted">W3W is event-wide and 2D. The selected level supplies the vertical context.</p><input id="w3wFile" type="file" accept=".json,.csv"><button class="btn block" id="importW3W">Import W3W Squares</button><div id="w3wStatus" class="small muted"></div><button class="btn secondary block" id="showSquares">Show Squares in View</button><button class="btn secondary block" id="publishW3W">Publish Offline Library</button></div>
+      <div class="card step ${activeLayer.status==="published"?"complete":""}"><h3>7. Publish Layer</h3><label><input type="checkbox" id="makeDefault" ${activeLayer.is_default?"checked":""}> Default map layer for this event</label><button class="btn good block" id="publishLayer">Publish ${esc(activeLayer.name)}</button><div id="publishStatus" class="small muted"></div></div>`:`<div class="notice">Create your first map layer. For a stadium, create Exterior, Field/100, Club/200, Terrace/300, Suites, Back of House, parking decks, etc.</div>`}`;
+    bindControls();
   }
 
-  document.querySelector("#uploadPdf").onclick=async()=>{
-    const file=document.querySelector("#pdfFile").files[0];
-    if(!file)return alert("Choose a PDF first.");
-    const status=document.querySelector("#uploadStatus");
-    try{
-      status.textContent="Rendering PDF in browser…";
-      const rendered=await renderFirstPdfPage(file,5000);
+  function controlHtml(){return points.map(p=>`<div class="cp-row"><div class="row"><strong>${esc(p.label)}</strong><button class="btn secondary" data-delcp="${p.id}">Delete</button></div><div class="small mono">${Number(p.latitude).toFixed(7)}, ${Number(p.longitude).toFixed(7)}</div><div class="small muted">${p.residual_m!=null?`error ${Number(p.residual_m).toFixed(2)} m`:"not calculated"}</div></div>`).join("")||`<div class="small muted">No control points on this layer.</div>`;}
+  function metricHtml(){return coeff?`<div class="grid2"><div><div class="metric">${Number(activeLayer.georef_rmse_m||0).toFixed(2)} m</div><div class="small muted">RMSE</div></div><div><div class="metric">${Number(activeLayer.georef_max_error_m||0).toFixed(2)} m</div><div class="small muted">Max</div></div></div>`:"";}
+  function zoneHtml(){return currentZones().map(z=>`<div class="poi-row"><div class="row"><strong>${esc(z.name)}</strong><span class="badge">${esc(z.short_name||"")}</span></div></div>`).join("")||`<div class="small muted">No zones on this level.</div>`;}
+  function poiHtml(){return currentPois().map(p=>{const z=zones.find(x=>x.id===p.zone_id);return `<div class="poi-row"><strong>${esc(p.name)}</strong><br><span class="small muted">${esc(z?.name||"")}${p.w3w?` · ///${esc(p.w3w)}`:""}</span></div>`;}).join("")||`<div class="small muted">No POIs on this level.</div>`;}
+  function accessHtml(){return accessPoints.map(ap=>{const linked=accessNodes.filter(n=>n.access_point_id===ap.id).map(n=>layers.find(l=>l.id===n.map_layer_id)?.short_name||layers.find(l=>l.id===n.map_layer_id)?.name).filter(Boolean);return `<div class="poi-row"><strong>${esc(ap.name)}</strong> <span class="badge">${esc(ap.access_type)}</span><br><span class="small muted">${esc(linked.join(" ↕ "))}</span></div>`;}).join("")||`<div class="small muted">No vertical access points yet.</div>`;}
 
-      const sourcePath=`${eventId}/map/source.pdf`;
-      const imagePath=`${eventId}/map/map.webp`;
-
-      status.textContent="Uploading original PDF…";
-      let result=await supabase.storage.from("event-assets").upload(sourcePath,file,{upsert:true,contentType:"application/pdf"});
-      if(result.error)throw result.error;
-
-      status.textContent="Uploading rendered map…";
-      result=await supabase.storage.from("event-assets").upload(imagePath,rendered.blob,{upsert:true,contentType:"image/webp"});
-      if(result.error)throw result.error;
-
-      const {error}=await supabase.from("event_maps").upsert({
-        event_id:eventId,
-        source_pdf_path:sourcePath,
-        rendered_image_path:imagePath,
-        image_width:rendered.width,
-        image_height:rendered.height,
-        status:"draft",
-        updated_at:new Date().toISOString()
-      },{onConflict:"event_id"});
-      if(error)throw error;
-
-      status.textContent=`Uploaded. Rendered ${rendered.width} × ${rendered.height}px.`;
-      await loadAll();
-    }catch(err){
-      status.textContent=`Error: ${err.message}`;
-    }
-  };
-
-  document.querySelector("#addControl").onclick=()=>{
-    if(!imageMeta)return alert("Upload a map first.");
-    clickMode="control";
-    document.querySelector("#pendingControl").innerHTML=`<div class="notice">Click the exact control point on the map.</div>`;
-  };
-
-  function showControlForm(px){
-    document.querySelector("#pendingControl").innerHTML=`<div class="card stack" style="margin-top:8px">
-      <strong>New control point</strong>
-      <div class="small mono">x=${px.x.toFixed(2)} y=${px.y.toFixed(2)}</div>
-      <div><label>Name / label</label><input id="cpLabel" placeholder="Gate N1"></div>
-      <div><label>Latitude</label><input id="cpLat" inputmode="decimal" placeholder="43.9656552"></div>
-      <div><label>Longitude</label><input id="cpLon" inputmode="decimal" placeholder="-88.5977022"></div>
-      <button class="btn" id="saveCp">Save Control Point</button>
-    </div>`;
-    document.querySelector("#saveCp").onclick=async()=>{
-      const row={
-        event_id:eventId,label:document.querySelector("#cpLabel").value.trim(),
-        map_x:px.x,map_y:px.y,
-        latitude:Number(document.querySelector("#cpLat").value),
-        longitude:Number(document.querySelector("#cpLon").value)
-      };
-      if(!row.label||!Number.isFinite(row.latitude)||!Number.isFinite(row.longitude))return alert("Complete all control point fields.");
-      const {error}=await supabase.from("map_control_points").insert(row);
-      if(error)return alert(error.message);
-      document.querySelector("#pendingControl").innerHTML="";
-      await loadAll();
-    };
+  function bindControls(){
+    document.querySelector("#venueType").onchange=async e=>{await supabase.from("events").update({venue_type:e.target.value}).eq("id",eventId);await loadAll();};
+    document.querySelector("#layerSelect").onchange=e=>loadAll(e.target.value);
+    document.querySelector("#newLayer").onclick=()=>{document.querySelector("#newLayerForm").innerHTML=`<div class="stack" style="margin-top:10px"><input id="layerName" placeholder="Terrace Level (300)"><div class="grid2"><input id="layerShort" placeholder="300"><select id="layerType"><option value="exterior">Exterior / Campus</option><option value="field">Field / Event Level</option><option value="concourse" selected>Concourse</option><option value="suite">Suites / Club</option><option value="deck">Deck</option><option value="back_of_house">Back of House</option><option value="parking">Parking</option><option value="other">Other</option></select></div><button class="btn" id="saveLayer">Create Layer</button></div>`;document.querySelector("#saveLayer").onclick=createLayer;};
+    if(!activeLayer)return;
+    document.querySelector("#uploadPdf").onclick=uploadPdf;
+    document.querySelector("#addControl").onclick=()=>{if(!activeLayer.rendered_image_path)return alert("Upload this layer's PDF first.");clickMode="control";document.querySelector("#pendingControl").innerHTML=`<div class="notice">Click the exact known point on ${esc(activeLayer.name)}.</div>`;};
+    document.querySelector("#calculate").onclick=calculateGeoref;
+    document.querySelectorAll("[data-delcp]").forEach(b=>b.onclick=async()=>{await supabase.from("map_control_points").delete().eq("id",b.dataset.delcp);await loadAll(activeLayer.id);});
+    document.querySelector("#addZone").onclick=addZone;
+    document.querySelector("#addPoi").onclick=()=>{if(!coeff)return alert("Georeference this layer first.");clickMode="poi";document.querySelector("#pendingPoi").innerHTML=`<div class="notice">Click the POI on ${esc(activeLayer.name)}.</div>`;};
+    document.querySelector("#addAccess").onclick=()=>{if(!coeff)return alert("Georeference this layer first.");clickMode="access";document.querySelector("#pendingAccess").innerHTML=`<div class="notice">Click the access point on ${esc(activeLayer.name)}.</div>`;};
+    document.querySelector("#importW3W").onclick=importW3W;
+    document.querySelector("#showSquares").onclick=showSquares;
+    document.querySelector("#publishW3W").onclick=publishW3W;
+    document.querySelector("#publishLayer").onclick=publishLayer;
   }
 
-  function renderControlList(residualMap={}){
-    document.querySelector("#controlList").innerHTML=points.map(p=>`<div class="cp-row">
-      <div class="row"><strong>${esc(p.label)}</strong><button class="btn secondary" data-delcp="${p.id}">Delete</button></div>
-      <div class="small mono">${Number(p.latitude).toFixed(7)}, ${Number(p.longitude).toFixed(7)}</div>
-      <div class="small muted">pixel ${Number(p.map_x).toFixed(1)}, ${Number(p.map_y).toFixed(1)}
-      ${residualMap[p.id]!=null?` · error ${residualMap[p.id].toFixed(2)} m`:""}</div>
-    </div>`).join("")||`<div class="small muted">No control points yet.</div>`;
-    document.querySelectorAll("[data-delcp]").forEach(b=>b.onclick=async()=>{
-      await supabase.from("map_control_points").delete().eq("id",b.dataset.delcp);
-      await loadAll();
-    });
+  async function createLayer(){const name=document.querySelector("#layerName").value.trim();if(!name)return alert("Enter a layer name.");const {data,error}=await supabase.from("event_map_layers").insert({event_id:eventId,name,short_name:document.querySelector("#layerShort").value.trim()||null,level_code:document.querySelector("#layerShort").value.trim()||null,level_type:document.querySelector("#layerType").value,sort_order:(layers.length+1)*10,is_default:layers.length===0}).select().single();if(error)return alert(error.message);await loadAll(data.id);}
+  async function uploadPdf(){const file=document.querySelector("#pdfFile").files[0];if(!file)return alert("Choose a PDF.");const st=document.querySelector("#uploadStatus");try{st.textContent="Rendering PDF…";const r=await renderFirstPdfPage(file,5000);const base=`${eventId}/layers/${activeLayer.id}`;let up=await supabase.storage.from("event-assets").upload(`${base}/source.pdf`,file,{upsert:true,contentType:"application/pdf"});if(up.error)throw up.error;up=await supabase.storage.from("event-assets").upload(`${base}/map.webp`,r.blob,{upsert:true,contentType:"image/webp"});if(up.error)throw up.error;const {error}=await supabase.from("event_map_layers").update({source_pdf_path:`${base}/source.pdf`,rendered_image_path:`${base}/map.webp`,image_width:r.width,image_height:r.height,status:"draft",updated_at:new Date().toISOString()}).eq("id",activeLayer.id);if(error)throw error;await loadAll(activeLayer.id);}catch(e){st.textContent=e.message;}}
+  async function calculateGeoref(){try{const result=fitAffine(points);for(const r of result.residuals)await supabase.from("map_control_points").update({residual_m:r.meters}).eq("id",r.id);const {error}=await supabase.from("event_map_layers").update({georef_method:"affine",georef_coefficients:result.coefficients,georef_rmse_m:result.rmse,georef_max_error_m:result.max,status:"calibrated",updated_at:new Date().toISOString()}).eq("id",activeLayer.id);if(error)throw error;await loadAll(activeLayer.id);}catch(e){alert(e.message);}}
+  async function addZone(){const name=document.querySelector("#zoneName").value.trim();if(!name)return alert("Enter a zone name.");const {error}=await supabase.from("event_zones").insert({event_id:eventId,map_layer_id:activeLayer.id,name,short_name:document.querySelector("#zoneShort").value.trim()||null});if(error)alert(error.message);else await loadAll(activeLayer.id);}
+
+  async function setupMap(){if(map){map.remove();map=null;}map=L.map("builderMap",{crs:L.CRS.Simple,minZoom:-4,maxZoom:5,zoomSnap:.25,attributionControl:false});layerGroup=L.layerGroup().addTo(map);w3wLayer=L.layerGroup().addTo(map);if(!activeLayer?.rendered_image_path){map.setView([0,0],0);return;}const url=await signedMapUrl(activeLayer.rendered_image_path);const bounds=[[0,0],[activeLayer.image_height,activeLayer.image_width]];L.imageOverlay(url,bounds).addTo(map);map.fitBounds(bounds);
+    for(const cp of points)L.circleMarker(pixelToLeaflet(cp.map_x,cp.map_y,activeLayer.image_height),{radius:6}).addTo(layerGroup).bindTooltip(`CP: ${cp.label}`);
+    for(const p of currentPois())L.marker(pixelToLeaflet(p.map_x,p.map_y,activeLayer.image_height)).addTo(layerGroup).bindTooltip(p.name);
+    for(const n of accessNodes.filter(n=>n.map_layer_id===activeLayer.id)){const ap=accessPoints.find(a=>a.id===n.access_point_id);L.circleMarker(pixelToLeaflet(n.map_x,n.map_y,activeLayer.image_height),{radius:7}).addTo(layerGroup).bindTooltip(`${ap?.name||"Access"} · ${ap?.access_type||""}`);}
+    map.on("click",async e=>{const px=leafletToPixel(e.latlng,activeLayer.image_height);if(clickMode==="control"){clickMode=null;showControlForm(px);}else if(clickMode==="poi"){clickMode=null;await showPoiForm(px);}else if(clickMode==="access"){clickMode=null;await showAccessForm(px);}});
   }
-
-  document.querySelector("#calculate").onclick=async()=>{
-    try{
-      const result=fitAffine(points);
-      coeff=result.coefficients;
-      const {error}=await supabase.from("event_maps").update({
-        georef_method:"affine",
-        georef_coefficients:result.coefficients,
-        georef_rmse_m:result.rmse,
-        georef_max_error_m:result.max,
-        status:"calibrated",
-        updated_at:new Date().toISOString()
-      }).eq("event_id",eventId);
-      if(error)throw error;
-
-      for(const r of result.residuals){
-        await supabase.from("map_control_points").update({residual_m:r.meters}).eq("id",r.id);
-      }
-      const residualMap=Object.fromEntries(result.residuals.map(r=>[r.id,r.meters]));
-      renderControlList(residualMap);
-      renderMetrics(result.rmse,result.max);
-      updateStepState();
-    }catch(err){alert(err.message);}
-  };
-
-  function renderMetrics(rmse,max){
-    document.querySelector("#geoMetrics").innerHTML=`<div class="grid2" style="margin-top:10px">
-      <div><div class="metric">${rmse.toFixed(2)} m</div><div class="small muted">RMSE</div></div>
-      <div><div class="metric">${max.toFixed(2)} m</div><div class="small muted">Maximum</div></div>
-    </div>`;
-  }
-  function renderSavedMetrics(){
-    renderMetrics(Number(imageMeta.georef_rmse_m||0),Number(imageMeta.georef_max_error_m||0));
-  }
-
-  document.querySelector("#importW3W").onclick=async()=>{
-    const file=document.querySelector("#w3wFile").files[0];
-    if(!file)return alert("Choose a JSON or CSV W3W file first.");
-    const status=document.querySelector("#w3wStatus"),bar=document.querySelector("#w3wProgress");
-    try{
-      let rows=await fileToRows(file);
-      rows=rows.map(r=>({
-        event_id:eventId,
-        words:String(r.words||"").replace(/^\/{3}/,"").trim(),
-        south:Number(r.south),north:Number(r.north),west:Number(r.west),east:Number(r.east),
-        center_lat:(Number(r.south)+Number(r.north))/2,
-        center_lon:(Number(r.west)+Number(r.east))/2
-      })).filter(r=>r.words&&[r.south,r.north,r.west,r.east].every(Number.isFinite));
-      if(!rows.length)throw new Error("No valid W3W rows found.");
-
-      const chunk=500;
-      for(let i=0;i<rows.length;i+=chunk){
-        const {error}=await supabase.from("event_w3w_squares").upsert(rows.slice(i,i+chunk),{onConflict:"event_id,words"});
-        if(error)throw error;
-        bar.style.width=`${Math.min(100,((i+chunk)/rows.length)*100)}%`;
-        status.textContent=`Imported ${Math.min(i+chunk,rows.length).toLocaleString()} / ${rows.length.toLocaleString()}`;
-      }
-      updateStepState();
-    }catch(err){status.textContent=`Error: ${err.message}`;}
-  };
-
-  document.querySelector("#showSquares").onclick=async()=>{
-    if(!map||!coeff)return alert("Calibrate the map first.");
-    w3wLayer.clearLayers();
-    const b=map.getBounds();
-    const corners=[
-      leafletToPixel(b.getSouthWest(),imageMeta.image_height),
-      leafletToPixel(b.getNorthEast(),imageMeta.image_height)
-    ];
-    const g1=pixelToGeo(corners[0].x,corners[0].y,coeff);
-    const g2=pixelToGeo(corners[1].x,corners[1].y,coeff);
-    const south=Math.min(g1.lat,g2.lat),north=Math.max(g1.lat,g2.lat),west=Math.min(g1.lon,g2.lon),east=Math.max(g1.lon,g2.lon);
-    const {data,error}=await supabase.rpc("w3w_squares_in_bounds",{p_event_id:eventId,p_south:south,p_north:north,p_west:west,p_east:east,p_limit:2500});
-    if(error)return alert(error.message);
-    for(const s of data||[]){
-      const geoCorners=[[s.south,s.west],[s.south,s.east],[s.north,s.east],[s.north,s.west]];
-      const pts=geoCorners.map(([lat,lon])=>{
-        const px=geoToPixel(lat,lon,coeff);
-        return pixelToLeaflet(px.x,px.y,imageMeta.image_height);
-      });
-      L.polygon(pts,{weight:1,fillOpacity:0.05}).addTo(w3wLayer).bindTooltip(`///${s.words}`);
-    }
-    document.querySelector("#w3wStatus").textContent=`Showing ${(data||[]).length.toLocaleString()} squares in current view (capped at 2,500).`;
-  };
-
-  document.querySelector("#publishW3W").onclick=async()=>{
-    const status=document.querySelector("#w3wStatus");
-    try{
-      status.textContent="Building offline JSON…";
-      let all=[],from=0,page=1000;
-      while(true){
-        const {data,error}=await supabase.from("event_w3w_squares")
-          .select("words,south,north,west,east")
-          .eq("event_id",eventId).range(from,from+page-1);
-        if(error)throw error;
-        all.push(...data);
-        if(data.length<page)break;
-        from+=page;
-        status.textContent=`Loaded ${all.length.toLocaleString()} squares…`;
-      }
-      const path=`${eventId}/offline/w3w.json`;
-      const blob=new Blob([JSON.stringify(all)],{type:"application/json"});
-      const {error:upErr}=await supabase.storage.from("event-assets").upload(path,blob,{upsert:true,contentType:"application/json"});
-      if(upErr)throw upErr;
-      const {error}=await supabase.from("event_maps").update({offline_w3w_path:path,updated_at:new Date().toISOString()}).eq("event_id",eventId);
-      if(error)throw error;
-      status.textContent=`Offline library published: ${all.length.toLocaleString()} squares.`;
-    }catch(err){status.textContent=`Error: ${err.message}`;}
-  };
-
-  document.querySelector("#addPoi").onclick=()=>{
-    if(!coeff)return alert("Calculate the georeference first.");
-    clickMode="poi";
-    document.querySelector("#pendingPoi").innerHTML=`<div class="notice">Click the POI on the map.</div>`;
-  };
-
-  async function showPoiForm(px){
-    const geo=pixelToGeo(px.x,px.y,coeff);
-    const {data:words}=await supabase.rpc("w3w_for_coordinate",{p_event_id:eventId,p_lat:geo.lat,p_lon:geo.lon});
-    document.querySelector("#pendingPoi").innerHTML=`<div class="card stack" style="margin-top:8px">
-      <strong>New POI</strong>
-      <div><label>Common name</label><input id="poiName" placeholder="Main Medical"></div>
-      <div><label>Category</label><select id="poiCategory">
-        <option>Medical</option><option>Command</option><option>Gate</option><option>Stage</option>
-        <option>Security</option><option>Parking</option><option>Production</option><option>Facilities</option>
-        <option>Transportation</option><option>Guest Services</option><option>Other</option>
-      </select></div>
-      <div><label>Aliases (comma separated)</label><input id="poiAliases" placeholder="Main Med, Med Tent"></div>
-      <div><label>Notes</label><textarea id="poiNotes" rows="2"></textarea></div>
-      <div class="small mono">${geo.lat.toFixed(7)}, ${geo.lon.toFixed(7)}</div>
-      <div class="${words?"notice ok":"notice"}">${words?`W3W: ///${esc(words)}`:"No W3W square is loaded for this point yet."}</div>
-      <button class="btn" id="savePoi">Save POI</button>
-    </div>`;
-    document.querySelector("#savePoi").onclick=async()=>{
-      const name=document.querySelector("#poiName").value.trim();
-      if(!name)return alert("Enter a POI name.");
-      const square=words ? (await supabase.from("event_w3w_squares").select("id,words").eq("event_id",eventId).eq("words",words).maybeSingle()).data : null;
-      const {data:poi,error}=await supabase.from("event_pois").insert({
-        event_id:eventId,name,category:document.querySelector("#poiCategory").value,
-        latitude:geo.lat,longitude:geo.lon,map_x:px.x,map_y:px.y,
-        w3w_square_id:square?.id||null,w3w:words||null,notes:document.querySelector("#poiNotes").value.trim()
-      }).select().single();
-      if(error)return alert(error.message);
-      const aliases=document.querySelector("#poiAliases").value.split(",").map(x=>x.trim()).filter(Boolean);
-      if(aliases.length){
-        const {error:aerr}=await supabase.from("poi_aliases").insert(aliases.map(alias=>({poi_id:poi.id,alias})));
-        if(aerr)return alert(aerr.message);
-      }
-      document.querySelector("#pendingPoi").innerHTML="";
-      await loadAll();
-    };
-  }
-
-  function renderPoiList(){
-    document.querySelector("#poiList").innerHTML=pois.map(p=>`<div class="poi-row">
-      <div class="row"><strong>${esc(p.name)}</strong><button class="btn secondary" data-delpoi="${p.id}">Delete</button></div>
-      <div class="small">${esc(p.category||"Other")}${p.w3w?` · ///${esc(p.w3w)}`:""}</div>
-      <div class="small muted">${(p.poi_aliases||[]).map(a=>esc(a.alias)).join(", ")}</div>
-    </div>`).join("")||`<div class="small muted">No POIs yet.</div>`;
-    document.querySelectorAll("[data-delpoi]").forEach(b=>b.onclick=async()=>{
-      await supabase.from("event_pois").update({active:false}).eq("id",b.dataset.delpoi);
-      await loadAll();
-    });
-  }
-
-  document.querySelector("#publishMap").onclick=async()=>{
-    if(!imageMeta?.rendered_image_path)return alert("Upload a map first.");
-    if(!coeff)return alert("Calibrate the map first.");
-    const {error}=await supabase.from("event_maps").update({status:"published",published_at:new Date().toISOString(),updated_at:new Date().toISOString()}).eq("event_id",eventId);
-    document.querySelector("#publishStatus").textContent=error?error.message:"Published. Dispatch can now use this event map.";
-    updateStepState();
-  };
-
-  async function updateStepState(){
-    const {count}=await supabase.from("event_w3w_squares").select("*",{count:"exact",head:true}).eq("event_id",eventId);
-    document.querySelector("#stepUpload").classList.toggle("complete",!!imageMeta?.rendered_image_path);
-    document.querySelector("#stepGeo").classList.toggle("complete",!!coeff);
-    document.querySelector("#stepW3W").classList.toggle("complete",(count||0)>0);
-    document.querySelector("#stepPoi").classList.toggle("complete",pois.length>0);
-    document.querySelector("#stepPublish").classList.toggle("complete",imageMeta?.status==="published");
-    if((count||0)>0)document.querySelector("#w3wStatus").textContent=`${count.toLocaleString()} W3W squares loaded.`;
-  }
+  function showControlForm(px){document.querySelector("#pendingControl").innerHTML=`<div class="card stack"><input id="cpLabel" placeholder="Gate / section reference"><input id="cpLat" placeholder="Latitude"><input id="cpLon" placeholder="Longitude"><button class="btn" id="saveCp">Save Control Point</button></div>`;document.querySelector("#saveCp").onclick=async()=>{const row={event_id:eventId,map_layer_id:activeLayer.id,label:document.querySelector("#cpLabel").value.trim(),map_x:px.x,map_y:px.y,latitude:Number(document.querySelector("#cpLat").value),longitude:Number(document.querySelector("#cpLon").value)};if(!row.label||!Number.isFinite(row.latitude)||!Number.isFinite(row.longitude))return alert("Complete all fields.");const {error}=await supabase.from("map_control_points").insert(row);if(error)alert(error.message);else await loadAll(activeLayer.id);};}
+  async function showPoiForm(px){const geo=pixelToGeo(px.x,px.y,coeff);const {data:words}=await supabase.rpc("w3w_for_coordinate",{p_event_id:eventId,p_lat:geo.lat,p_lon:geo.lon});document.querySelector("#pendingPoi").innerHTML=`<div class="card stack"><input id="poiName" placeholder="Section 312 / Main Medical"><select id="poiCategory"><option>Seating Section</option><option>Medical</option><option>Command</option><option>Gate</option><option>Portal</option><option>Concession</option><option>Restroom</option><option>Production</option><option>Security</option><option>Other</option></select><select id="poiZone"><option value="">No zone</option>${currentZones().map(z=>`<option value="${z.id}">${esc(z.name)}</option>`).join("")}</select><input id="poiAliases" placeholder="Aliases, comma separated"><textarea id="poiNotes" placeholder="Access notes / nearest portal"></textarea><div class="notice ${words?"ok":""}">${words?`///${esc(words)}`:"No W3W square loaded here"}</div><button class="btn" id="savePoi">Save POI</button></div>`;document.querySelector("#savePoi").onclick=async()=>{const name=document.querySelector("#poiName").value.trim();if(!name)return alert("Enter a POI name.");const square=words?(await supabase.from("event_w3w_squares").select("id").eq("event_id",eventId).eq("words",words).maybeSingle()).data:null;const {data:poi,error}=await supabase.from("event_pois").insert({event_id:eventId,map_layer_id:activeLayer.id,zone_id:document.querySelector("#poiZone").value||null,name,category:document.querySelector("#poiCategory").value,latitude:geo.lat,longitude:geo.lon,map_x:px.x,map_y:px.y,w3w_square_id:square?.id||null,w3w:words||null,notes:document.querySelector("#poiNotes").value.trim()||null}).select().single();if(error)return alert(error.message);const aliases=document.querySelector("#poiAliases").value.split(",").map(x=>x.trim()).filter(Boolean);if(aliases.length)await supabase.from("poi_aliases").insert(aliases.map(alias=>({poi_id:poi.id,alias})));await loadAll(activeLayer.id);};}
+  async function showAccessForm(px){const geo=pixelToGeo(px.x,px.y,coeff);const {data:words}=await supabase.rpc("w3w_for_coordinate",{p_event_id:eventId,p_lat:geo.lat,p_lon:geo.lon});document.querySelector("#pendingAccess").innerHTML=`<div class="card stack"><select id="existingAccess"><option value="">Create new access point</option>${accessPoints.map(a=>`<option value="${a.id}">${esc(a.name)} · ${esc(a.access_type)}</option>`).join("")}</select><input id="accessName" placeholder="Elevator E3"><select id="accessType"><option value="elevator">Elevator</option><option value="stairwell">Stairwell</option><option value="escalator">Escalator</option><option value="ramp">Ramp</option><option value="portal">Portal</option><option value="vomitory">Vomitory</option><option value="tunnel">Tunnel</option><option value="gate">Gate</option><option value="corridor">Corridor</option><option value="other">Other</option></select><select id="accessZone"><option value="">No zone</option>${currentZones().map(z=>`<option value="${z.id}">${esc(z.name)}</option>`).join("")}</select><input id="accessInstructions" placeholder="e.g. Use for stretcher access"><button class="btn" id="saveAccess">Save Node on ${esc(activeLayer.name)}</button></div>`;document.querySelector("#saveAccess").onclick=async()=>{let apId=document.querySelector("#existingAccess").value;if(!apId){const name=document.querySelector("#accessName").value.trim();if(!name)return alert("Enter an access-point name.");const {data,error}=await supabase.from("venue_access_points").insert({event_id:eventId,name,access_type:document.querySelector("#accessType").value}).select().single();if(error)return alert(error.message);apId=data.id;}const {error}=await supabase.from("venue_access_point_nodes").upsert({access_point_id:apId,map_layer_id:activeLayer.id,zone_id:document.querySelector("#accessZone").value||null,map_x:px.x,map_y:px.y,latitude:geo.lat,longitude:geo.lon,w3w:words||null,instructions:document.querySelector("#accessInstructions").value.trim()||null},{onConflict:"access_point_id,map_layer_id"});if(error)alert(error.message);else await loadAll(activeLayer.id);};}
+  async function importW3W(){const file=document.querySelector("#w3wFile").files[0];if(!file)return alert("Choose a CSV/JSON file.");try{let rows=await fileToRows(file);rows=rows.map(r=>({event_id:eventId,words:String(r.words||"").replace(/^\/{3}/,"").trim(),south:Number(r.south),north:Number(r.north),west:Number(r.west),east:Number(r.east),center_lat:(Number(r.south)+Number(r.north))/2,center_lon:(Number(r.west)+Number(r.east))/2})).filter(r=>r.words&&[r.south,r.north,r.west,r.east].every(Number.isFinite));for(let i=0;i<rows.length;i+=500){const {error}=await supabase.from("event_w3w_squares").upsert(rows.slice(i,i+500),{onConflict:"event_id,words"});if(error)throw error;document.querySelector("#w3wStatus").textContent=`Imported ${Math.min(i+500,rows.length)} / ${rows.length}`;}}catch(e){document.querySelector("#w3wStatus").textContent=e.message;}}
+  async function showSquares(){if(!coeff)return alert("Georeference this layer first.");w3wLayer.clearLayers();const b=map.getBounds(),p1=leafletToPixel(b.getSouthWest(),activeLayer.image_height),p2=leafletToPixel(b.getNorthEast(),activeLayer.image_height),g1=pixelToGeo(p1.x,p1.y,coeff),g2=pixelToGeo(p2.x,p2.y,coeff);const {data,error}=await supabase.rpc("w3w_squares_in_bounds",{p_event_id:eventId,p_south:Math.min(g1.lat,g2.lat),p_north:Math.max(g1.lat,g2.lat),p_west:Math.min(g1.lon,g2.lon),p_east:Math.max(g1.lon,g2.lon),p_limit:2500});if(error)return alert(error.message);for(const q of data||[]){const pts=[[q.south,q.west],[q.south,q.east],[q.north,q.east],[q.north,q.west]].map(([lat,lon])=>{const px=geoToPixel(lat,lon,coeff);return pixelToLeaflet(px.x,px.y,activeLayer.image_height);});L.polygon(pts,{weight:1,fillOpacity:.03}).addTo(w3wLayer).bindTooltip(`///${q.words}`);}}
+  async function publishW3W(){let all=[],from=0;while(true){const {data,error}=await supabase.from("event_w3w_squares").select("words,south,north,west,east").eq("event_id",eventId).range(from,from+999);if(error)return alert(error.message);all.push(...data);if(data.length<1000)break;from+=1000;}const path=`${eventId}/offline/w3w.json`;const {error}=await supabase.storage.from("event-assets").upload(path,new Blob([JSON.stringify(all)],{type:"application/json"}),{upsert:true,contentType:"application/json"});if(error)return alert(error.message);await supabase.from("events").update({offline_w3w_path:path}).eq("id",eventId);document.querySelector("#w3wStatus").textContent=`Published ${all.length.toLocaleString()} squares.`;}
+  async function publishLayer(){if(!activeLayer.rendered_image_path||!coeff)return alert("Upload and georeference this layer first.");const makeDefault=document.querySelector("#makeDefault").checked;if(makeDefault)await supabase.from("event_map_layers").update({is_default:false}).eq("event_id",eventId);const {error}=await supabase.from("event_map_layers").update({status:"published",is_default:makeDefault,published_at:new Date().toISOString(),updated_at:new Date().toISOString()}).eq("id",activeLayer.id);if(error)alert(error.message);else await loadAll(activeLayer.id);}
 
   await loadAll();
 }

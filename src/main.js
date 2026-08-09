@@ -4,11 +4,12 @@ import { supabase } from "./supabase.js";
 import { renderMapBuilder } from "./mapBuilder.js";
 import { pixelToGeo, pixelToLeaflet, leafletToPixel } from "./georef.js";
 import { saveOfflineEvent, getOfflineEvent, localW3WForCoordinate } from "./offlineStore.js";
+import { renderEmsOps, renderEmsAdmin, renderTreatmentAreaFlow, loadFieldEmsState, fieldEmsPanelHtml, bindFieldEmsPanel } from "./ems.js";
 
 const app=document.querySelector("#app");
 const S={
   mode:null,session:null,orgs:[],orgId:null,events:[],eventId:null,event:null,
-  departments:[],units:[],incidents:[],pois:[],eventMap:null,map:null,realtime:[],
+  departments:[],units:[],incidents:[],pois:[],eventMap:null,mapLayers:[],zones:[],accessPoints:[],accessNodes:[],activeMapLayerId:null,map:null,realtime:[],
   fieldSession:null,currentLocation:null,isPlatformAdmin:false
 };
 
@@ -31,6 +32,10 @@ async function route(){
     return staffFlow();
   }
   if(S.mode==="field")return fieldFlow();
+  if(S.mode==="treatment")return renderTreatmentAreaFlow(app,{
+    header,
+    onExit:()=>{S.mode=null;reset();route();}
+  });
 }
 
 function landing(){
@@ -39,9 +44,11 @@ function landing(){
       <h1>CommCenter Pro</h1>
       <p class="muted">Multi-department event command, dispatch, mapping, field CAD and reporting.</p>
       <button class="btn block" id="fieldAccess">Field Unit Access</button>
+      <button class="btn block" id="treatmentAccess">Treatment Area Station</button>
       <button class="btn secondary block" id="staffAccess">Dispatcher / Admin Login</button>
     </div></div></div>`;
   document.querySelector("#fieldAccess").onclick=()=>{S.mode="field";route();};
+  document.querySelector("#treatmentAccess").onclick=()=>{S.mode="treatment";route();};
   document.querySelector("#staffAccess").onclick=()=>{S.mode="staff";route();};
 }
 
@@ -197,7 +204,11 @@ async function loadEventOps(){
     unitsRes,
     incidentsRes,
     poisRes,
-    eventMapRes
+    eventMapRes,
+    mapLayersRes,
+    zonesRes,
+    accessPointsRes,
+    accessNodesRes
   ] = await Promise.all([
     supabase.from("events").select("*").eq("id",S.eventId).single(),
     supabase.from("event_departments").select("*").eq("event_id",S.eventId).order("sort_order"),
@@ -211,7 +222,11 @@ async function loadEventOps(){
       .neq("status","CLOSED")
       .order("created_at",{ascending:false}),
     supabase.from("event_pois").select("*,poi_aliases(alias)").eq("event_id",S.eventId).eq("active",true).order("name"),
-    supabase.from("event_maps").select("*").eq("event_id",S.eventId).maybeSingle()
+    supabase.from("event_maps").select("*").eq("event_id",S.eventId).maybeSingle(),
+    supabase.from("event_map_layers").select("*").eq("event_id",S.eventId).eq("active",true).order("sort_order"),
+    supabase.from("event_zones").select("*").eq("event_id",S.eventId).eq("active",true).order("sort_order"),
+    supabase.from("venue_access_points").select("*").eq("event_id",S.eventId).eq("active",true).order("name"),
+    supabase.from("venue_access_point_nodes").select("*")
   ]);
 
   const baseResults = {
@@ -220,7 +235,11 @@ async function loadEventOps(){
     units: unitsRes,
     incidents: incidentsRes,
     pois: poisRes,
-    eventMap: eventMapRes
+    eventMap: eventMapRes,
+    mapLayers: mapLayersRes,
+    zones: zonesRes,
+    accessPoints: accessPointsRes,
+    accessNodes: accessNodesRes
   };
 
   const failed = Object.entries(baseResults).filter(([,res])=>res.error);
@@ -268,7 +287,19 @@ async function loadEventOps(){
   S.incidents=incidents;
   S.pois=poisRes.data||[];
   S.eventMap=eventMapRes.data||null;
+  S.mapLayers=mapLayersRes.data||[];
+  S.zones=zonesRes.data||[];
+  S.accessPoints=accessPointsRes.data||[];
+  const apIds=new Set(S.accessPoints.map(a=>a.id));
+  S.accessNodes=(accessNodesRes.data||[]).filter(n=>apIds.has(n.access_point_id));
+  const preferred=S.mapLayers.find(l=>l.id===S.activeMapLayerId);
+  const fallback=S.mapLayers.find(l=>l.is_default&&l.status==="published")||S.mapLayers.find(l=>l.status==="published")||S.mapLayers[0]||null;
+  S.activeMapLayerId=(preferred||fallback)?.id||null;
 }
+
+function activeMapLayer(){return S.mapLayers.find(l=>l.id===S.activeMapLayerId)||null;}
+function zoneName(id){return S.zones.find(z=>z.id===id)?.name||"";}
+function layerName(id){return S.mapLayers.find(l=>l.id===id)?.name||"";}
 
 async function storageSigned(path,seconds=3600){
   if(!path)return null;
@@ -305,7 +336,7 @@ async function dispatchPage(){
         <button class="btn block" id="newIncident">+ New Incident</button>
         <div class="section-title">Active incidents</div><div id="incidentList">${incidentList()}</div>
       </aside>
-      <div class="map-wrap"><div id="map"></div></div>
+      <div class="map-wrap"><div class="map-level-toolbar"><span class="section-title">Map Layer</span><select id="dispatchLayerSelect">${S.mapLayers.filter(l=>l.status==="published").map(l=>`<option value="${l.id}" ${l.id===S.activeMapLayerId?"selected":""}>${esc(l.name)}${l.level_code?` · ${esc(l.level_code)}`:""}</option>`).join("")}</select></div><div id="map"></div></div>
       <aside class="panel right">
         <div class="row"><div class="section-title">Units</div></div>
         <div id="unitList">${unitList()}</div>
@@ -313,168 +344,400 @@ async function dispatchPage(){
       </aside>
     </div></div>`;
   document.querySelector("#topActions").innerHTML=`
+    <button class="btn secondary" id="emsOpsBtn">EMS Ops</button>
     <button class="btn secondary" id="adminBtn">Event Admin</button>
     <button class="btn secondary" id="reportsBtn">Reports</button>
     <button class="btn secondary" id="eventsBtn">Events</button>
     <button class="btn secondary" id="logoutBtn">Sign out</button>`;
+  document.querySelector("#emsOpsBtn").onclick=()=>renderEmsOps(app,{eventId:S.eventId,event:S.event,header,onBack:()=>dispatchPage(),onAdmin:()=>eventAdmin("ems")});
   document.querySelector("#adminBtn").onclick=()=>eventAdmin();
   document.querySelector("#reportsBtn").onclick=()=>reportsPage();
   document.querySelector("#eventsBtn").onclick=()=>{S.eventId=null;staffFlow();};
   document.querySelector("#logoutBtn").onclick=async()=>{await supabase.auth.signOut();S.mode=null;reset();route();};
   document.querySelector("#newIncident").onclick=()=>incidentForm(null);
+  document.querySelector("#dispatchLayerSelect")?.addEventListener("change",e=>{S.activeMapLayerId=e.target.value;setupDispatchMap();});
   bindIncidentClicks();
   await setupDispatchMap();
   subscribeDispatch();
 }
 
+
+function activeAssignmentForUnit(unitId){
+  for(const incident of S.incidents){
+    const link=(incident.incident_units||[]).find(x=>x.unit_id===unitId && !x.cleared_at);
+    if(link)return {incident,link};
+  }
+  return null;
+}
+
 function incidentList(){
   return S.incidents.map(i=>{
     const deps=(i.incident_departments||[]).map(d=>d.event_departments?.short_name||d.event_departments?.name).filter(Boolean).join("/");
+    const assigned=(i.incident_units||[]).filter(x=>!x.cleared_at).map(x=>x.units?.name).filter(Boolean);
     return `<div class="incident" data-incident="${i.id}">
       <div class="row"><strong>${esc(i.incident_number)}</strong><span class="badge">${esc(i.priority)}</span></div>
-      <div>${esc(i.call_type)}</div><div class="small muted">${esc(deps)} · ${esc(i.landmark||i.w3w||"Mapped")}</div>
+      <div>${esc(i.call_type)}</div>
+      <div class="small muted">${esc(deps)} · ${esc(layerName(i.map_layer_id))}${i.zone_id?` / ${esc(zoneName(i.zone_id))}`:""} · ${esc(i.landmark||i.w3w||"Mapped")}</div>
+      ${assigned.length?`<div class="small" style="margin-top:5px"><strong>${esc(assigned.join(", "))}</strong></div>`:""}
     </div>`;
   }).join("")||`<div class="small muted">No active incidents.</div>`;
 }
+
 function unitList(){
-  return S.units.map(u=>`<div class="unit"><div class="row">
-    <strong>${esc(u.event_departments?.short_name||"")} · ${esc(u.name)}</strong>
-    <span class="badge status-${esc(u.status)}">${esc(u.status.replaceAll("_"," "))}</span>
-  </div></div>`).join("")||`<div class="small muted">No units configured.</div>`;
+  const groups={};
+  for(const u of S.units){
+    const name=u.event_departments?.name||"Other";
+    (groups[name]??=[]).push(u);
+  }
+
+  return Object.entries(groups).map(([department,units])=>`
+    <div class="section-title">${esc(department)}</div>
+    ${units.map(u=>{
+      const active=activeAssignmentForUnit(u.id);
+      return `<button class="unit unit-button" data-unit-detail="${u.id}">
+        <div class="row">
+          <strong>${esc(u.name)}</strong>
+          <span class="badge status-${esc(u.status)}">${esc(u.status.replaceAll("_"," "))}</span>
+        </div>
+        <div class="small muted">${active?`Assigned: ${esc(active.incident.incident_number)} · ${esc(active.incident.call_type)}`:"Unassigned"}</div>
+      </button>`;
+    }).join("")}
+  `).join("")||`<div class="small muted">No units configured.</div>`;
 }
+
 function bindIncidentClicks(){
   document.querySelectorAll("[data-incident]").forEach(b=>b.onclick=()=>selectIncident(b.dataset.incident));
+  document.querySelectorAll("[data-unit-detail]").forEach(b=>b.onclick=()=>selectUnit(b.dataset.unitDetail));
 }
+
+function unitStatusOptions(unit){
+  const dep=S.departments.find(d=>d.id===unit.department_id);
+  const raw=Array.isArray(dep?.status_profile)?dep.status_profile:[];
+  return [...new Set(["ASSIGNED",...raw])];
+}
+
+async function dispatcherSetUnitStatus(unitId,status,incidentId=null){
+  const {error}=await supabase.rpc("staff_set_unit_status",{
+    p_unit_id:unitId,
+    p_status:status,
+    p_incident_id:incidentId
+  });
+  if(error)return alert(error.message);
+  await dispatchPage();
+}
+
+async function dispatcherUnassign(incidentId,unitId){
+  if(!confirm("Remove this unit from the incident?"))return;
+  const {error}=await supabase.rpc("unassign_unit",{
+    p_incident_id:incidentId,
+    p_unit_id:unitId,
+    p_new_status:"AVAILABLE"
+  });
+  if(error)return alert(error.message);
+  await dispatchPage();
+}
+
+async function dispatcherAssign(incidentId,unitId){
+  if(!incidentId||!unitId)return;
+  const {error}=await supabase.rpc("assign_unit",{
+    p_incident_id:incidentId,
+    p_unit_id:unitId
+  });
+  if(error)return alert(error.message);
+  await dispatchPage();
+}
+
 function selectIncident(id){
   const i=S.incidents.find(x=>x.id===id);if(!i)return;
-  const assigned=(i.incident_units||[]).filter(x=>!x.cleared_at).map(x=>x.units?.name).filter(Boolean);
+
+  const assignedLinks=(i.incident_units||[]).filter(x=>!x.cleared_at);
+  const assignedIds=new Set(assignedLinks.map(x=>x.unit_id));
+
   document.querySelector("#detail").innerHTML=`<div class="card stack">
     <div class="row"><strong>${esc(i.incident_number)}</strong><span class="badge">${esc(i.priority)}</span></div>
     <strong>${esc(i.call_type)}</strong>
+    <div class="venue-location-line">${i.map_layer_id?`<span class="badge layer-badge">${esc(layerName(i.map_layer_id))}</span> `:""}${i.zone_id?`<span class="badge">${esc(zoneName(i.zone_id))}</span>`:""}</div>
     <div>${i.w3w?`<strong>///${esc(i.w3w)}</strong><br>`:""}${esc(i.landmark||"")}<br>
     <span class="small mono">${Number(i.latitude).toFixed(6)}, ${Number(i.longitude).toFixed(6)}</span></div>
     <div>${esc(i.notes||"")}</div>
-    <div><strong>Assigned:</strong> ${esc(assigned.join(", ")||"None")}</div>
-    <div><label>Assign unit</label><select id="assignUnit"><option value="">Choose unit</option>
-      ${S.units.map(u=>`<option value="${u.id}">${esc(u.event_departments?.short_name||"")} · ${esc(u.name)} · ${esc(u.status)}</option>`).join("")}
-    </select></div>
-    <button class="btn" id="dispatchUnit">Dispatch Unit</button>
+
+    <div>
+      <div class="section-title">Assigned units</div>
+      ${assignedLinks.map(link=>{
+        const u=S.units.find(x=>x.id===link.unit_id);
+        if(!u)return "";
+        return `<div class="assignment-unit-row">
+          <div>
+            <strong>${esc(u.event_departments?.short_name||"")} · ${esc(u.name)}</strong><br>
+            <span class="badge status-${esc(u.status)}">${esc(u.status.replaceAll("_"," "))}</span>
+          </div>
+          <div class="assignment-unit-actions">
+            <select data-status-unit="${u.id}">
+              ${unitStatusOptions(u).map(st=>`<option value="${esc(st)}" ${st===u.status?"selected":""}>${esc(st.replaceAll("_"," "))}</option>`).join("")}
+            </select>
+            <button class="btn secondary" data-apply-status="${u.id}">Set Status</button>
+            <button class="btn danger" data-unassign-unit="${u.id}">Unassign</button>
+          </div>
+        </div>`;
+      }).join("")||`<div class="small muted">No units assigned.</div>`}
+    </div>
+
+    <div>
+      <label>Assign another unit</label>
+      <select id="assignUnit">
+        <option value="">Choose unit</option>
+        ${S.units.filter(u=>!assignedIds.has(u.id)).map(u=>{
+          const active=activeAssignmentForUnit(u.id);
+          return `<option value="${u.id}" ${active?"disabled":""}>${esc(u.event_departments?.short_name||"")} · ${esc(u.name)} · ${esc(u.status)}${active?` · ${esc(active.incident.incident_number)}`:""}</option>`;
+        }).join("")}
+      </select>
+    </div>
+    <button class="btn" id="dispatchUnit">Assign Unit</button>
     <button class="btn secondary" id="closeIncident">Close Incident</button>
   </div>`;
-  document.querySelector("#dispatchUnit").onclick=async()=>{
-    const unitId=document.querySelector("#assignUnit").value;if(!unitId)return;
-    const {error}=await supabase.rpc("assign_unit",{p_incident_id:i.id,p_unit_id:unitId});
-    if(error)alert(error.message);else dispatchPage();
-  };
+
+  document.querySelector("#dispatchUnit").onclick=()=>dispatcherAssign(i.id,document.querySelector("#assignUnit").value);
+
+  document.querySelectorAll("[data-apply-status]").forEach(b=>b.onclick=()=>{
+    const unitId=b.dataset.applyStatus;
+    const status=document.querySelector(`[data-status-unit="${unitId}"]`).value;
+    dispatcherSetUnitStatus(unitId,status,i.id);
+  });
+
+  document.querySelectorAll("[data-unassign-unit]").forEach(b=>b.onclick=()=>dispatcherUnassign(i.id,b.dataset.unassignUnit));
+
   document.querySelector("#closeIncident").onclick=async()=>{
     const disposition=prompt("Disposition:","Complete");
     const {error}=await supabase.rpc("close_incident",{p_incident_id:i.id,p_disposition:disposition});
     if(error)alert(error.message);else dispatchPage();
   };
-  if(S.map&&i.map_x!=null&&i.map_y!=null&&S.eventMap){
-    S.map.setView(pixelToLeaflet(i.map_x,i.map_y,S.eventMap.image_height),Math.max(S.map.getZoom(),0));
-  }
+
+  if(i.map_layer_id && i.map_layer_id!==S.activeMapLayerId){
+    S.activeMapLayerId=i.map_layer_id;
+    setupDispatchMap().then(()=>{
+      const l=activeMapLayer();if(S.map&&l&&i.map_x!=null&&i.map_y!=null)S.map.setView(pixelToLeaflet(i.map_x,i.map_y,l.image_height),Math.max(S.map.getZoom(),0));
+    });
+  }else{const l=activeMapLayer();if(S.map&&l&&i.map_x!=null&&i.map_y!=null)S.map.setView(pixelToLeaflet(i.map_x,i.map_y,l.image_height),Math.max(S.map.getZoom(),0));}
+
 }
 
+function selectUnit(unitId){
+  const u=S.units.find(x=>x.id===unitId);if(!u)return;
+  const active=activeAssignmentForUnit(unitId);
+
+  document.querySelector("#detail").innerHTML=`<div class="card stack">
+    <div class="row">
+      <div><div class="section-title">${esc(u.event_departments?.name||"Unit")}</div><div class="big" style="font-size:20px">${esc(u.name)}</div></div>
+      <span class="badge status-${esc(u.status)}">${esc(u.status.replaceAll("_"," "))}</span>
+    </div>
+
+    ${active?`<div class="notice">
+      <strong>Current assignment</strong><br>
+      ${esc(active.incident.incident_number)} · ${esc(active.incident.call_type)}<br>
+      ${esc(active.incident.landmark||active.incident.w3w||"")}
+    </div>`:`<div class="notice ok"><strong>Unassigned</strong></div>`}
+
+    <div>
+      <label>Dispatcher status</label>
+      <select id="unitStatus">
+        ${unitStatusOptions(u).map(st=>`<option value="${esc(st)}" ${st===u.status?"selected":""}>${esc(st.replaceAll("_"," "))}</option>`).join("")}
+      </select>
+    </div>
+    <button class="btn secondary" id="setUnitStatus">Set Status</button>
+
+    <div class="venue-unit-location"><div class="section-title">Current Venue Location</div><select id="unitLayer"><option value="">No level/post</option>${S.mapLayers.filter(l=>l.status==="published").map(l=>`<option value="${l.id}" ${u.current_map_layer_id===l.id?"selected":""}>${esc(l.name)}</option>`).join("")}</select><select id="unitZone"><option value="">No zone</option>${S.zones.filter(z=>!u.current_map_layer_id||z.map_layer_id===u.current_map_layer_id).map(z=>`<option value="${z.id}" ${u.current_zone_id===z.id?"selected":""}>${esc(z.name)}</option>`).join("")}</select><button class="btn secondary" id="saveUnitLocation">Update Post</button></div>
+
+    ${active?`
+      <button class="btn" id="openAssignedIncident">Open ${esc(active.incident.incident_number)}</button>
+      <button class="btn danger" id="removeAssignment">Unassign from ${esc(active.incident.incident_number)}</button>
+    `:`
+      <div>
+        <label>Assign to incident</label>
+        <select id="unitIncident">
+          <option value="">Choose active incident</option>
+          ${S.incidents.map(i=>`<option value="${i.id}">${esc(i.incident_number)} · ${esc(i.call_type)} · ${esc(i.landmark||"")}</option>`).join("")}
+        </select>
+      </div>
+      <button class="btn" id="assignFromUnit">Assign to Incident</button>
+    `}
+  </div>`;
+
+  document.querySelector("#setUnitStatus").onclick=()=>dispatcherSetUnitStatus(unitId,document.querySelector("#unitStatus").value,active?.incident.id||null);
+  document.querySelector("#unitLayer").onchange=e=>{const layer=e.target.value;document.querySelector("#unitZone").innerHTML=`<option value="">No zone</option>${S.zones.filter(z=>z.map_layer_id===layer).map(z=>`<option value="${z.id}">${esc(z.name)}</option>`).join("")}`;};
+  document.querySelector("#saveUnitLocation").onclick=async()=>{const {error}=await supabase.rpc("staff_set_unit_location",{p_unit_id:unitId,p_map_layer_id:document.querySelector("#unitLayer").value||null,p_zone_id:document.querySelector("#unitZone").value||null,p_poi_id:null});if(error)alert(error.message);else dispatchPage();};
+
+  if(active){
+    document.querySelector("#openAssignedIncident").onclick=()=>selectIncident(active.incident.id);
+    document.querySelector("#removeAssignment").onclick=()=>dispatcherUnassign(active.incident.id,unitId);
+  }else{
+    document.querySelector("#assignFromUnit").onclick=()=>dispatcherAssign(document.querySelector("#unitIncident").value,unitId);
+  }
+}
 async function setupDispatchMap(){
-  if(!S.eventMap?.rendered_image_path || S.eventMap.status!=="published"){
+  if(S.map){try{S.map.remove()}catch{}S.map=null;}
+  const layer=activeMapLayer();
+  if(!layer?.rendered_image_path || layer.status!=="published"){
     S.map=L.map("map",{crs:L.CRS.Simple,attributionControl:false}).setView([0,0],0);
-    L.popup().setLatLng([0,0]).setContent("No published event map yet. Open Event Admin → Map Builder.").openOn(S.map);
+    L.popup().setLatLng([0,0]).setContent("No published map layer selected. Open Event Admin → Map Builder.").openOn(S.map);
     return;
   }
-  const url=await storageSigned(S.eventMap.rendered_image_path);
+  const url=await storageSigned(layer.rendered_image_path);
   S.map=L.map("map",{crs:L.CRS.Simple,minZoom:-4,maxZoom:5,zoomSnap:.25,attributionControl:false});
-  const bounds=[[0,0],[S.eventMap.image_height,S.eventMap.image_width]];
+  const bounds=[[0,0],[layer.image_height,layer.image_width]];
   L.imageOverlay(url,bounds).addTo(S.map);S.map.fitBounds(bounds);
 
-  for(const p of S.pois){
-    L.marker(pixelToLeaflet(p.map_x,p.map_y,S.eventMap.image_height)).addTo(S.map)
-      .bindTooltip(`${p.name}${p.w3w?` · ///${p.w3w}`:""}`);
+  for(const p of S.pois.filter(p=>p.map_layer_id===layer.id)){
+    L.marker(pixelToLeaflet(p.map_x,p.map_y,layer.image_height)).addTo(S.map).bindTooltip(`${p.name}${p.w3w?` · ///${p.w3w}`:""}`);
   }
-  for(const i of S.incidents){
-    if(i.map_x!=null&&i.map_y!=null)L.circleMarker(pixelToLeaflet(i.map_x,i.map_y,S.eventMap.image_height),{radius:8}).addTo(S.map).bindTooltip(i.incident_number);
+  for(const n of S.accessNodes.filter(n=>n.map_layer_id===layer.id)){
+    const ap=S.accessPoints.find(a=>a.id===n.access_point_id);
+    L.circleMarker(pixelToLeaflet(n.map_x,n.map_y,layer.image_height),{radius:6,className:"access-marker"}).addTo(S.map).bindTooltip(`${ap?.name||"Access"} · ${ap?.access_type||""}`);
   }
-  if(S.eventMap.georef_coefficients){
+  for(const i of S.incidents.filter(i=>!i.map_layer_id||i.map_layer_id===layer.id)){
+    if(i.map_x!=null&&i.map_y!=null)L.circleMarker(pixelToLeaflet(i.map_x,i.map_y,layer.image_height),{radius:8,className:"incident-marker"}).addTo(S.map).bindTooltip(i.incident_number);
+  }
+  if(layer.georef_coefficients){
     S.map.on("click",async e=>{
-      const px=leafletToPixel(e.latlng,S.eventMap.image_height);
-      const geo=pixelToGeo(px.x,px.y,S.eventMap.georef_coefficients);
+      const px=leafletToPixel(e.latlng,layer.image_height);
+      const geo=pixelToGeo(px.x,px.y,layer.georef_coefficients);
       const {data:words}=await supabase.rpc("w3w_for_coordinate",{p_event_id:S.eventId,p_lat:geo.lat,p_lon:geo.lon});
-      S.currentLocation={map_x:px.x,map_y:px.y,latitude:geo.lat,longitude:geo.lon,w3w:words||null,poi_id:null,landmark:""};
-      L.popup().setLatLng(e.latlng).setContent(`<strong>${words?`///${esc(words)}`:"Selected location"}</strong><br>${geo.lat.toFixed(6)}, ${geo.lon.toFixed(6)}<br><br><button id="createAtPoint">Create incident here</button>`).openOn(S.map);
+      S.currentLocation={map_x:px.x,map_y:px.y,latitude:geo.lat,longitude:geo.lon,w3w:words||null,poi_id:null,landmark:"",map_layer_id:layer.id,zone_id:null};
+      L.popup().setLatLng(e.latlng).setContent(`<strong>${esc(layer.name)}</strong><br>${words?`///${esc(words)}<br>`:""}${geo.lat.toFixed(6)}, ${geo.lon.toFixed(6)}<br><br><button id="createAtPoint">Create incident here</button>`).openOn(S.map);
       setTimeout(()=>document.querySelector("#createAtPoint")?.addEventListener("click",()=>incidentForm(S.currentLocation)),0);
     });
   }
 }
 
+
 function incidentForm(loc){
   const detail=document.querySelector("#detail");
+
   detail.innerHTML=`<div class="card stack"><strong>New Incident</strong>
     <div><label>Use a POI</label><select id="poiSelect"><option value="">-- Map location / none --</option>
-      ${S.pois.map(p=>`<option value="${p.id}">${esc(p.name)}${p.w3w?` · ///${esc(p.w3w)}`:""}</option>`).join("")}
+      ${S.pois.map(p=>`<option value="${p.id}">${esc(layerName(p.map_layer_id)||"Unlayered")} · ${esc(p.name)}${p.w3w?` · ///${esc(p.w3w)}`:""}</option>`).join("")}
     </select></div>
+
     <div><label>Departments</label>${S.departments.map(d=>`<label style="font-weight:500"><input type="checkbox" name="dept" value="${d.id}"> ${esc(d.name)}</label>`).join("")}</div>
     <div><label>Call type</label><input id="callType" placeholder="Medical, disturbance, power issue…"></div>
     <div><label>Priority</label><select id="priority"><option>Standard</option><option>Urgent</option><option>Critical</option></select></div>
     <div><label>Location description</label><input id="landmark" value="${esc(loc?.landmark||"")}"></div>
     <div><label>Dispatch notes</label><textarea id="notes" rows="4"></textarea></div>
-    <div id="locSummary" class="small muted">${loc?`${loc.w3w?`///${esc(loc.w3w)} · `:""}${Number(loc.latitude).toFixed(6)}, ${Number(loc.longitude).toFixed(6)}`:"Choose a POI or click the map first."}</div>
-    <button class="btn" id="saveIncident">Create Incident</button>
+    <div id="locSummary" class="small muted">${loc?`${loc.map_layer_id?`${esc(layerName(loc.map_layer_id))} · `:""}${loc.w3w?`///${esc(loc.w3w)} · `:""}${Number(loc.latitude).toFixed(6)}, ${Number(loc.longitude).toFixed(6)}`:"Choose a POI or click the map first."}</div>
+
+    <div>
+      <div class="section-title">Initial unit assignment</div>
+      <div class="small muted" style="margin-bottom:7px">Optional. Select one or more unassigned units.</div>
+      <div class="create-unit-grid">
+        ${S.units.map(u=>{
+          const active=activeAssignmentForUnit(u.id);
+          return `<label class="create-unit-option ${active?"disabled":""}">
+            <input type="checkbox" name="initialUnit" value="${u.id}" ${active?"disabled":""}>
+            <span><strong>${esc(u.event_departments?.short_name||"")} · ${esc(u.name)}</strong><br>
+            <span class="small muted">${esc(u.status.replaceAll("_"," "))}${active?` · ${esc(active.incident.incident_number)}`:""}</span></span>
+          </label>`;
+        }).join("")||`<div class="small muted">No units configured.</div>`}
+      </div>
+    </div>
+
+    <div class="grid2">
+      <button class="btn secondary" id="saveIncidentOnly">Create Without Assignment</button>
+      <button class="btn" id="saveAndDispatch">Create & Dispatch Selected</button>
+    </div>
   </div>`;
 
   let chosen=loc?{...loc}:null;
+
   document.querySelector("#poiSelect").onchange=()=>{
     const p=S.pois.find(x=>x.id===document.querySelector("#poiSelect").value);
     if(!p)return;
-    chosen={poi_id:p.id,map_x:p.map_x,map_y:p.map_y,latitude:p.latitude,longitude:p.longitude,w3w:p.w3w,landmark:p.name};
+    chosen={poi_id:p.id,map_x:p.map_x,map_y:p.map_y,latitude:p.latitude,longitude:p.longitude,w3w:p.w3w,landmark:p.name,map_layer_id:p.map_layer_id||null,zone_id:p.zone_id||null};
     document.querySelector("#landmark").value=p.name;
-    document.querySelector("#locSummary").textContent=`${p.w3w?`///${p.w3w} · `:""}${Number(p.latitude).toFixed(6)}, ${Number(p.longitude).toFixed(6)}`;
+    document.querySelector("#locSummary").textContent=`${layerName(p.map_layer_id)||"Unlayered"}${p.zone_id?` / ${zoneName(p.zone_id)}`:""} · ${p.w3w?`///${p.w3w} · `:""}${Number(p.latitude).toFixed(6)}, ${Number(p.longitude).toFixed(6)}`;
   };
-  document.querySelector("#saveIncident").onclick=async()=>{
+
+  const create=async(assignSelected)=>{
     if(!chosen)return alert("Choose a POI or click the map to set the incident location.");
     const deps=[...document.querySelectorAll('input[name="dept"]:checked')].map(x=>x.value);
     if(!deps.length)return alert("Choose at least one department.");
-    const {data,error}=await supabase.rpc("create_incident",{
-      p_event_id:S.eventId,p_department_ids:deps,p_call_type:document.querySelector("#callType").value.trim()||"Other",
-      p_priority:document.querySelector("#priority").value,p_latitude:chosen.latitude,p_longitude:chosen.longitude,
-      p_map_x:chosen.map_x,p_map_y:chosen.map_y,p_w3w:chosen.w3w,
-      p_landmark:document.querySelector("#landmark").value.trim(),p_notes:document.querySelector("#notes").value.trim(),
-      p_poi_id:chosen.poi_id||null
+
+    const selectedUnits=assignSelected
+      ? [...document.querySelectorAll('input[name="initialUnit"]:checked')].map(x=>x.value)
+      : [];
+
+    const {data,error}=await supabase.rpc("create_incident_v2",{
+      p_event_id:S.eventId,
+      p_department_ids:deps,
+      p_call_type:document.querySelector("#callType").value.trim()||"Other",
+      p_priority:document.querySelector("#priority").value,
+      p_latitude:chosen.latitude,
+      p_longitude:chosen.longitude,
+      p_map_x:chosen.map_x,
+      p_map_y:chosen.map_y,
+      p_w3w:chosen.w3w,
+      p_landmark:document.querySelector("#landmark").value.trim(),
+      p_notes:document.querySelector("#notes").value.trim(),
+      p_poi_id:chosen.poi_id||null,
+      p_map_layer_id:chosen.map_layer_id||S.activeMapLayerId||null,
+      p_zone_id:chosen.zone_id||null
     });
+
     if(error){
       console.error("CommCenter Pro create incident error",error);
       return alert(`Incident was NOT created.\n\n${error.message}${error.hint?`\n\nHint: ${error.hint}`:""}`);
     }
 
     const createdId=data;
-    await dispatchPage();
+    const failures=[];
 
-    if(createdId){
-      setTimeout(()=>{
-        selectIncident(createdId);
-        const created=S.incidents.find(i=>i.id===createdId);
-        if(created) console.info(`CommCenter Pro: ${created.incident_number} created successfully.`);
-      },50);
+    for(const unitId of selectedUnits){
+      const result=await supabase.rpc("assign_unit",{p_incident_id:createdId,p_unit_id:unitId});
+      if(result.error)failures.push(result.error.message);
+    }
+
+    await dispatchPage();
+    if(createdId)setTimeout(()=>selectIncident(createdId),50);
+
+    if(failures.length){
+      alert(`Incident created, but one or more units could not be assigned:\n\n${failures.join("\n")}`);
     }
   };
+
+  document.querySelector("#saveIncidentOnly").onclick=()=>create(false);
+  document.querySelector("#saveAndDispatch").onclick=()=>create(true);
 }
 
 /* ---------------- EVENT ADMIN ---------------- */
 
-async function eventAdmin(){
+async function eventAdmin(initialTab="setup"){
   await loadEventOps();
   app.innerHTML=`<div class="shell">${header(`${esc(S.event?.name||"Event")} · Event Admin`)}
     <div class="admin-layout">
       <aside class="admin-menu">
-        <button class="active" id="setupTab">Setup</button>
+        <button class="${initialTab==="setup"?"active":""}" id="setupTab">Setup</button>
+        <button class="${initialTab==="ems"?"active":""}" id="emsTab">EMS Setup</button>
         <button id="mapTab">Map Builder</button>
         <button id="backDispatch">Back to CAD</button>
       </aside>
       <main class="admin-content"><div id="adminContent"></div></main>
     </div></div>`;
   document.querySelector("#backDispatch").onclick=()=>dispatchPage();
+  const markAdminTab=(activeId)=>{
+    document.querySelectorAll(".admin-menu button").forEach(b=>b.classList.remove("active"));
+    document.querySelector(`#${activeId}`)?.classList.add("active");
+  };
+  const showEmsAdmin=async()=>{
+    markAdminTab("emsTab");
+    await loadEventOps();
+    await renderEmsAdmin(
+      document.querySelector("#adminContent"),
+      {eventId:S.eventId,event:S.event,units:S.units,pois:S.pois,departments:S.departments},
+      showEmsAdmin
+    );
+  };
   document.querySelector("#mapTab").onclick=()=>renderMapBuilder(app,S.eventId,()=>eventAdmin());
-  document.querySelector("#setupTab").onclick=()=>renderEventSetup();
-  renderEventSetup();
+  document.querySelector("#setupTab").onclick=()=>{markAdminTab("setupTab");renderEventSetup();};
+  document.querySelector("#emsTab").onclick=showEmsAdmin;
+  if(initialTab==="ems")showEmsAdmin();else renderEventSetup();
 }
 
 function renderEventSetup(){
@@ -512,8 +775,8 @@ function renderEventSetup(){
     </div>
 
     <div class="card">
-      <h2>Event Map</h2>
-      <p>${S.eventMap?.rendered_image_path?`Map uploaded · status: <strong>${esc(S.eventMap.status)}</strong>`:"No map uploaded yet."}</p>
+      <h2>Venue Maps</h2>
+      <p><strong>${S.mapLayers.length}</strong> map layer${S.mapLayers.length===1?"":"s"} configured · Venue type: <strong>${esc(S.event.venue_type||"outdoor")}</strong></p>
       <button class="btn" id="openMapBuilder">Open Map Builder</button>
     </div>
   </div>`;
@@ -635,17 +898,23 @@ async function fieldUnitCad(){
   const {data:a}=await supabase.from("incident_units").select("*,incidents(*)")
     .eq("unit_id",fs.unit_id).is("cleared_at",null).order("assigned_at",{ascending:false}).limit(1).maybeSingle();
   const incident=a?.incidents;
+  let fieldLayer=null,fieldZone=null;
+  if(incident?.map_layer_id){fieldLayer=(await supabase.from("event_map_layers").select("id,name,level_code").eq("id",incident.map_layer_id).maybeSingle()).data||null;}
+  if(incident?.zone_id){fieldZone=(await supabase.from("event_zones").select("id,name").eq("id",incident.zone_id).maybeSingle()).data||null;}
   const statuses=fs.units?.event_departments?.status_profile||["AVAILABLE","RESPONDING","ON_SCENE","CLEAR"];
+  let emsState=null;
+  try{emsState=await loadFieldEmsState(S.eventId,fs.unit_id,incident?.id||null);}catch(err){console.error("Field EMS panel failed to load",err);}
 
   app.innerHTML=`<div class="shell">${header(`${esc(fs.events?.name||"")} · ${esc(fs.units?.event_departments?.name||"")}`)}
     <div class="field-shell stack">
       <div class="card"><div class="small muted">Your unit</div><div class="big">${esc(fs.units?.name)}</div><span class="badge status-${esc(fs.units?.status)}">${esc(fs.units?.status?.replaceAll("_"," "))}</span></div>
       ${incident?`<div class="card assignment"><div class="row"><strong>${esc(incident.incident_number)}</strong><span class="badge">${esc(incident.priority)}</span></div>
-        <h2>${esc(incident.call_type)}</h2><p>${incident.w3w?`<strong>///${esc(incident.w3w)}</strong><br>`:""}${esc(incident.landmark||"")}<br>
+        <h2>${esc(incident.call_type)}</h2>${fieldLayer?`<div class="venue-location-line"><span class="badge layer-badge">${esc(fieldLayer.name)}</span>${fieldZone?` <span class="badge">${esc(fieldZone.name)}</span>`:""}</div>`:""}<p>${incident.w3w?`<strong>///${esc(incident.w3w)}</strong><br>`:""}${esc(incident.landmark||"")}<br>
         <span class="small mono">${Number(incident.latitude).toFixed(6)}, ${Number(incident.longitude).toFixed(6)}</span></p><p>${esc(incident.notes||"")}</p>
         <button class="btn secondary block" id="viewFieldMap">View on Event Map</button>
         <div id="fieldMapHolder"></div>
       </div>`:`<div class="card"><strong>No current assignment</strong><p class="muted">Remain available for dispatch.</p></div>`}
+      ${fieldEmsPanelHtml(emsState,incident)}
       <div class="status-buttons">${statuses.map(s=>`<button class="btn ${["AVAILABLE","CLEAR","COMPLETE"].includes(s)?"good":""}" data-status="${esc(s)}">${esc(s.replaceAll("_"," "))}</button>`).join("")}</div>
       <div class="notice ${navigator.onLine?"ok":""}">${navigator.onLine?"Connected":"Offline — CAD changes cannot reach dispatch until connectivity returns."}</div>
       <button class="btn secondary" id="downloadOffline">Download Event Map + W3W for Offline Use</button>
@@ -656,6 +925,7 @@ async function fieldUnitCad(){
     const {error}=await supabase.rpc("field_set_unit_status",{p_unit_id:fs.unit_id,p_status:b.dataset.status,p_incident_id:incident?.id||null,p_client_time:new Date().toISOString()});
     if(error)alert(error.message);else fieldUnitCad();
   });
+  bindFieldEmsPanel(emsState,{eventId:S.eventId,unitId:fs.unit_id,incident,refresh:()=>fieldUnitCad()});
   document.querySelector("#downloadOffline").onclick=()=>downloadOfflineEventData();
   getOfflineEvent(S.eventId).then(x=>{if(x)document.querySelector("#offlineStatus").textContent=`Offline package saved ${new Date(x.savedAt).toLocaleString()}`;}).catch(()=>{});
   document.querySelector("#changeUnit").onclick=async()=>{await supabase.rpc("field_release_unit",{p_field_session_id:fs.id});fieldUnitPicker();};
@@ -666,85 +936,56 @@ async function fieldUnitCad(){
 async function downloadOfflineEventData(){
   const status=document.querySelector("#offlineStatus");
   try{
-    status.textContent="Downloading event package…";
-    const [{data:m},{data:pois}]=await Promise.all([
-      supabase.from("event_maps").select("*").eq("event_id",S.eventId).maybeSingle(),
-      supabase.from("event_pois").select("id,name,category,w3w,latitude,longitude,map_x,map_y,notes").eq("event_id",S.eventId).eq("active",true)
+    status.textContent="Downloading venue map package…";
+    const [{data:layers,error:layersErr},{data:pois,error:poisErr},{data:event,error:eventErr}]=await Promise.all([
+      supabase.from("event_map_layers").select("*").eq("event_id",S.eventId).eq("active",true).eq("status","published").order("sort_order"),
+      supabase.from("event_pois").select("id,name,category,w3w,latitude,longitude,map_x,map_y,map_layer_id,zone_id,notes").eq("event_id",S.eventId).eq("active",true),
+      supabase.from("events").select("offline_w3w_path").eq("id",S.eventId).single()
     ]);
-    if(!m?.rendered_image_path || m.status!=="published")throw new Error("No published event map.");
-    const {data:mapBlob,error:mapErr}=await supabase.storage.from("event-assets").download(m.rendered_image_path);
-    if(mapErr)throw mapErr;
+    if(layersErr)throw layersErr;if(poisErr)throw poisErr;if(eventErr)throw eventErr;
+    if(!(layers||[]).length)throw new Error("No published map layers.");
 
-    let w3w=[];
-    if(m.offline_w3w_path){
-      const {data:w3wBlob,error:wErr}=await supabase.storage.from("event-assets").download(m.offline_w3w_path);
-      if(wErr)throw wErr;
-      w3w=JSON.parse(await w3wBlob.text());
+    const offlineLayers=[];
+    for(const layer of layers){
+      status.textContent=`Downloading ${layer.name}…`;
+      const {data:mapBlob,error}=await supabase.storage.from("event-assets").download(layer.rendered_image_path);
+      if(error)throw error;
+      offlineLayers.push({meta:layer,mapBlob});
     }
 
-    await saveOfflineEvent({
-      eventId:S.eventId,
-      savedAt:new Date().toISOString(),
-      mapMeta:m,
-      mapBlob,
-      pois:pois||[],
-      w3w
-    });
-    status.textContent=`Saved offline: map + ${(w3w||[]).length.toLocaleString()} W3W squares.`;
-  }catch(err){
-    status.textContent=`Offline download failed: ${err.message}`;
-  }
+    let w3w=[];
+    if(event.offline_w3w_path){
+      const {data:w3wBlob,error}=await supabase.storage.from("event-assets").download(event.offline_w3w_path);
+      if(error)throw error;
+      w3w=JSON.parse(await w3wBlob.text());
+    }
+    const {data:zones}=await supabase.from("event_zones").select("*").eq("event_id",S.eventId).eq("active",true);
+    await saveOfflineEvent({eventId:S.eventId,savedAt:new Date().toISOString(),layers:offlineLayers,pois:pois||[],zones:zones||[],w3w});
+    status.textContent=`Saved offline: ${offlineLayers.length} map layer${offlineLayers.length===1?"":"s"} + ${w3w.length.toLocaleString()} W3W squares.`;
+  }catch(err){status.textContent=`Offline download failed: ${err.message}`;}
 }
 
 async function showFieldMap(incident){
   const holder=document.querySelector("#fieldMapHolder");
-  holder.innerHTML=`<div id="fieldMap" style="height:420px;margin-top:10px;border-radius:10px;overflow:hidden"></div><div id="fieldMapReadout" class="small muted" style="margin-top:6px"></div>`;
-
+  holder.innerHTML=`<div id="fieldLayerName" class="small muted" style="margin-top:8px"></div><div id="fieldMap" style="height:420px;margin-top:6px;border-radius:10px;overflow:hidden"></div><div id="fieldMapReadout" class="small muted" style="margin-top:6px"></div>`;
   let m=null,url=null,w3wRows=[];
+  const targetLayerId=incident.map_layer_id||null;
   try{
     if(navigator.onLine){
-      const {data}=await supabase.from("event_maps").select("*").eq("event_id",S.eventId).maybeSingle();
-      if(data?.rendered_image_path && data.status==="published"){
-        m=data;
-        url=await storageSigned(m.rendered_image_path);
-      }
+      let q=supabase.from("event_map_layers").select("*").eq("event_id",S.eventId).eq("status","published");
+      q=targetLayerId?q.eq("id",targetLayerId):q.eq("is_default",true);
+      const {data}=await q.limit(1).maybeSingle();
+      if(data?.rendered_image_path){m=data;url=await storageSigned(m.rendered_image_path);}
     }
   }catch{}
-
   const offline=await getOfflineEvent(S.eventId).catch(()=>null);
-  if(!m && offline){
-    m=offline.mapMeta;
-    url=URL.createObjectURL(offline.mapBlob);
-    w3wRows=offline.w3w||[];
-  }else if(offline){
-    w3wRows=offline.w3w||[];
-  }
-
-  if(!m||!url)return alert("No published event map is available. Download it for offline use while connected.");
-
+  if(!m&&offline?.layers?.length){const item=offline.layers.find(x=>x.meta.id===targetLayerId)||offline.layers.find(x=>x.meta.is_default)||offline.layers[0];m=item.meta;url=URL.createObjectURL(item.mapBlob);w3wRows=offline.w3w||[];}else if(offline){w3wRows=offline.w3w||[];}
+  if(!m||!url)return alert("No published map layer is available. Download the event package while connected.");
+  document.querySelector("#fieldLayerName").textContent=`Map layer: ${m.name}${incident.zone_id?` · ${offline?.zones?.find(z=>z.id===incident.zone_id)?.name||""}`:""}`;
   const map=L.map("fieldMap",{crs:L.CRS.Simple,minZoom:-4,maxZoom:5,attributionControl:false});
   L.imageOverlay(url,[[0,0],[m.image_height,m.image_width]]).addTo(map);
-
-  if(incident.map_x!=null&&incident.map_y!=null){
-    const pt=pixelToLeaflet(incident.map_x,incident.map_y,m.image_height);
-    L.marker(pt).addTo(map).bindPopup(`${esc(incident.incident_number)}<br>${esc(incident.landmark||"")}`).openPopup();
-    map.setView(pt,0);
-  }else map.fitBounds([[0,0],[m.image_height,m.image_width]]);
-
-  if(m.georef_coefficients){
-    map.on("click",async e=>{
-      const px=leafletToPixel(e.latlng,m.image_height);
-      const geo=pixelToGeo(px.x,px.y,m.georef_coefficients);
-      let words=localW3WForCoordinate(w3wRows,geo.lat,geo.lon);
-      if(!words && navigator.onLine){
-        try{
-          const {data}=await supabase.rpc("w3w_for_coordinate",{p_event_id:S.eventId,p_lat:geo.lat,p_lon:geo.lon});
-          words=data||null;
-        }catch{}
-      }
-      document.querySelector("#fieldMapReadout").textContent=`${words?`///${words} · `:""}${geo.lat.toFixed(6)}, ${geo.lon.toFixed(6)}`;
-    });
-  }
+  if(incident.map_x!=null&&incident.map_y!=null){const pt=pixelToLeaflet(incident.map_x,incident.map_y,m.image_height);L.marker(pt).addTo(map).bindPopup(`${esc(incident.incident_number)}<br>${esc(incident.landmark||"")}`).openPopup();map.setView(pt,0);}else map.fitBounds([[0,0],[m.image_height,m.image_width]]);
+  if(m.georef_coefficients)map.on("click",async e=>{const px=leafletToPixel(e.latlng,m.image_height),geo=pixelToGeo(px.x,px.y,m.georef_coefficients);let words=localW3WForCoordinate(w3wRows,geo.lat,geo.lon);if(!words&&navigator.onLine){try{words=(await supabase.rpc("w3w_for_coordinate",{p_event_id:S.eventId,p_lat:geo.lat,p_lon:geo.lon})).data||null;}catch{}}document.querySelector("#fieldMapReadout").textContent=`${m.name} · ${words?`///${words} · `:""}${geo.lat.toFixed(6)}, ${geo.lon.toFixed(6)}`;});
 }
 
 async function leaveField(){

@@ -112,3 +112,130 @@ th{background:#f9fafb}
   .center{margin:20px auto}
   .topbar{align-items:flex-start}
 }
+
+/* ---------------- EMS OPERATIONS ---------------- */
+.ems-ops-wrap{max-width:1500px}
+.ems-metrics{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px}
+.ems-board-grid{align-items:start}
+.ems-resource-card,.ems-admin-row,.handoff-card,.patient-card,.incoming-handoff,.treatment-patient-card{
+  border:1px solid #e5e7eb;border-radius:11px;padding:12px;background:#fff;margin-bottom:9px
+}
+.ems-admin-row{display:flex;justify-content:space-between;align-items:center;gap:12px}
+.handoff-row{display:grid;grid-template-columns:minmax(120px,1fr) minmax(120px,1fr) 34px minmax(120px,1fr);gap:10px;align-items:center;padding:10px 0;border-bottom:1px solid #e5e7eb}
+.handoff-arrow{text-align:center;font-size:22px;font-weight:900;color:#6b7280}
+.ems-panel{border-top:5px solid #1f2937}
+.patient-card{background:#f9fafb}
+.ta-OPEN{background:#dcfce7;color:#166534}
+.ta-LIMITED{background:#fef3c7;color:#92400e}
+.ta-FULL,.ta-CLOSED{background:#fee2e2;color:#991b1b}
+.treatment-shell{max-width:1300px;margin:18px auto;padding:0 14px 40px}
+.treatment-header{display:grid;grid-template-columns:minmax(240px,1fr) minmax(220px,360px) minmax(160px,240px);gap:20px;align-items:center}
+.treatment-capacity .progress{margin-top:7px}
+.treatment-top-grid{align-items:stretch}
+.treatment-patient-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.treatment-patient-card{margin:0}
+.incoming-section{border:2px solid #b45309}
+.incoming-handoff{display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,360px);gap:20px;align-items:center;background:#fffbeb}
+
+@media(max-width:1100px){
+  .ems-metrics{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .treatment-header{grid-template-columns:1fr 1fr}
+  .treatment-patient-grid{grid-template-columns:1fr}
+}
+@media(max-width:700px){
+  .ems-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .treatment-header,.incoming-handoff{grid-template-columns:1fr}
+  .handoff-row{grid-template-columns:1fr;gap:4px}
+  .handoff-arrow{text-align:left;transform:rotate(90deg);width:20px}
+}
+
+
+/* v0.3.1 dispatcher assignment controls */
+.unit-button{
+  display:block;width:100%;text-align:left;color:inherit;font:inherit;cursor:pointer;
+}
+.unit-button:hover{border-color:#6b7280;box-shadow:0 1px 3px rgba(0,0,0,.06)}
+.assignment-unit-row{
+  border:1px solid #e5e7eb;border-radius:10px;padding:10px;margin-bottom:8px;background:#fff;
+  display:grid;grid-template-columns:minmax(0,1fr) minmax(220px,1.2fr);gap:10px;align-items:center;
+}
+.assignment-unit-actions{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:6px;align-items:center}
+.assignment-unit-actions select{min-width:0}
+.create-unit-grid{display:grid;grid-template-columns:1fr;gap:6px;max-height:240px;overflow:auto}
+.create-unit-option{
+  display:flex;gap:9px;align-items:flex-start;border:1px solid #e5e7eb;border-radius:9px;padding:8px;
+  font-weight:500;margin:0;background:#fff
+}
+.create-unit-option input{margin-top:4px}
+.create-unit-option.disabled{opacity:.5;background:#f3f4f6}
+@media(max-width:560px){
+  .assignment-unit-row{grid-template-columns:1fr}
+  .assignment-unit-actions{grid-template-columns:1fr}
+}
+
+/* ============================================================
+   v0.4.0 DARK COMMAND UI + MULTI-LEVEL VENUES
+   ============================================================ */
+:root{
+  color-scheme:dark;
+  --cc-bg:#07111d;
+  --cc-bg-2:#0b1624;
+  --cc-panel:#0f1c2b;
+  --cc-panel-2:#132235;
+  --cc-line:#25364a;
+  --cc-text:#edf4ff;
+  --cc-muted:#8fa2b8;
+  --cc-blue:#2382ff;
+  --cc-blue-2:#1267d6;
+  --cc-green:#19b66a;
+  --cc-amber:#e39a20;
+  --cc-red:#e44c4c;
+  --cc-purple:#8b6be8;
+  color:var(--cc-text);background:var(--cc-bg);
+}
+html,body,#app{background:var(--cc-bg);color:var(--cc-text)}
+body{background:radial-gradient(circle at 50% 0,#10243a 0,#07111d 38%,#050c15 100%) fixed}
+.topbar{background:#07111df2;border-bottom:1px solid var(--cc-line);box-shadow:0 8px 24px rgba(0,0,0,.22);backdrop-filter:blur(12px)}
+.brand{font-size:18px}.brand::before{content:"◈";color:var(--cc-blue);margin-right:9px}.brand small{color:var(--cc-muted);opacity:1}
+.wrap,.admin-content{color:var(--cc-text)}
+.card,.choice,.incident,.unit,.poi-row,.cp-row,.ems-resource-card,.ems-admin-row,.handoff-card,.patient-card,.incoming-handoff,.treatment-patient-card,.assignment-unit-row,.create-unit-option{
+  background:linear-gradient(180deg,var(--cc-panel-2),var(--cc-panel));border-color:var(--cc-line);color:var(--cc-text);box-shadow:0 8px 24px rgba(0,0,0,.12)
+}
+.choice:hover,.unit-button:hover{border-color:#4379b5;background:#15283e;box-shadow:0 0 0 1px rgba(35,130,255,.12)}
+.muted,.small.muted{color:var(--cc-muted)}
+.section-title{color:#8ea6c0}
+input,select,textarea{background:#091523;border-color:#31465f;color:var(--cc-text)}
+input::placeholder,textarea::placeholder{color:#657b92}
+input:disabled{opacity:.65}
+.btn{background:linear-gradient(180deg,#2989ff,#176bd9);color:white;border:1px solid #3b91ff;box-shadow:0 5px 14px rgba(14,96,205,.2)}
+.btn:hover{filter:brightness(1.08)}
+.btn.secondary{background:#162638;color:#d9e7f6;border:1px solid #30465d;box-shadow:none}
+.btn.good{background:#118851;border-color:#22b96e}.btn.warn{background:#a96a0b;border-color:#d68b16}.btn.danger{background:#842e35;border-color:#b7474f}
+.badge{background:#24364b;color:#dce9f7;border:1px solid #344b63}
+.status-AVAILABLE,.ta-OPEN{background:#123b2b;color:#6ee7a6;border-color:#21613f}
+.status-ASSIGNED,.status-RESPONDING,.status-EN_ROUTE,.ta-LIMITED{background:#4a3514;color:#ffc45d;border-color:#765523}
+.status-ON_SCENE,.status-WORKING{background:#123e5e;color:#67baff;border-color:#24658e}
+.status-TRANSPORTING,.status-AT_HOSPITAL{background:#34285c;color:#b8a1ff;border-color:#59478a}
+.status-OUT_OF_SERVICE,.ta-FULL,.ta-CLOSED{background:#4f2026;color:#ff8b92;border-color:#77333b}
+.notice{background:#3d2d14;color:#ffd37b;border:1px solid #6d5021}.notice.ok{background:#123b2b;color:#86efb5;border-color:#21613f}.notice.error{background:#4e2027;color:#ff9aa1;border-color:#78333c}
+.panel{background:#091522}.panel.left{border-color:var(--cc-line)}.panel.right{border-color:var(--cc-line)}
+#map,#builderMap{background:#07111d}
+.leaflet-container{background:#07111d;color:#172334}.leaflet-popup-content-wrapper,.leaflet-popup-tip{background:#112135;color:#e8f2ff}.leaflet-control-zoom a{background:#102033!important;color:#dceaff!important;border-color:#2c435b!important}
+.cad-grid{grid-template-columns:290px minmax(0,1fr) 330px}
+.map-wrap{background:#07111d}.map-level-toolbar{position:absolute;z-index:900;top:12px;left:12px;display:flex;align-items:center;gap:8px;background:#0b1727e8;border:1px solid #2c4258;border-radius:10px;padding:8px 10px;box-shadow:0 8px 28px #0008;backdrop-filter:blur(8px)}
+.map-level-toolbar .section-title{margin:0}.map-level-toolbar select{min-width:190px;padding:7px 9px}
+.layer-badge{background:#103f72;color:#8bc7ff;border-color:#236ba9}.venue-location-line{display:flex;gap:5px;flex-wrap:wrap;margin:4px 0}
+.admin-menu{background:#07111d;border-right:1px solid var(--cc-line)}.admin-menu button{background:#111f30;color:#cfe0f1}.admin-menu button.active{background:#176bd9;color:white}
+.builder-side{background:#091522;border-color:var(--cc-line)}.builder-layout{grid-template-columns:minmax(0,1fr) 410px}.step{border-left-color:#42566c}.step.complete{border-left-color:var(--cc-green)}
+.table-wrap{background:var(--cc-panel);border-color:var(--cc-line)}th{background:#0c1928;color:#9eb4ca}th,td{border-color:#26394d}
+.progress{background:#203248}.progress>div{background:var(--cc-blue)}
+.incoming-section{border-color:#8c641f}.incoming-handoff{background:#2b2415}.patient-card{background:#0c1928}.ems-panel{border-top-color:var(--cc-blue)}
+.assignment{border-left-color:var(--cc-blue)}
+.unit-button{border:1px solid var(--cc-line);margin-bottom:7px}.unit-button .small{margin-top:3px}
+.create-unit-option.disabled{background:#0a1420}.assignment-unit-actions{align-items:center}
+.venue-unit-location{display:grid;gap:7px;padding-top:8px;border-top:1px solid var(--cc-line)}
+.access-marker{stroke:#47a6ff;fill:#1668aa}.incident-marker{stroke:#ff6464;fill:#d83745}
+
+/* larger command-center feel on desktop */
+@media(min-width:1200px){.topbar{min-height:64px;padding:10px 18px}.cad-grid{height:calc(100vh - 64px)}.panel{padding:13px}.incident,.unit{border-radius:8px}}
+@media(max-width:980px){.map-level-toolbar{position:absolute;max-width:calc(100% - 24px)}.builder-layout{display:block}.builder-map-wrap{height:55vh}.builder-side{border-top:1px solid var(--cc-line)}}
