@@ -5,6 +5,7 @@ import { renderMapBuilder } from "./mapBuilder.js";
 import { pixelToGeo, pixelToLeaflet, leafletToPixel } from "./georef.js";
 import { saveOfflineEvent, getOfflineEvent, localW3WForCoordinate } from "./offlineStore.js";
 import { renderEmsOps, renderEmsAdmin, renderTreatmentAreaFlow, loadFieldEmsState, fieldEmsPanelHtml, bindFieldEmsPanel } from "./ems.js";
+import { loadVenueChoices, applyVenueVersionToEvent, saveEventToVenueLibrary, renderVenueLibrary } from "./venueLibrary.js";
 
 const app=document.querySelector("#app");
 const S={
@@ -265,7 +266,7 @@ function eventPicker(){
   app.innerHTML=`<div class="shell">${header(org?.organizations?.name||"Events")}
     <div class="wrap stack">
       <div class="row"><h2>Events</h2><div class="nav">
-        <button class="btn" id="newEvent">+ Create Event</button><button class="btn secondary" id="orgSettings">Organization Staff</button><button class="btn secondary" id="changeOrg">Organizations</button><button class="btn secondary" id="logout">Sign out</button>
+        <button class="btn" id="newEvent">+ Create Event</button><button class="btn secondary" id="venueLibrary">Venue Library</button><button class="btn secondary" id="orgSettings">Organization Staff</button><button class="btn secondary" id="changeOrg">Organizations</button><button class="btn secondary" id="logout">Sign out</button>
       </div></div>
       ${S.events.map(e=>`<button class="choice" data-event="${e.id}">
         <strong>${esc(e.name)}</strong><br><span class="muted">${esc(e.event_code)} · ${esc(e.staff_role)}</span>
@@ -274,8 +275,23 @@ function eventPicker(){
   document.querySelector("#logout").onclick=async()=>{await supabase.auth.signOut();S.mode=null;reset();clearNavigationState();route();};
   document.querySelector("#changeOrg").onclick=()=>{S.orgId=null;S.eventId=null;saveNavigationState();orgPicker();};
   document.querySelector("#orgSettings").onclick=()=>organizationStaffPage();
+  document.querySelector("#venueLibrary").onclick=()=>venueLibraryPage();
   document.querySelector("#newEvent").onclick=()=>newEventForm();
   document.querySelectorAll("[data-event]").forEach(b=>b.onclick=()=>{S.eventId=b.dataset.event;saveNavigationState();dispatchPage();});
+}
+
+
+async function venueLibraryPage(){
+  const org=S.orgs.find(o=>o.organization_id===S.orgId);
+  try{
+    await renderVenueLibrary(app,S.orgId,org?.organizations?.name||"Organization",{
+      onBack:()=>eventPicker(),
+      onUseVersion:versionId=>newEventForm(versionId)
+    });
+  }catch(error){
+    alert(error.message);
+    eventPicker();
+  }
 }
 
 function organizationStaffPage(){
@@ -302,20 +318,44 @@ function organizationStaffPage(){
   };
 }
 
-function newEventForm(){
+
+async function newEventForm(preselectedVersionId=null){
   const org=S.orgs.find(o=>o.organization_id===S.orgId);
+  let venues=[];
+  try{
+    venues=await loadVenueChoices(S.orgId);
+  }catch(error){
+    console.warn("Venue library could not be loaded",error);
+  }
+
   app.innerHTML=`<div class="shell">${header(`${org?.organizations?.name||""} · Create Event`)}
     <div class="center"><div class="card stack">
-      <div><label>Event name</label><input id="eventName" placeholder="XRoads41 2027"></div>
-      <div><label>Event ID / field code</label><input id="eventCode" placeholder="XR41"></div>
+      <h2>Create Event</h2>
+      <div><label>Event name</label><input id="eventName" placeholder="American Family Field Concert 2027"></div>
+      <div><label>Event ID / field code</label><input id="eventCode" placeholder="AFF27"></div>
       <div><label>4-digit field PIN</label><input id="fieldPin" inputmode="numeric" maxlength="4" placeholder="4821"></div>
-      <div><label>Incident prefix</label><input id="prefix" placeholder="XR27"></div>
+      <div><label>Incident prefix</label><input id="prefix" placeholder="AFF27"></div>
+
+      <div>
+        <label>Venue / Map Setup</label>
+        <select id="venueVersion">
+          <option value="">Start with a blank event map</option>
+          ${venues.map(v=>`<option value="${v.version_id}" ${v.version_id===preselectedVersionId?"selected":""}>${esc(v.venue_name)} · v${v.version_number}${v.address?` · ${esc(v.address)}`:""}</option>`).join("")}
+        </select>
+        <div class="small muted" style="margin-top:5px">Selecting a venue copies its published map layers, calibration, zones, POIs, aliases, vertical access points and W3W library into this event as a snapshot.</div>
+      </div>
+
       <button class="btn" id="createEvent">Create Event</button>
       <button class="btn secondary" id="cancel">Cancel</button>
       <div id="eventErr" class="small muted"></div>
     </div></div></div>`;
+
   document.querySelector("#cancel").onclick=()=>eventPicker();
+
   document.querySelector("#createEvent").onclick=async()=>{
+    const status=document.querySelector("#eventErr");
+    status.textContent="Creating event…";
+
     const {data,error}=await supabase.rpc("create_event",{
       p_organization_id:S.orgId,
       p_name:document.querySelector("#eventName").value.trim(),
@@ -323,9 +363,30 @@ function newEventForm(){
       p_pin:document.querySelector("#fieldPin").value.trim(),
       p_incident_prefix:document.querySelector("#prefix").value.trim().toUpperCase()
     });
-    if(error)return document.querySelector("#eventErr").textContent=error.message;
+
+    if(error){
+      status.textContent=error.message;
+      return;
+    }
+
     S.eventId=data;
     saveNavigationState();
+
+    const versionId=document.querySelector("#venueVersion").value;
+    if(versionId){
+      try{
+        await applyVenueVersionToEvent({
+          eventId:data,
+          versionId,
+          onProgress:message=>{status.textContent=message;}
+        });
+      }catch(venueError){
+        console.error("Venue snapshot apply failed",venueError);
+        status.textContent=`Event was created, but the venue could not be fully applied: ${venueError.message}`;
+        alert(status.textContent);
+      }
+    }
+
     await eventAdmin();
   };
 }
@@ -477,7 +538,7 @@ function poiSearchResultsHtml(query){
   const rows=searchPois(query);
   return rows.map(p=>`<button type="button" class="poi-search-result" data-poi-search-result="${p.id}">
     <strong>${esc(p.name)}</strong>
-    <span>${esc([p.category,layerName(p.map_layer_id),p.zone_id?zoneName(p.zone_id):""].filter(Boolean).join(" · "))}</span>
+    <span>${esc([p.poi_scope==="venue_snapshot"?"Venue":"Event",p.category,layerName(p.map_layer_id),p.zone_id?zoneName(p.zone_id):""].filter(Boolean).join(" · "))}</span>
     ${(p.poi_aliases||[]).length?`<small>Aliases: ${esc((p.poi_aliases||[]).map(a=>a.alias).join(", "))}</small>`:""}
     ${p.w3w?`<small>///${esc(p.w3w)}</small>`:""}
   </button>`).join("")||`<div class="small muted poi-no-results">No POIs match that search.</div>`;
@@ -1210,9 +1271,15 @@ function renderEventSetup(){
     </div>
 
     <div class="card">
-      <h2>Venue Maps</h2>
-      <p><strong>${S.mapLayers.length}</strong> map layer${S.mapLayers.length===1?"":"s"} configured · Venue type: <strong>${esc(S.event.venue_type||"outdoor")}</strong></p>
-      <button class="btn" id="openMapBuilder">Open Map Builder</button>
+      <div class="row">
+        <div><h2>Venue Maps</h2><p><strong>${S.mapLayers.length}</strong> map layer${S.mapLayers.length===1?"":"s"} configured · Venue type: <strong>${esc(S.event.venue_type||"outdoor")}</strong></p></div>
+        ${S.event.venue_version_id?`<span class="badge">Venue Snapshot</span>`:`<span class="badge">Event Only</span>`}
+      </div>
+      <div class="grid2">
+        <button class="btn" id="openMapBuilder">Open Map Builder</button>
+        <button class="btn secondary" id="saveVenueLibrary">Save / Update Venue Library</button>
+      </div>
+      <div id="venueSavePanel"></div>
     </div>
   </div>`;
 
@@ -1251,8 +1318,81 @@ function renderEventSetup(){
     if(error)alert(error.message);else{await loadEventOps();renderEventSetup();}
   };
   document.querySelector("#openMapBuilder").onclick=()=>renderMapBuilder(app,S.eventId,()=>eventAdmin());
+  document.querySelector("#saveVenueLibrary").onclick=()=>renderVenueSavePanel();
 }
 
+
+
+async function renderVenueSavePanel(){
+  const host=document.querySelector("#venueSavePanel");
+  if(!host)return;
+
+  let venues=[];
+  try{
+    venues=await loadVenueChoices(S.orgId);
+  }catch(error){
+    return alert(error.message);
+  }
+
+  const linkedVenue=venues.find(v=>v.venue_id===S.event.venue_id);
+
+  host.innerHTML=`<div class="venue-save-panel">
+    <div class="row">
+      <div>
+        <div class="section-title">Reusable Venue Template</div>
+        <strong>${linkedVenue?`Create a new version of ${esc(linkedVenue.venue_name)}`:"Save this event map as a reusable venue"}</strong>
+      </div>
+      <button class="btn secondary" id="cancelVenueSave">Cancel</button>
+    </div>
+
+    ${linkedVenue?`
+      <input type="hidden" id="venueExistingId" value="${linkedVenue.venue_id}">
+      <div class="notice">This event is based on <strong>${esc(linkedVenue.venue_name)}</strong>. Saving creates a new immutable venue version; older events stay on their existing snapshots.</div>
+    `:`
+      <div><label>Venue Name</label><input id="venueName" placeholder="American Family Field"></div>
+      <div><label>Venue Address</label><input id="venueAddress" placeholder="1 Brewers Way, Milwaukee, WI"></div>
+    `}
+
+    <div><label>Version Notes</label><input id="venueNotes" placeholder="Updated 300-level map and medical POIs"></div>
+
+    ${S.event.venue_id?`
+      <label class="venue-promote-check"><input type="checkbox" id="includeEventPois"> Include event-only POIs in this new venue version</label>
+      <div class="small muted">Leave this off for temporary locations such as event-specific EMS staging, tour compounds or credentialing. Turn it on when those event POIs should become permanent venue POIs.</div>
+    `:""}
+
+    <button class="btn" id="confirmVenueSave">${linkedVenue?"Create New Venue Version":"Save Venue to Organization"}</button>
+    <div id="venueSaveStatus" class="small muted"></div>
+  </div>`;
+
+  document.querySelector("#cancelVenueSave").onclick=()=>{host.innerHTML="";};
+
+  document.querySelector("#confirmVenueSave").onclick=async()=>{
+    const status=document.querySelector("#venueSaveStatus");
+    const venueId=document.querySelector("#venueExistingId")?.value||null;
+    const venueName=document.querySelector("#venueName")?.value.trim()||null;
+    const address=document.querySelector("#venueAddress")?.value.trim()||null;
+
+    if(!venueId&&!venueName)return alert("Enter a venue name.");
+
+    try{
+      const result=await saveEventToVenueLibrary({
+        eventId:S.eventId,
+        organizationId:S.orgId,
+        venueId,
+        venueName,
+        address,
+        notes:document.querySelector("#venueNotes").value.trim(),
+        includeEventPois:document.querySelector("#includeEventPois")?.checked||false,
+        onProgress:message=>{status.textContent=message;}
+      });
+      await loadEventOps();
+      status.textContent=`Saved ${result.venue_name} v${result.version_number}. Future events can now start from this venue.`;
+    }catch(error){
+      console.error("Venue save failed",error);
+      status.textContent=error.message;
+    }
+  };
+}
 
 function renderDepartmentStatusEditor(departmentId){
   const dep=S.departments.find(d=>d.id===departmentId);

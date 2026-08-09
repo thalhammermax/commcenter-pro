@@ -379,3 +379,52 @@ input:disabled{opacity:.65}
 @media(max-width:560px){
   .incident-department-picker{grid-template-columns:1fr}
 }
+
+
+/* v0.5.0 — organization Venue Library */
+.venue-library-hero h2{margin-bottom:6px}
+.venue-library-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(280px,1fr));
+  gap:12px;
+}
+.venue-library-card{
+  display:flex;
+  flex-direction:column;
+  gap:10px;
+}
+.venue-version-summary{
+  padding:9px 10px;
+  border:1px solid #334155;
+  border-radius:9px;
+  background:#0b1324;
+}
+.venue-version-list{
+  display:grid;
+  gap:7px;
+  margin-top:8px;
+}
+.venue-version-list>div{
+  padding:7px 0;
+  border-bottom:1px solid #253249;
+}
+.venue-save-panel{
+  display:grid;
+  gap:10px;
+  margin-top:14px;
+  padding:14px;
+  border:1px solid #3b82f6;
+  border-radius:12px;
+  background:#0b1324;
+}
+.venue-promote-check{
+  display:flex;
+  align-items:flex-start;
+  gap:8px;
+  font-weight:600;
+}
+.venue-promote-check input{
+  width:auto;
+  margin-top:3px;
+  accent-color:#3b82f6;
+}
