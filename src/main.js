@@ -10,12 +10,38 @@ const app=document.querySelector("#app");
 const S={
   mode:null,session:null,orgs:[],orgId:null,events:[],eventId:null,event:null,
   departments:[],units:[],incidents:[],pois:[],eventMap:null,mapLayers:[],zones:[],accessPoints:[],accessNodes:[],activeMapLayerId:null,map:null,realtime:[],
-  fieldSession:null,currentLocation:null,isPlatformAdmin:false
+  fieldSession:null,currentLocation:null,isPlatformAdmin:false,callTimerInterval:null
 };
 
 const esc=(v="")=>String(v).replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m]));
 const fmt=iso=>iso?new Date(iso).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}):"";
 const header=(sub="")=>`<div class="topbar"><div class="brand">CommCenter Pro<small>${esc(sub)}</small></div><div class="nav" id="topActions"></div></div>`;
+
+function formatElapsed(startIso){
+  const start=new Date(startIso).getTime();
+  if(!Number.isFinite(start))return "--:--";
+  const total=Math.max(0,Math.floor((Date.now()-start)/1000));
+  const days=Math.floor(total/86400);
+  const hours=Math.floor((total%86400)/3600);
+  const minutes=Math.floor((total%3600)/60);
+  const seconds=total%60;
+  const pad=n=>String(n).padStart(2,"0");
+  if(days>0)return `${days}d ${pad(hours)}:${pad(minutes)}:${pad(seconds)}`;
+  if(hours>0)return `${hours}:${pad(minutes)}:${pad(seconds)}`;
+  return `${pad(minutes)}:${pad(seconds)}`;
+}
+
+function updateCallTimers(){
+  document.querySelectorAll("[data-call-start]").forEach(el=>{
+    el.textContent=formatElapsed(el.dataset.callStart);
+  });
+}
+
+function ensureCallTimerTicker(){
+  updateCallTimers();
+  if(S.callTimerInterval)return;
+  S.callTimerInterval=setInterval(updateCallTimers,1000);
+}
 
 async function init(){
   if("serviceWorker"in navigator)navigator.serviceWorker.register("/service-worker.js").catch(console.warn);
@@ -357,6 +383,7 @@ async function dispatchPage(){
   document.querySelector("#newIncident").onclick=()=>incidentForm(null);
   document.querySelector("#dispatchLayerSelect")?.addEventListener("change",e=>{S.activeMapLayerId=e.target.value;setupDispatchMap();});
   bindIncidentClicks();
+  ensureCallTimerTicker();
   await setupDispatchMap();
   subscribeDispatch();
 }
@@ -375,7 +402,7 @@ function incidentList(){
     const deps=(i.incident_departments||[]).map(d=>d.event_departments?.short_name||d.event_departments?.name).filter(Boolean).join("/");
     const assigned=(i.incident_units||[]).filter(x=>!x.cleared_at).map(x=>x.units?.name).filter(Boolean);
     return `<div class="incident" data-incident="${i.id}">
-      <div class="row"><strong>${esc(i.incident_number)}</strong><span class="badge">${esc(i.priority)}</span></div>
+      <div class="row"><strong>${esc(i.incident_number)}</strong><span class="incident-head-meta"><span class="call-timer" title="Elapsed call time" data-call-start="${esc(i.created_at)}">00:00</span><span class="badge">${esc(i.priority)}</span></span></div>
       <div>${esc(i.call_type)}</div>
       <div class="small muted">${esc(deps)} · ${esc(layerName(i.map_layer_id))}${i.zone_id?` / ${esc(zoneName(i.zone_id))}`:""} · ${esc(i.landmark||i.w3w||"Mapped")}</div>
       ${assigned.length?`<div class="small" style="margin-top:5px"><strong>${esc(assigned.join(", "))}</strong></div>`:""}
@@ -454,7 +481,7 @@ function selectIncident(id){
   const assignedIds=new Set(assignedLinks.map(x=>x.unit_id));
 
   document.querySelector("#detail").innerHTML=`<div class="card stack">
-    <div class="row"><strong>${esc(i.incident_number)}</strong><span class="badge">${esc(i.priority)}</span></div>
+    <div class="row"><strong>${esc(i.incident_number)}</strong><span class="incident-head-meta"><span class="call-timer" title="Elapsed call time" data-call-start="${esc(i.created_at)}">00:00</span><span class="badge">${esc(i.priority)}</span></span></div>
     <strong>${esc(i.call_type)}</strong>
     <div class="venue-location-line">${i.map_layer_id?`<span class="badge layer-badge">${esc(layerName(i.map_layer_id))}</span> `:""}${i.zone_id?`<span class="badge">${esc(zoneName(i.zone_id))}</span>`:""}</div>
     <div>${i.w3w?`<strong>///${esc(i.w3w)}</strong><br>`:""}${esc(i.landmark||"")}<br>
@@ -907,23 +934,29 @@ async function fieldUnitCad(){
 
   app.innerHTML=`<div class="shell">${header(`${esc(fs.events?.name||"")} · ${esc(fs.units?.event_departments?.name||"")}`)}
     <div class="field-shell stack">
-      <div class="card"><div class="small muted">Your unit</div><div class="big">${esc(fs.units?.name)}</div><span class="badge status-${esc(fs.units?.status)}">${esc(fs.units?.status?.replaceAll("_"," "))}</span></div>
-      ${incident?`<div class="card assignment"><div class="row"><strong>${esc(incident.incident_number)}</strong><span class="badge">${esc(incident.priority)}</span></div>
+      <div class="card"><div class="small muted">Your unit</div><div class="big">${esc(fs.units?.name)}</div><span class="badge status-${esc(fs.units?.status)}" data-field-unit-status>${esc(fs.units?.status?.replaceAll("_"," "))}</span></div>
+      ${incident?`<div class="card assignment"><div class="row"><strong>${esc(incident.incident_number)}</strong><span class="incident-head-meta"><span class="call-timer field-call-timer" title="Elapsed call time" data-call-start="${esc(incident.created_at)}">00:00</span><span class="badge">${esc(incident.priority)}</span></span></div>
         <h2>${esc(incident.call_type)}</h2>${fieldLayer?`<div class="venue-location-line"><span class="badge layer-badge">${esc(fieldLayer.name)}</span>${fieldZone?` <span class="badge">${esc(fieldZone.name)}</span>`:""}</div>`:""}<p>${incident.w3w?`<strong>///${esc(incident.w3w)}</strong><br>`:""}${esc(incident.landmark||"")}<br>
         <span class="small mono">${Number(incident.latitude).toFixed(6)}, ${Number(incident.longitude).toFixed(6)}</span></p><p>${esc(incident.notes||"")}</p>
         <button class="btn secondary block" id="viewFieldMap">View on Event Map</button>
         <div id="fieldMapHolder"></div>
       </div>`:`<div class="card"><strong>No current assignment</strong><p class="muted">Remain available for dispatch.</p></div>`}
       ${fieldEmsPanelHtml(emsState,incident)}
-      <div class="status-buttons">${statuses.map(s=>`<button class="btn ${["AVAILABLE","CLEAR","COMPLETE"].includes(s)?"good":""}" data-status="${esc(s)}">${esc(s.replaceAll("_"," "))}</button>`).join("")}</div>
+      <div class="status-buttons">${statuses.map(s=>`<button class="btn ${["AVAILABLE","CLEAR","COMPLETE"].includes(s)?"good":""} ${s===fs.units?.status?"field-status-active":""}" data-status="${esc(s)}">${esc(s.replaceAll("_"," "))}</button>`).join("")}</div>
       <div class="notice ${navigator.onLine?"ok":""}">${navigator.onLine?"Connected":"Offline — CAD changes cannot reach dispatch until connectivity returns."}</div>
       <button class="btn secondary" id="downloadOffline">Download Event Map + W3W for Offline Use</button>
       <div id="offlineStatus" class="small muted"></div>
       <button class="btn secondary" id="changeUnit">Change Unit</button><button class="btn secondary" id="leaveEvent">Leave Event</button>
     </div></div>`;
+  ensureCallTimerTicker();
   document.querySelectorAll("[data-status]").forEach(b=>b.onclick=async()=>{
-    const {error}=await supabase.rpc("field_set_unit_status",{p_unit_id:fs.unit_id,p_status:b.dataset.status,p_incident_id:incident?.id||null,p_client_time:new Date().toISOString()});
-    if(error)alert(error.message);else fieldUnitCad();
+    const requested=b.dataset.status;
+    b.disabled=true;
+    const {error}=await supabase.rpc("field_set_unit_status",{p_unit_id:fs.unit_id,p_status:requested,p_incident_id:incident?.id||null,p_client_time:new Date().toISOString()});
+    b.disabled=false;
+    if(error)return alert(error.message);
+    fs.units.status=requested;
+    updateFieldUnitStatusUI(requested);
   });
   bindFieldEmsPanel(emsState,{eventId:S.eventId,unitId:fs.unit_id,incident,refresh:()=>fieldUnitCad()});
   document.querySelector("#downloadOffline").onclick=()=>downloadOfflineEventData();
@@ -933,6 +966,20 @@ async function fieldUnitCad(){
   if(incident)document.querySelector("#viewFieldMap").onclick=()=>showFieldMap(incident);
   subscribeField(fs.unit_id);
 }
+function updateFieldUnitStatusUI(status){
+  const badge=document.querySelector("[data-field-unit-status]");
+  if(badge){
+    [...badge.classList].filter(c=>c.startsWith("status-")).forEach(c=>badge.classList.remove(c));
+    badge.classList.add(`status-${status}`);
+    badge.textContent=String(status||"").replaceAll("_"," ");
+  }
+
+  document.querySelectorAll("[data-status]").forEach(btn=>{
+    btn.classList.toggle("field-status-active",btn.dataset.status===status);
+    btn.setAttribute("aria-pressed",btn.dataset.status===status?"true":"false");
+  });
+}
+
 async function downloadOfflineEventData(){
   const status=document.querySelector("#offlineStatus");
   try{
@@ -1004,10 +1051,23 @@ function subscribeDispatch(){
   S.realtime.push(ch);
 }
 function subscribeField(unitId){
-  const ch=supabase.channel(`unit-${unitId}`)
-    .on("postgres_changes",{event:"*",schema:"public",table:"units",filter:`id=eq.${unitId}`},()=>fieldUnitCad())
+  // A field CAD screen should stay visually stable while a crew changes status.
+  // Replace any previous field subscriptions, then update only the status badge
+  // for unit row changes. Assignment/unassignment still performs a full refresh.
+  S.realtime.forEach(ch=>supabase.removeChannel(ch));
+  S.realtime=[];
+
+  const ch=supabase.channel(`unit-${unitId}-${Date.now()}`)
+    .on("postgres_changes",{event:"UPDATE",schema:"public",table:"units",filter:`id=eq.${unitId}`},payload=>{
+      const status=payload.new?.status;
+      if(status){
+        if(S.fieldSession?.units)S.fieldSession.units.status=status;
+        updateFieldUnitStatusUI(status);
+      }
+    })
     .on("postgres_changes",{event:"*",schema:"public",table:"incident_units",filter:`unit_id=eq.${unitId}`},()=>fieldUnitCad())
     .subscribe();
+
   S.realtime.push(ch);
 }
 function cleanupRealtime(){
