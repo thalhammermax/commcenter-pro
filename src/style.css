@@ -428,3 +428,45 @@ input:disabled{opacity:.65}
   margin-top:3px;
   accent-color:#3b82f6;
 }
+
+
+/* v0.5.1 — live field unit location */
+.unit-gps-readout{
+  margin-top:4px;
+  font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;
+}
+.gps-live{color:#86efac}
+.gps-stale{color:#facc15}
+.gps-expired{color:#94a3b8}
+.unit-gps-marker{
+  stroke:#dbeafe;
+  fill:#2563eb;
+}
+.unit-gps-stale{
+  stroke:#fde68a;
+  fill:#ca8a04;
+}
+.field-location-card{
+  border-color:#334155;
+}
+.gps-sharing-badge{
+  background:#14532d;
+  border-color:#22c55e;
+  color:#dcfce7;
+}
+.location-status{
+  padding:9px 10px;
+  border-radius:9px;
+  background:#111827;
+  border:1px solid #334155;
+  color:#cbd5e1;
+  font-size:13px;
+}
+.location-status.ok{
+  border-color:#166534;
+  color:#bbf7d0;
+}
+.location-status.error{
+  border-color:#991b1b;
+  color:#fecaca;
+}

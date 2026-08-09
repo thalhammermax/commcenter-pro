@@ -2,7 +2,7 @@ import "./style.css";
 import L from "leaflet";
 import { supabase } from "./supabase.js";
 import { renderMapBuilder } from "./mapBuilder.js";
-import { pixelToGeo, pixelToLeaflet, leafletToPixel } from "./georef.js";
+import { pixelToGeo, pixelToLeaflet, leafletToPixel, geoToPixel, distanceMeters } from "./georef.js";
 import { saveOfflineEvent, getOfflineEvent, localW3WForCoordinate } from "./offlineStore.js";
 import { renderEmsOps, renderEmsAdmin, renderTreatmentAreaFlow, loadFieldEmsState, fieldEmsPanelHtml, bindFieldEmsPanel } from "./ems.js";
 import { loadVenueChoices, applyVenueVersionToEvent, saveEventToVenueLibrary, renderVenueLibrary } from "./venueLibrary.js";
@@ -11,7 +11,9 @@ const app=document.querySelector("#app");
 const S={
   mode:null,session:null,orgs:[],orgId:null,events:[],eventId:null,event:null,
   departments:[],units:[],incidents:[],pois:[],eventMap:null,mapLayers:[],zones:[],accessPoints:[],accessNodes:[],activeMapLayerId:null,map:null,realtime:[],
-  fieldSession:null,currentLocation:null,isPlatformAdmin:false,callTimerInterval:null
+  fieldSession:null,currentLocation:null,isPlatformAdmin:false,callTimerInterval:null,
+  unitLocations:[],unitLocationMarkers:new Map(),locationAgeInterval:null,
+  locationWatchId:null,locationLastSentAt:0,locationLastSent:null,locationWriteInFlight:false
 };
 
 const esc=(v="")=>String(v).replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m]));
@@ -402,7 +404,8 @@ async function loadEventOps(){
     mapLayersRes,
     zonesRes,
     accessPointsRes,
-    accessNodesRes
+    accessNodesRes,
+    unitLocationsRes
   ] = await Promise.all([
     supabase.from("events").select("*").eq("id",S.eventId).single(),
     supabase.from("event_departments").select("*").eq("event_id",S.eventId).order("sort_order"),
@@ -420,7 +423,8 @@ async function loadEventOps(){
     supabase.from("event_map_layers").select("*").eq("event_id",S.eventId).eq("active",true).order("sort_order"),
     supabase.from("event_zones").select("*").eq("event_id",S.eventId).eq("active",true).order("sort_order"),
     supabase.from("venue_access_points").select("*").eq("event_id",S.eventId).eq("active",true).order("name"),
-    supabase.from("venue_access_point_nodes").select("*")
+    supabase.from("venue_access_point_nodes").select("*"),
+    supabase.from("unit_locations").select("*").eq("event_id",S.eventId)
   ]);
 
   const baseResults = {
@@ -433,7 +437,8 @@ async function loadEventOps(){
     mapLayers: mapLayersRes,
     zones: zonesRes,
     accessPoints: accessPointsRes,
-    accessNodes: accessNodesRes
+    accessNodes: accessNodesRes,
+    unitLocations: unitLocationsRes
   };
 
   const failed = Object.entries(baseResults).filter(([,res])=>res.error);
@@ -484,6 +489,7 @@ async function loadEventOps(){
   S.mapLayers=mapLayersRes.data||[];
   S.zones=zonesRes.data||[];
   S.accessPoints=accessPointsRes.data||[];
+  S.unitLocations=unitLocationsRes.data||[];
   const apIds=new Set(S.accessPoints.map(a=>a.id));
   S.accessNodes=(accessNodesRes.data||[]).filter(n=>apIds.has(n.access_point_id));
   const preferred=S.mapLayers.find(l=>l.id===S.activeMapLayerId);
@@ -689,10 +695,159 @@ async function dispatchPage(){
   document.querySelector("#dispatchLayerSelect")?.addEventListener("change",e=>{S.activeMapLayerId=e.target.value;saveNavigationState();setupDispatchMap();});
   bindIncidentClicks();
   ensureCallTimerTicker();
+  ensureLocationAgeTicker();
   await setupDispatchMap();
   subscribeDispatch();
 }
 
+
+
+function locationAgeSeconds(location){
+  if(!location?.updated_at)return Infinity;
+  return Math.max(0,Math.floor((Date.now()-new Date(location.updated_at).getTime())/1000));
+}
+
+function locationAgeLabel(location){
+  const seconds=locationAgeSeconds(location);
+  if(!Number.isFinite(seconds))return "No GPS";
+  if(seconds<10)return "GPS now";
+  if(seconds<60)return `GPS ${seconds}s`;
+  if(seconds<3600)return `GPS ${Math.floor(seconds/60)}m`;
+  return `GPS ${Math.floor(seconds/3600)}h`;
+}
+
+function locationFreshness(location){
+  const seconds=locationAgeSeconds(location);
+  if(seconds<=30)return "live";
+  if(seconds<=300)return "stale";
+  return "expired";
+}
+
+function unitLocation(unitId){
+  return S.unitLocations.find(l=>l.unit_id===unitId)||null;
+}
+
+function unitLocationLayerId(unit){
+  if(unit?.current_map_layer_id)return unit.current_map_layer_id;
+  return S.mapLayers.find(l=>l.is_default&&l.status==="published")?.id
+    || S.mapLayers.find(l=>l.status==="published")?.id
+    || null;
+}
+
+function unitLocationTooltip(unit,location){
+  const age=locationAgeLabel(location);
+  const accuracy=location.accuracy_m!=null?` · ±${Math.round(location.accuracy_m)}m`:"";
+  const layer=unitLocationLayerId(unit);
+  return `<strong>${esc(unit.name)}</strong><br>${esc(String(unit.status||"").replaceAll("_"," "))}<br>${esc(age)}${esc(accuracy)}${layer?`<br>${esc(layerName(layer))}`:""}`;
+}
+
+function removeUnitLocationMarker(unitId){
+  const entry=S.unitLocationMarkers.get(unitId);
+  if(entry?.marker&&S.map){
+    try{S.map.removeLayer(entry.marker);}catch{}
+  }
+  S.unitLocationMarkers.delete(unitId);
+}
+
+function renderUnitLocationMarker(unitId){
+  if(!S.map)return;
+  removeUnitLocationMarker(unitId);
+
+  const unit=S.units.find(u=>u.id===unitId);
+  const location=unitLocation(unitId);
+  const layer=activeMapLayer();
+  if(!unit||!location||!layer?.georef_coefficients)return;
+
+  const freshness=locationFreshness(location);
+  if(freshness==="expired")return;
+
+  const locationLayerId=unitLocationLayerId(unit);
+  if(locationLayerId!==layer.id)return;
+
+  let pixel;
+  try{
+    pixel=geoToPixel(Number(location.latitude),Number(location.longitude),layer.georef_coefficients);
+  }catch{
+    return;
+  }
+
+  // Do not pin a device far outside the actual venue image.
+  if(pixel.x < -50 || pixel.y < -50 || pixel.x > Number(layer.image_width)+50 || pixel.y > Number(layer.image_height)+50){
+    return;
+  }
+
+  const marker=L.circleMarker(
+    pixelToLeaflet(pixel.x,pixel.y,layer.image_height),
+    {
+      radius:9,
+      weight:3,
+      fillOpacity:freshness==="live"?.9:.45,
+      opacity:freshness==="live"?1:.55,
+      className:`unit-gps-marker unit-gps-${freshness}`
+    }
+  ).addTo(S.map);
+
+  marker.bindTooltip(unitLocationTooltip(unit,location),{direction:"top",offset:[0,-8]});
+  S.unitLocationMarkers.set(unitId,{marker});
+}
+
+function renderAllUnitLocationMarkers(){
+  S.unitLocationMarkers.forEach((_,unitId)=>removeUnitLocationMarker(unitId));
+  S.unitLocationMarkers.clear();
+  for(const location of S.unitLocations)renderUnitLocationMarker(location.unit_id);
+}
+
+function updateDispatcherUnitLocation(payload){
+  const row=payload?.new;
+  const old=payload?.old;
+
+  if(payload.eventType==="DELETE"){
+    const unitId=old?.unit_id;
+    if(!unitId)return;
+    S.unitLocations=S.unitLocations.filter(l=>l.unit_id!==unitId);
+    removeUnitLocationMarker(unitId);
+    updateUnitLocationBoardRow(unitId);
+    return;
+  }
+
+  if(!row?.unit_id || !S.units.some(u=>u.id===row.unit_id))return;
+  const index=S.unitLocations.findIndex(l=>l.unit_id===row.unit_id);
+  if(index>=0)S.unitLocations[index]=row;
+  else S.unitLocations.push(row);
+  renderUnitLocationMarker(row.unit_id);
+  updateUnitLocationBoardRow(row.unit_id);
+}
+
+function updateUnitLocationBoardRow(unitId){
+  const location=unitLocation(unitId);
+  const el=document.querySelector(`[data-unit-gps="${unitId}"]`);
+  if(!el)return;
+  if(!location){
+    el.textContent=S.event?.field_location_enabled?"GPS not shared":"GPS disabled";
+    el.className="small muted unit-gps-readout";
+    return;
+  }
+  const freshness=locationFreshness(location);
+  el.textContent=`${locationAgeLabel(location)}${location.accuracy_m!=null?` · ±${Math.round(location.accuracy_m)}m`:""}`;
+  el.className=`small unit-gps-readout gps-${freshness}`;
+}
+
+function refreshLocationAges(){
+  for(const unit of S.units){
+    updateUnitLocationBoardRow(unit.id);
+    const location=unitLocation(unit.id);
+    if(location){
+      const freshness=locationFreshness(location);
+      if(freshness==="expired")removeUnitLocationMarker(unit.id);
+      else renderUnitLocationMarker(unit.id);
+    }
+  }
+}
+
+function ensureLocationAgeTicker(){
+  if(S.locationAgeInterval)return;
+  S.locationAgeInterval=setInterval(refreshLocationAges,10000);
+}
 
 function activeAssignmentForUnit(unitId){
   for(const incident of S.incidents){
@@ -732,6 +887,7 @@ function unitList(){
           <span class="badge status-${esc(u.status)}" data-dispatch-unit-status="${u.id}">${esc(u.status.replaceAll("_"," "))}</span>
         </div>
         <div class="small muted">${active?`Assigned: ${esc(active.incident.incident_number)} · ${esc(active.incident.call_type)}`:"Unassigned"}</div>
+        <div class="small unit-gps-readout ${unitLocation(u.id)?`gps-${locationFreshness(unitLocation(u.id))}`:"muted"}" data-unit-gps="${u.id}">${unitLocation(u.id)?`${locationAgeLabel(unitLocation(u.id))}${unitLocation(u.id).accuracy_m!=null?` · ±${Math.round(unitLocation(u.id).accuracy_m)}m`:""}`:(S.event?.field_location_enabled?"GPS not shared":"GPS disabled")}</div>
       </button>`;
     }).join("")}
   `).join("")||`<div class="small muted">No units configured.</div>`;
@@ -935,6 +1091,7 @@ function selectUnit(unitId){
   }
 }
 async function setupDispatchMap(){
+  S.unitLocationMarkers.clear();
   if(S.map){try{S.map.remove()}catch{}S.map=null;}
   const layer=activeMapLayer();
   if(!layer?.rendered_image_path || layer.status!=="published"){
@@ -957,6 +1114,7 @@ async function setupDispatchMap(){
   for(const i of S.incidents.filter(i=>!i.map_layer_id||i.map_layer_id===layer.id)){
     if(i.map_x!=null&&i.map_y!=null)L.circleMarker(pixelToLeaflet(i.map_x,i.map_y,layer.image_height),{radius:8,className:"incident-marker"}).addTo(S.map).bindTooltip(i.incident_number);
   }
+  renderAllUnitLocationMarkers();
   if(layer.georef_coefficients){
     S.map.on("click",async e=>{
       const px=leafletToPixel(e.latlng,layer.image_height);
@@ -1227,6 +1385,8 @@ function renderEventSetup(){
         <div><label>New 4-digit PIN</label><input id="newPin" maxlength="4" inputmode="numeric" placeholder="4821"></div>
       </div>
       <label style="margin-top:10px"><input id="accessEnabled" type="checkbox" ${S.event.field_access_enabled?"checked":""}> Field access enabled</label>
+      <label style="margin-top:8px"><input id="locationEnabled" type="checkbox" ${S.event.field_location_enabled?"checked":""}> Allow field units to share live GPS location with Dispatch</label>
+      <div class="small muted" style="margin-top:5px">Location is opt-in on each field device. This version stores only the latest location, not a route history.</div>
       <button class="btn" id="savePin">Save Field Access</button>
       <div id="pinMsg" class="small muted"></div>
     </div>
@@ -1286,10 +1446,18 @@ function renderEventSetup(){
   document.querySelector("#savePin").onclick=async()=>{
     const pin=document.querySelector("#newPin").value.trim();
     const enabled=document.querySelector("#accessEnabled").checked;
+    const locationEnabled=document.querySelector("#locationEnabled").checked;
     if(pin&& !/^\d{4}$/.test(pin))return alert("PIN must be exactly 4 digits.");
-    const {error}=await supabase.rpc("set_event_field_access",{p_event_id:S.eventId,p_pin:pin||null,p_enabled:enabled});
-    document.querySelector("#pinMsg").textContent=error?error.message:"Saved.";
-    if(!error){await loadEventOps();renderEventSetup();}
+
+    const fieldResult=await supabase.rpc("set_event_field_access",{p_event_id:S.eventId,p_pin:pin||null,p_enabled:enabled});
+    if(fieldResult.error){
+      document.querySelector("#pinMsg").textContent=fieldResult.error.message;
+      return;
+    }
+
+    const locationResult=await supabase.rpc("set_event_field_location_enabled",{p_event_id:S.eventId,p_enabled:locationEnabled});
+    document.querySelector("#pinMsg").textContent=locationResult.error?locationResult.error.message:"Saved.";
+    if(!locationResult.error){await loadEventOps();renderEventSetup();}
   };
   document.querySelectorAll("[data-edit-dept-statuses]").forEach(btn=>{
     btn.onclick=()=>renderDepartmentStatusEditor(btn.dataset.editDeptStatuses);
@@ -1515,7 +1683,7 @@ async function fieldUnitPicker(){
 }
 async function fieldUnitCad(){
   const {data:fs,error}=await supabase.from("field_sessions")
-    .select("*,events(name),units(name,status,event_id,event_departments(name,status_profile))")
+    .select("*,events(name,field_location_enabled,venue_type),units(name,status,event_id,current_map_layer_id,current_zone_id,event_departments(name,status_profile))")
     .eq("auth_user_id",S.session.user.id).eq("active",true).order("started_at",{ascending:false}).limit(1).single();
   if(error)return fieldJoin();
   S.fieldSession=fs;S.eventId=fs.event_id;
@@ -1526,6 +1694,10 @@ async function fieldUnitCad(){
   if(incident?.map_layer_id){fieldLayer=(await supabase.from("event_map_layers").select("id,name,level_code").eq("id",incident.map_layer_id).maybeSingle()).data||null;}
   if(incident?.zone_id){fieldZone=(await supabase.from("event_zones").select("id,name").eq("id",incident.zone_id).maybeSingle()).data||null;}
   const statuses=fs.units?.event_departments?.status_profile||["AVAILABLE","RESPONDING","ON_SCENE","CLEAR"];
+  const [{data:fieldMapLayers},{data:fieldZones}]=await Promise.all([
+    supabase.from("event_map_layers").select("id,name,level_code,is_default").eq("event_id",S.eventId).eq("active",true).eq("status","published").order("sort_order"),
+    supabase.from("event_zones").select("id,map_layer_id,name").eq("event_id",S.eventId).eq("active",true).order("sort_order")
+  ]);
   let emsState=null;
   try{emsState=await loadFieldEmsState(S.eventId,fs.unit_id,incident?.id||null);}catch(err){console.error("Field EMS panel failed to load",err);}
 
@@ -1538,6 +1710,31 @@ async function fieldUnitCad(){
         <button class="btn secondary block" id="viewFieldMap">View on Event Map</button>
         <div id="fieldMapHolder"></div>
       </div>`:`<div class="card"><strong>No current assignment</strong><p class="muted">Remain available for dispatch.</p></div>`}
+      ${fs.events?.field_location_enabled?`<div class="card field-location-card">
+        <div class="row">
+          <div>
+            <div class="section-title">Live Unit Location</div>
+            <strong>Share this device's GPS with Dispatch</strong>
+          </div>
+          <span class="badge ${S.locationWatchId!=null?"gps-sharing-badge":""}" id="fieldLocationBadge">${S.locationWatchId!=null?"SHARING":"OFF"}</span>
+        </div>
+        <p class="small muted">Your browser will ask for location permission. CommCenter Pro stores only the unit's current location in this version; it does not save a breadcrumb history.</p>
+        ${(fieldMapLayers||[]).length>1?`<div class="grid2">
+          <div><label>Current Venue Level</label><select id="fieldVenueLayer">
+            <option value="">Default / level unknown</option>
+            ${(fieldMapLayers||[]).map(l=>`<option value="${l.id}" ${fs.units?.current_map_layer_id===l.id?"selected":""}>${esc(l.name)}</option>`).join("")}
+          </select></div>
+          <div><label>Current Zone</label><select id="fieldVenueZone">
+            <option value="">No zone</option>
+            ${(fieldZones||[]).filter(z=>!fs.units?.current_map_layer_id||z.map_layer_id===fs.units.current_map_layer_id).map(z=>`<option value="${z.id}" ${fs.units?.current_zone_id===z.id?"selected":""}>${esc(z.name)}</option>`).join("")}
+          </select></div>
+        </div><button class="btn secondary block" id="saveFieldVenueLocation">Update Venue Level / Zone</button>`:""}
+        <div id="fieldLocationStatus" class="location-status ${S.locationWatchId!=null?"ok":""}">${S.locationWatchId!=null?"Location sharing is active while this page remains visible.":"Location is not being shared."}</div>
+        <div class="grid2">
+          <button class="btn" id="startLocationSharing" ${S.locationWatchId!=null?"disabled":""}>Start Sharing Location</button>
+          <button class="btn secondary" id="stopLocationSharing" ${S.locationWatchId==null?"disabled":""}>Stop Sharing</button>
+        </div>
+      </div>`:""}
       ${fieldEmsPanelHtml(emsState,incident)}
       <div class="status-buttons">${statuses.map(s=>`<button class="btn ${["AVAILABLE","CLEAR","COMPLETE"].includes(s)?"good":""} ${s===fs.units?.status?"field-status-active":""}" data-status="${esc(s)}">${esc(s.replaceAll("_"," "))}</button>`).join("")}</div>
       <div class="notice ${navigator.onLine?"ok":""}">${navigator.onLine?"Connected":"Offline — CAD changes cannot reach dispatch until connectivity returns."}</div>
@@ -1555,14 +1752,196 @@ async function fieldUnitCad(){
     fs.units.status=requested;
     updateFieldUnitStatusUI(requested);
   });
+  if(fs.events?.field_location_enabled){
+    bindFieldLocationControls(fs,fieldMapLayers||[],fieldZones||[]);
+  }
   bindFieldEmsPanel(emsState,{eventId:S.eventId,unitId:fs.unit_id,incident,refresh:()=>fieldUnitCad()});
   document.querySelector("#downloadOffline").onclick=()=>downloadOfflineEventData();
   getOfflineEvent(S.eventId).then(x=>{if(x)document.querySelector("#offlineStatus").textContent=`Offline package saved ${new Date(x.savedAt).toLocaleString()}`;}).catch(()=>{});
-  document.querySelector("#changeUnit").onclick=async()=>{await supabase.rpc("field_release_unit",{p_field_session_id:fs.id});fieldUnitPicker();};
+  document.querySelector("#changeUnit").onclick=async()=>{await stopFieldLocationSharing(fs.unit_id,{notifyServer:true});await supabase.rpc("field_release_unit",{p_field_session_id:fs.id});fieldUnitPicker();};
   document.querySelector("#leaveEvent").onclick=leaveField;
   if(incident)document.querySelector("#viewFieldMap").onclick=()=>showFieldMap(incident);
   subscribeField(fs.unit_id);
 }
+
+function fieldLocationPreferenceKey(eventId,unitId){
+  return `commcenter-live-location:${eventId}:${unitId}`;
+}
+
+function updateFieldLocationUi({message,sharing,accuracy=null,error=false}){
+  const badge=document.querySelector("#fieldLocationBadge");
+  const status=document.querySelector("#fieldLocationStatus");
+  const start=document.querySelector("#startLocationSharing");
+  const stop=document.querySelector("#stopLocationSharing");
+
+  if(badge){
+    badge.textContent=sharing?"SHARING":"OFF";
+    badge.classList.toggle("gps-sharing-badge",!!sharing);
+  }
+  if(status){
+    status.textContent=`${message||""}${accuracy!=null?` · accuracy ±${Math.round(accuracy)}m`:""}`;
+    status.classList.toggle("ok",!!sharing&&!error);
+    status.classList.toggle("error",!!error);
+  }
+  if(start)start.disabled=!!sharing;
+  if(stop)stop.disabled=!sharing;
+}
+
+async function sendFieldLocation(unitId,position){
+  if(S.locationWriteInFlight)return;
+
+  const now=Date.now();
+  const coords=position.coords;
+  const current={lat:Number(coords.latitude),lon:Number(coords.longitude)};
+  const elapsed=now-(S.locationLastSentAt||0);
+  const moved=S.locationLastSent
+    ? distanceMeters(S.locationLastSent.lat,S.locationLastSent.lon,current.lat,current.lon)
+    : Infinity;
+
+  // High-frequency GPS callbacks are intentionally throttled. Send immediately
+  // the first time, then at most about every 5 seconds while moving, with a
+  // 15-second heartbeat even when stationary.
+  if(S.locationLastSentAt && elapsed<5000)return;
+  if(S.locationLastSent && moved<3 && elapsed<15000)return;
+
+  S.locationWriteInFlight=true;
+  try{
+    const {error}=await supabase.rpc("field_update_unit_location",{
+      p_unit_id:unitId,
+      p_latitude:current.lat,
+      p_longitude:current.lon,
+      p_accuracy_m:Number.isFinite(coords.accuracy)?Number(coords.accuracy):null,
+      p_altitude_m:Number.isFinite(coords.altitude)?Number(coords.altitude):null,
+      p_heading_deg:Number.isFinite(coords.heading)?Number(coords.heading):null,
+      p_speed_mps:Number.isFinite(coords.speed)?Number(coords.speed):null,
+      p_client_time:new Date(position.timestamp||Date.now()).toISOString()
+    });
+    if(error)throw error;
+
+    S.locationLastSentAt=now;
+    S.locationLastSent=current;
+    updateFieldLocationUi({
+      message:"Location shared with Dispatch",
+      sharing:true,
+      accuracy:coords.accuracy
+    });
+  }catch(error){
+    console.error("Field location update failed",error);
+    updateFieldLocationUi({
+      message:`Location could not be sent: ${error.message}`,
+      sharing:S.locationWatchId!=null,
+      error:true
+    });
+  }finally{
+    S.locationWriteInFlight=false;
+  }
+}
+
+function fieldLocationErrorMessage(error){
+  if(error?.code===1)return "Location permission was denied. Allow location access for CommCenter Pro in your browser/site settings.";
+  if(error?.code===2)return "This device could not determine its current location.";
+  if(error?.code===3)return "Location lookup timed out. Try again where the device has a better GPS/Wi-Fi/cellular fix.";
+  return error?.message||"Location is unavailable.";
+}
+
+async function startFieldLocationSharing(unitId){
+  if(!window.isSecureContext){
+    updateFieldLocationUi({message:"Live location requires HTTPS.",sharing:false,error:true});
+    return;
+  }
+  if(!navigator.geolocation){
+    updateFieldLocationUi({message:"This browser does not provide the Geolocation API.",sharing:false,error:true});
+    return;
+  }
+  if(S.locationWatchId!=null)return;
+
+  updateFieldLocationUi({message:"Waiting for browser location permission / GPS fix…",sharing:true});
+
+  S.locationLastSentAt=0;
+  S.locationLastSent=null;
+
+  S.locationWatchId=navigator.geolocation.watchPosition(
+    position=>sendFieldLocation(unitId,position),
+    error=>{
+      const message=fieldLocationErrorMessage(error);
+      if(error?.code===1){
+        if(S.locationWatchId!=null){
+          navigator.geolocation.clearWatch(S.locationWatchId);
+          S.locationWatchId=null;
+        }
+        try{localStorage.removeItem(fieldLocationPreferenceKey(S.eventId,unitId));}catch{}
+      }
+      updateFieldLocationUi({message,sharing:S.locationWatchId!=null,error:true});
+    },
+    {
+      enableHighAccuracy:true,
+      maximumAge:5000,
+      timeout:15000
+    }
+  );
+
+  try{localStorage.setItem(fieldLocationPreferenceKey(S.eventId,unitId),"1");}catch{}
+}
+
+async function stopFieldLocationSharing(unitId,{notifyServer=true}={}){
+  if(S.locationWatchId!=null && navigator.geolocation){
+    navigator.geolocation.clearWatch(S.locationWatchId);
+  }
+  S.locationWatchId=null;
+  S.locationLastSentAt=0;
+  S.locationLastSent=null;
+  S.locationWriteInFlight=false;
+
+  try{localStorage.removeItem(fieldLocationPreferenceKey(S.eventId,unitId));}catch{}
+
+  if(notifyServer&&unitId){
+    const {error}=await supabase.rpc("field_stop_unit_location",{p_unit_id:unitId});
+    if(error)console.warn("Could not clear field unit location",error);
+  }
+
+  updateFieldLocationUi({message:"Location sharing is off.",sharing:false});
+}
+
+function bindFieldLocationControls(fs,mapLayers,zones){
+  document.querySelector("#startLocationSharing")?.addEventListener("click",()=>startFieldLocationSharing(fs.unit_id));
+  document.querySelector("#stopLocationSharing")?.addEventListener("click",()=>stopFieldLocationSharing(fs.unit_id,{notifyServer:true}));
+
+  const layerSelect=document.querySelector("#fieldVenueLayer");
+  const zoneSelect=document.querySelector("#fieldVenueZone");
+
+  if(layerSelect&&zoneSelect){
+    layerSelect.onchange=()=>{
+      const layerId=layerSelect.value;
+      zoneSelect.innerHTML=`<option value="">No zone</option>${zones.filter(z=>z.map_layer_id===layerId).map(z=>`<option value="${z.id}">${esc(z.name)}</option>`).join("")}`;
+    };
+
+    document.querySelector("#saveFieldVenueLocation").onclick=async()=>{
+      const layerId=layerSelect.value||null;
+      const zoneId=zoneSelect.value||null;
+      const {error}=await supabase.rpc("field_set_unit_venue_location",{
+        p_unit_id:fs.unit_id,
+        p_map_layer_id:layerId,
+        p_zone_id:zoneId
+      });
+      if(error)return alert(error.message);
+
+      fs.units.current_map_layer_id=layerId;
+      fs.units.current_zone_id=zoneId;
+      updateFieldLocationUi({
+        message:layerId?`Venue level updated to ${mapLayers.find(l=>l.id===layerId)?.name||"selected level"}.`:"Venue level set to default / unknown.",
+        sharing:S.locationWatchId!=null
+      });
+    };
+  }
+
+  // If this device was sharing before a field-page rerender, the existing
+  // watcher remains active. Browser refreshes are different: the page must
+  // reacquire geolocation and the browser remains in control of permission.
+  if(S.locationWatchId!=null){
+    updateFieldLocationUi({message:"Location sharing is active while this page remains visible.",sharing:true});
+  }
+}
+
 function updateFieldUnitStatusUI(status){
   const badge=document.querySelector("[data-field-unit-status]");
   if(badge){
@@ -1633,6 +2012,7 @@ async function showFieldMap(incident){
 }
 
 async function leaveField(){
+  if(S.fieldSession?.unit_id)await stopFieldLocationSharing(S.fieldSession.unit_id,{notifyServer:true});
   if(S.fieldSession?.id)await supabase.rpc("field_end_session",{p_field_session_id:S.fieldSession.id});
   await supabase.auth.signOut();S.mode=null;reset();clearNavigationState();route();
 }
@@ -1653,6 +2033,9 @@ function subscribeDispatch(){
     // Assignment/unassignment changes the call/unit relationship and needs a
     // structural refresh. Ordinary crew status changes do NOT touch this table.
     .on("postgres_changes",{event:"*",schema:"public",table:"incident_units"},()=>dispatchPage())
+    // GPS changes update only the unit's map marker/readout. They never rebuild
+    // the dispatch console or wipe a call form in progress.
+    .on("postgres_changes",{event:"*",schema:"public",table:"unit_locations"},payload=>updateDispatcherUnitLocation(payload))
     .subscribe();
   S.realtime.push(ch);
 }
@@ -1678,8 +2061,20 @@ function subscribeField(unitId){
 }
 function cleanupRealtime(){
   S.realtime.forEach(ch=>supabase.removeChannel(ch));S.realtime=[];
+  S.unitLocationMarkers.clear();
   if(S.map){try{S.map.remove()}catch{}}S.map=null;
 }
-function reset(){S.orgId=null;S.eventId=null;S.event=null;S.fieldSession=null;S.activeMapLayerId=null;}
+function reset(){
+  if(S.locationWatchId!=null&&navigator.geolocation){
+    navigator.geolocation.clearWatch(S.locationWatchId);
+  }
+  S.locationWatchId=null;
+  S.locationLastSentAt=0;
+  S.locationLastSent=null;
+  S.locationWriteInFlight=false;
+  S.unitLocations=[];
+  S.unitLocationMarkers.clear();
+  S.orgId=null;S.eventId=null;S.event=null;S.fieldSession=null;S.activeMapLayerId=null;
+}
 
 init();
