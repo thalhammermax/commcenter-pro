@@ -86,15 +86,53 @@ function selectedDepartmentStatuses(name){
   return [...document.querySelectorAll(`input[name="${name}"]:checked`)].map(el=>el.value);
 }
 
+const NAV_STATE_KEY="commcenter-pro-navigation-v1";
+
+function saveNavigationState(){
+  try{
+    localStorage.setItem(NAV_STATE_KEY,JSON.stringify({
+      mode:S.mode,
+      orgId:S.orgId,
+      eventId:S.eventId,
+      activeMapLayerId:S.activeMapLayerId
+    }));
+  }catch{}
+}
+
+function restoreNavigationState(){
+  try{
+    const raw=localStorage.getItem(NAV_STATE_KEY);
+    if(!raw)return;
+    const saved=JSON.parse(raw);
+    S.mode=saved.mode||null;
+    S.orgId=saved.orgId||null;
+    S.eventId=saved.eventId||null;
+    S.activeMapLayerId=saved.activeMapLayerId||null;
+  }catch{}
+}
+
+function clearNavigationState(){
+  try{localStorage.removeItem(NAV_STATE_KEY);}catch{}
+}
+
 async function init(){
   if("serviceWorker"in navigator)navigator.serviceWorker.register("/service-worker.js").catch(console.warn);
   const {data:{session}}=await supabase.auth.getSession();S.session=session;
-  supabase.auth.onAuthStateChange((_event,session)=>{S.session=session;});
+  restoreNavigationState();
+  supabase.auth.onAuthStateChange((_event,session)=>{
+    S.session=session;
+    if(!session){
+      S.mode=null;
+      reset();
+      clearNavigationState();
+    }
+  });
   route();
 }
 
 async function route(){
   cleanupRealtime();
+  saveNavigationState();
   if(!S.mode)return landing();
   if(S.mode==="staff"){
     if(!S.session||S.session.user?.is_anonymous)return staffLogin();
@@ -103,7 +141,7 @@ async function route(){
   if(S.mode==="field")return fieldFlow();
   if(S.mode==="treatment")return renderTreatmentAreaFlow(app,{
     header,
-    onExit:()=>{S.mode=null;reset();route();}
+    onExit:()=>{S.mode=null;reset();clearNavigationState();route();}
   });
 }
 
@@ -156,12 +194,37 @@ async function loadStaffContext(){
 
 async function staffFlow(){
   await loadStaffContext();
+
+  // A browser refresh restores the last organization/event. If permissions
+  // changed or that organization no longer exists, gracefully fall back.
+  if(S.orgId && !S.orgs.some(o=>o.organization_id===S.orgId)){
+    S.orgId=null;
+    S.eventId=null;
+  }
+
   if(!S.orgId){
     if(S.orgs.length===1)S.orgId=S.orgs[0].organization_id;
-    else return orgPicker();
+    else{
+      saveNavigationState();
+      return orgPicker();
+    }
   }
-  const {data}=await supabase.rpc("staff_events_for_org",{p_organization_id:S.orgId});
+
+  const {data,error}=await supabase.rpc("staff_events_for_org",{p_organization_id:S.orgId});
+  if(error){
+    console.error("Could not restore event list",error);
+    S.eventId=null;
+    saveNavigationState();
+    return eventPicker();
+  }
+
   S.events=data||[];
+
+  if(S.eventId && !S.events.some(e=>e.id===S.eventId)){
+    S.eventId=null;
+  }
+
+  saveNavigationState();
   if(!S.eventId)return eventPicker();
   return dispatchPage();
 }
@@ -174,8 +237,8 @@ function orgPicker(){
     </button>`).join("")||`<div class="card">No organization membership found.</div>`}
     <button class="btn secondary" id="orgLogout">Sign out</button>
   </div></div>`;
-  document.querySelectorAll("[data-org]").forEach(b=>b.onclick=()=>{S.orgId=b.dataset.org;staffFlow();});
-  document.querySelector("#orgLogout").onclick=async()=>{await supabase.auth.signOut();S.mode=null;reset();route();};
+  document.querySelectorAll("[data-org]").forEach(b=>b.onclick=()=>{S.orgId=b.dataset.org;S.eventId=null;saveNavigationState();staffFlow();});
+  document.querySelector("#orgLogout").onclick=async()=>{await supabase.auth.signOut();S.mode=null;reset();clearNavigationState();route();};
   if(S.isPlatformAdmin)document.querySelector("#createOrgBtn").onclick=()=>createOrganizationForm();
 }
 
@@ -208,11 +271,11 @@ function eventPicker(){
         <strong>${esc(e.name)}</strong><br><span class="muted">${esc(e.event_code)} · ${esc(e.staff_role)}</span>
       </button>`).join("")||`<div class="card">No events yet.</div>`}
     </div></div>`;
-  document.querySelector("#logout").onclick=async()=>{await supabase.auth.signOut();S.mode=null;reset();route();};
-  document.querySelector("#changeOrg").onclick=()=>{S.orgId=null;S.eventId=null;orgPicker();};
+  document.querySelector("#logout").onclick=async()=>{await supabase.auth.signOut();S.mode=null;reset();clearNavigationState();route();};
+  document.querySelector("#changeOrg").onclick=()=>{S.orgId=null;S.eventId=null;saveNavigationState();orgPicker();};
   document.querySelector("#orgSettings").onclick=()=>organizationStaffPage();
   document.querySelector("#newEvent").onclick=()=>newEventForm();
-  document.querySelectorAll("[data-event]").forEach(b=>b.onclick=()=>{S.eventId=b.dataset.event;dispatchPage();});
+  document.querySelectorAll("[data-event]").forEach(b=>b.onclick=()=>{S.eventId=b.dataset.event;saveNavigationState();dispatchPage();});
 }
 
 function organizationStaffPage(){
@@ -262,6 +325,7 @@ function newEventForm(){
     });
     if(error)return document.querySelector("#eventErr").textContent=error.message;
     S.eventId=data;
+    saveNavigationState();
     await eventAdmin();
   };
 }
@@ -380,6 +444,10 @@ async function storageSigned(path,seconds=3600){
 /* ---------------- DISPATCH ---------------- */
 
 async function dispatchPage(){
+  // The dispatcher route is durable across browser refreshes.
+  S.mode="staff";
+  saveNavigationState();
+
   // Prevent detached Leaflet maps and duplicate realtime subscriptions from
   // accumulating every time the CAD refreshes.
   cleanupRealtime();
@@ -422,7 +490,7 @@ async function dispatchPage(){
   document.querySelector("#adminBtn").onclick=()=>eventAdmin();
   document.querySelector("#reportsBtn").onclick=()=>reportsPage();
   document.querySelector("#eventsBtn").onclick=()=>{S.eventId=null;staffFlow();};
-  document.querySelector("#logoutBtn").onclick=async()=>{await supabase.auth.signOut();S.mode=null;reset();route();};
+  document.querySelector("#logoutBtn").onclick=async()=>{await supabase.auth.signOut();S.mode=null;reset();clearNavigationState();route();};
   document.querySelector("#newIncident").onclick=()=>incidentForm(null);
   document.querySelector("#dispatchLayerSelect")?.addEventListener("change",e=>{S.activeMapLayerId=e.target.value;setupDispatchMap();});
   bindIncidentClicks();
@@ -467,7 +535,7 @@ function unitList(){
       return `<button class="unit unit-button" data-unit-detail="${u.id}">
         <div class="row">
           <strong>${esc(u.name)}</strong>
-          <span class="badge status-${esc(u.status)}">${esc(u.status.replaceAll("_"," "))}</span>
+          <span class="badge status-${esc(u.status)}" data-dispatch-unit-status="${u.id}">${esc(u.status.replaceAll("_"," "))}</span>
         </div>
         <div class="small muted">${active?`Assigned: ${esc(active.incident.incident_number)} · ${esc(active.incident.call_type)}`:"Unassigned"}</div>
       </button>`;
@@ -486,6 +554,32 @@ function unitStatusOptions(unit){
   return [...new Set(["ASSIGNED",...raw])];
 }
 
+function updateDispatcherUnitStatusUI(unitId,status){
+  const unit=S.units.find(u=>u.id===unitId);
+  if(unit)unit.status=status;
+
+  document.querySelectorAll(`[data-dispatch-unit-status="${unitId}"]`).forEach(badge=>{
+    [...badge.classList].filter(c=>c.startsWith("status-")).forEach(c=>badge.classList.remove(c));
+    badge.classList.add(`status-${status}`);
+    badge.textContent=String(status||"").replaceAll("_"," ");
+  });
+
+  document.querySelectorAll(`[data-create-unit-status="${unitId}"]`).forEach(el=>{
+    const active=activeAssignmentForUnit(unitId);
+    el.textContent=`${String(status||"").replaceAll("_"," ")}${active?` · ${active.incident.incident_number}`:""}`;
+  });
+
+  document.querySelectorAll(`[data-status-unit="${unitId}"]`).forEach(select=>{
+    if([...select.options].some(o=>o.value===status))select.value=status;
+  });
+
+  const openUnit=document.querySelector(`[data-unit-detail-id="${unitId}"]`);
+  if(openUnit){
+    const select=document.querySelector("#unitStatus");
+    if(select && [...select.options].some(o=>o.value===status))select.value=status;
+  }
+}
+
 async function dispatcherSetUnitStatus(unitId,status,incidentId=null){
   const {error}=await supabase.rpc("staff_set_unit_status",{
     p_unit_id:unitId,
@@ -493,7 +587,7 @@ async function dispatcherSetUnitStatus(unitId,status,incidentId=null){
     p_incident_id:incidentId
   });
   if(error)return alert(error.message);
-  await dispatchPage();
+  updateDispatcherUnitStatusUI(unitId,status);
 }
 
 async function dispatcherUnassign(incidentId,unitId){
@@ -539,7 +633,7 @@ function selectIncident(id){
         return `<div class="assignment-unit-row">
           <div>
             <strong>${esc(u.event_departments?.short_name||"")} · ${esc(u.name)}</strong><br>
-            <span class="badge status-${esc(u.status)}">${esc(u.status.replaceAll("_"," "))}</span>
+            <span class="badge status-${esc(u.status)}" data-dispatch-unit-status="${u.id}">${esc(u.status.replaceAll("_"," "))}</span>
           </div>
           <div class="assignment-unit-actions">
             <select data-status-unit="${u.id}">
@@ -584,6 +678,7 @@ function selectIncident(id){
 
   if(i.map_layer_id && i.map_layer_id!==S.activeMapLayerId){
     S.activeMapLayerId=i.map_layer_id;
+    saveNavigationState();
     setupDispatchMap().then(()=>{
       const l=activeMapLayer();if(S.map&&l&&i.map_x!=null&&i.map_y!=null)S.map.setView(pixelToLeaflet(i.map_x,i.map_y,l.image_height),Math.max(S.map.getZoom(),0));
     });
@@ -595,10 +690,10 @@ function selectUnit(unitId){
   const u=S.units.find(x=>x.id===unitId);if(!u)return;
   const active=activeAssignmentForUnit(unitId);
 
-  document.querySelector("#detail").innerHTML=`<div class="card stack">
+  document.querySelector("#detail").innerHTML=`<div class="card stack" data-unit-detail-id="${u.id}">
     <div class="row">
       <div><div class="section-title">${esc(u.event_departments?.name||"Unit")}</div><div class="big" style="font-size:20px">${esc(u.name)}</div></div>
-      <span class="badge status-${esc(u.status)}">${esc(u.status.replaceAll("_"," "))}</span>
+      <span class="badge status-${esc(u.status)}" data-dispatch-unit-status="${u.id}">${esc(u.status.replaceAll("_"," "))}</span>
     </div>
 
     ${active?`<div class="notice">
@@ -703,7 +798,7 @@ function incidentForm(loc){
           return `<label class="create-unit-option ${active?"disabled":""}">
             <input type="checkbox" name="initialUnit" value="${u.id}" ${active?"disabled":""}>
             <span><strong>${esc(u.event_departments?.short_name||"")} · ${esc(u.name)}</strong><br>
-            <span class="small muted">${esc(u.status.replaceAll("_"," "))}${active?` · ${esc(active.incident.incident_number)}`:""}</span></span>
+            <span class="small muted" data-create-unit-status="${u.id}">${esc(u.status.replaceAll("_"," "))}${active?` · ${esc(active.incident.incident_number)}`:""}</span></span>
           </label>`;
         }).join("")||`<div class="small muted">No units configured.</div>`}
       </div>
@@ -1016,7 +1111,7 @@ async function fieldUnitPicker(){
   ]);
   app.innerHTML=`<div class="shell">${header(`${esc(event?.name||"Event")} · Select Unit`)}<div class="wrap">
     ${(deps||[]).map(d=>`<div class="section-title">${esc(d.name)}</div><div class="grid2">
-      ${(units||[]).filter(u=>u.department_id===d.id).map(u=>`<button class="choice" data-unit="${u.id}"><strong>${esc(u.name)}</strong><br><span class="badge status-${esc(u.status)}">${esc(u.status.replaceAll("_"," "))}</span></button>`).join("")}
+      ${(units||[]).filter(u=>u.department_id===d.id).map(u=>`<button class="choice" data-unit="${u.id}"><strong>${esc(u.name)}</strong><br><span class="badge status-${esc(u.status)}" data-dispatch-unit-status="${u.id}">${esc(u.status.replaceAll("_"," "))}</span></button>`).join("")}
     </div>`).join("")}
     <button class="btn secondary" id="leaveEvent" style="margin-top:18px">Leave Event</button>
   </div></div>`;
@@ -1147,15 +1242,24 @@ async function showFieldMap(incident){
 
 async function leaveField(){
   if(S.fieldSession?.id)await supabase.rpc("field_end_session",{p_field_session_id:S.fieldSession.id});
-  await supabase.auth.signOut();S.mode=null;reset();route();
+  await supabase.auth.signOut();S.mode=null;reset();clearNavigationState();route();
 }
 
 /* ---------------- REALTIME / RESET ---------------- */
 
 function subscribeDispatch(){
-  const ch=supabase.channel(`event-${S.eventId}`)
-    .on("postgres_changes",{event:"*",schema:"public",table:"units",filter:`event_id=eq.${S.eventId}`},()=>dispatchPage())
+  const ch=supabase.channel(`event-${S.eventId}-${Date.now()}`)
+    // Unit status changes are extremely frequent. Update only the matching unit
+    // controls; never rebuild the CAD/map or destroy an incident form in progress.
+    .on("postgres_changes",{event:"UPDATE",schema:"public",table:"units",filter:`event_id=eq.${S.eventId}`},payload=>{
+      if(payload.new?.id && payload.new?.status){
+        updateDispatcherUnitStatusUI(payload.new.id,payload.new.status);
+      }
+    })
+    // A new/closed/edited incident changes the call board structurally, so reload.
     .on("postgres_changes",{event:"*",schema:"public",table:"incidents",filter:`event_id=eq.${S.eventId}`},()=>dispatchPage())
+    // Assignment/unassignment changes the call/unit relationship and needs a
+    // structural refresh. Ordinary crew status changes do NOT touch this table.
     .on("postgres_changes",{event:"*",schema:"public",table:"incident_units"},()=>dispatchPage())
     .subscribe();
   S.realtime.push(ch);
@@ -1184,6 +1288,6 @@ function cleanupRealtime(){
   S.realtime.forEach(ch=>supabase.removeChannel(ch));S.realtime=[];
   if(S.map){try{S.map.remove()}catch{}}S.map=null;
 }
-function reset(){S.orgId=null;S.eventId=null;S.event=null;S.fieldSession=null;}
+function reset(){S.orgId=null;S.eventId=null;S.event=null;S.fieldSession=null;S.activeMapLayerId=null;}
 
 init();

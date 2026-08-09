@@ -40,6 +40,15 @@ async function getIncidentMap(ids){
   return Object.fromEntries((data||[]).map(i=>[i.id,i]));
 }
 
+
+function encounterIncidentNumber(encounter,incidentMap){
+  return incidentMap[encounter?.incident_id]?.incident_number || "EMS Incident";
+}
+
+function encounterIncidentNature(encounter,incidentMap){
+  return incidentMap[encounter?.incident_id]?.call_type || "Medical";
+}
+
 /* ============================================================
    EMS COMMAND / DISPATCH BOARD
    ============================================================ */
@@ -74,7 +83,7 @@ export async function renderEmsOps(app,ctx){
       <div class="wrap stack ems-ops-wrap">
         <div class="row"><h2>EMS Operations</h2><div class="nav"><button class="btn secondary" id="emsAdmin">EMS Setup</button><button class="btn secondary" id="emsBack">Back to CAD</button></div></div>
         <div class="ems-metrics">
-          <div class="card"><div class="metric">${encounters.length}</div><div class="small muted">Active Patients</div></div>
+          <div class="card"><div class="metric">${encounters.length}</div><div class="small muted">Active EMS Incidents</div></div>
           <div class="card"><div class="metric">${fieldCount}</div><div class="small muted">With Field Teams</div></div>
           <div class="card"><div class="metric">${treatmentCount}</div><div class="small muted">In Treatment</div></div>
           <div class="card"><div class="metric">${ambulanceCount}</div><div class="small muted">With Ambulances</div></div>
@@ -99,14 +108,14 @@ export async function renderEmsOps(app,ctx){
             ${ambulances.map(u=>{
               const pts=encounters.filter(e=>e.current_unit_id===u.id);
               return `<div class="ems-resource-card"><div class="row"><strong>${esc(u.name)}</strong><span class="badge status-${esc(u.status)}">${esc(pretty(u.status))}</span></div>
-                <div class="small muted">${esc(u.ems_config?.ambulance_level||"Transport")} · ${pts.length?pts.map(p=>esc(p.tracking_number)).join(", "):"No patient"}</div></div>`;
+                <div class="small muted">${esc(u.ems_config?.ambulance_level||"Transport")} · ${pts.length?pts.map(p=>esc(encounterIncidentNumber(p,incidents))).join(", "):"No patient"}</div></div>`;
             }).join("")||`<div class="muted">No ambulances configured.</div>`}
           </section>
         </div>
 
         <section class="card">
-          <div class="row"><h3>Active Patient Tracking</h3><span class="small muted">Operational tracking only — not an ePCR</span></div>
-          <div class="table-wrap"><table><thead><tr><th>Patient ID</th><th>Incident</th><th>Status</th><th>Current Custody</th><th>Age</th><th>Note</th></tr></thead><tbody>
+          <div class="row"><h3>Active EMS Patient Flow</h3><span class="small muted">Incident number is the patient reference</span></div>
+          <div class="table-wrap"><table><thead><tr><th>Incident</th><th>Nature</th><th>Status</th><th>Current Custody</th><th>Age</th><th>Note</th></tr></thead><tbody>
             ${encounters.map(e=>`<tr>
               <td><strong>${esc(e.tracking_number)}</strong></td>
               <td>${esc(incidents[e.incident_id]?.incident_number||"Walk-in")}</td>
@@ -123,7 +132,7 @@ export async function renderEmsOps(app,ctx){
           ${pending.map(h=>{
             const e=encounters.find(x=>x.id===h.encounter_id);
             return `<div class="handoff-row">
-              <div><strong>${esc(e?.tracking_number||"Patient")}</strong><div class="small muted">Requested ${fmt(h.requested_at)}</div></div>
+              <div><strong>${esc(e?encounterIncidentNumber(e,incidents):"EMS Incident")}</strong><div class="small muted">Requested ${fmt(h.requested_at)}</div></div>
               <div>${esc(resourceName({unitId:h.from_unit_id,areaId:h.from_treatment_area_id,units,areas}))}</div>
               <div class="handoff-arrow">→</div>
               <div>${esc(resourceName({unitId:h.to_unit_id,areaId:h.to_treatment_area_id,units,areas}))}</div>
@@ -291,20 +300,44 @@ export async function loadFieldEmsState(eventId,unitId,incidentId){
 export function fieldEmsPanelHtml(state,incident){
   if(!state)return "";
   const outgoingByEncounter=Object.fromEntries(state.outgoing.map(h=>[h.encounter_id,h]));
-  return `<div class="card ems-panel">
-    <div class="row"><div><div class="section-title">EMS Patient Tracking</div><strong>${state.config.ems_role==="ambulance"?"Ambulance Patient Custody":state.config.ems_role==="field_team"?"Field Patient Custody":"EMS Command Resource"}</strong></div><span class="badge">${esc(pretty(state.config.ems_role))}</span></div>
+  const activeForIncident=incident ? state.current.find(e=>e.incident_id===incident.id) : null;
 
-    ${state.incoming.length?`<div class="notice"><strong>Incoming handoff${state.incoming.length>1?"s":""}</strong></div>${state.incoming.map(h=>{const ie=state.incomingEncounters.find(e=>e.id===h.encounter_id);const inc=state.incidentMap[ie?.incident_id];return `<div class="handoff-card"><div class="row"><strong>${esc(ie?.tracking_number||"Patient")}</strong><span class="badge">HANDOFF</span></div><div>${esc(resourceName({unitId:h.from_unit_id,areaId:h.from_treatment_area_id,units:state.units,areas:state.areas}))} → this unit</div><div class="small muted">${inc?`${esc(inc.incident_number)} · ${esc(inc.call_type)} · `:""}requested ${fmt(h.requested_at)}</div><div class="grid2" style="margin-top:8px"><button class="btn good" data-accept-handoff="${h.id}">Accept Patient</button><button class="btn secondary" data-decline-handoff="${h.id}">Decline</button></div></div>`;}).join("")}`:""}
+  return `<div class="card ems-panel">
+    <div class="row">
+      <div>
+        <div class="section-title">EMS Patient Flow</div>
+        <strong>${state.config.ems_role==="ambulance"?"Ambulance Custody":state.config.ems_role==="field_team"?"Field Handoff Operations":"EMS Command Resource"}</strong>
+      </div>
+      <span class="badge">${esc(pretty(state.config.ems_role))}</span>
+    </div>
+
+    ${state.incoming.length?`<div class="notice"><strong>Incoming handoff${state.incoming.length>1?"s":""}</strong></div>${state.incoming.map(h=>{const ie=state.incomingEncounters.find(e=>e.id===h.encounter_id);const inc=state.incidentMap[ie?.incident_id];return `<div class="handoff-card"><div class="row"><strong>${esc(inc?.incident_number||"EMS Incident")}</strong><span class="badge">HANDOFF</span></div><div>${esc(resourceName({unitId:h.from_unit_id,areaId:h.from_treatment_area_id,units:state.units,areas:state.areas}))} → this unit</div><div class="small muted">${inc?`${esc(inc.call_type)} · `:""}requested ${fmt(h.requested_at)}</div><div class="grid2" style="margin-top:8px"><button class="btn good" data-accept-handoff="${h.id}">Accept Handoff</button><button class="btn secondary" data-decline-handoff="${h.id}">Decline</button></div></div>`;}).join("")}`:""}
 
     ${state.current.map(e=>{
       const pending=outgoingByEncounter[e.id];
-      return `<div class="patient-card"><div class="row"><div><div class="big">${esc(e.tracking_number)}</div><div class="small muted">${e.incident_id?`Incident ${esc(state.incidentMap[e.incident_id]?.incident_number||"")}`:"Unlinked / walk-in"} · ${ageMinutes(e.created_at)} min</div></div><span class="badge">${esc(pretty(e.current_status))}</span></div>
+      return `<div class="patient-card"><div class="row"><div><div class="big">${esc(encounterIncidentNumber(e,state.incidentMap))}</div><div class="small muted">${esc(encounterIncidentNature(e,state.incidentMap))} · ${ageMinutes(e.created_at)} min in EMS flow</div></div><span class="badge">${esc(pretty(e.current_status))}</span></div>
         ${e.operational_note?`<p>${esc(e.operational_note)}</p>`:""}
         ${pending?`<div class="notice">Handoff pending → ${esc(resourceName({unitId:pending.to_unit_id,areaId:pending.to_treatment_area_id,units:state.units,areas:state.areas}))}<br><button class="btn secondary" data-cancel-handoff="${pending.id}" style="margin-top:6px">Cancel Handoff</button></div>`:fieldEncounterActions(e,state)}
       </div>`;
-    }).join("")||`<p class="muted">No EMS patient currently in this unit's custody.</p>`}
+    }).join("")}
 
-    ${incident&&state.config.ems_role==="field_team"?`<button class="btn block" id="createFieldEncounter">+ Create Patient Tracking Record for ${esc(incident.incident_number)}</button>`:""}
+    ${incident&&state.config.ems_role==="field_team"&&!activeForIncident?`
+      <div class="patient-card">
+        <div class="row"><div><div class="big">${esc(incident.incident_number)}</div><div class="small muted">${esc(incident.call_type)} · current incident</div></div><span class="badge">FIELD</span></div>
+        <p class="small muted">The incident number is the patient reference. Choose a destination when a handoff is needed; CommCenter Pro creates only the internal custody record required for the transfer.</p>
+        <div class="stack">
+          <div><label>Handoff to treatment area</label><div class="grid2">
+            <select id="new-ta-${incident.id}"><option value="">Choose treatment area</option>${state.areas.filter(a=>a.accepting_patients&&!["FULL","CLOSED"].includes(a.status)).map(a=>`<option value="${a.id}">${esc(a.name)} · ${a.status}</option>`).join("")}</select>
+            <button class="btn" data-new-handoff-ta="${incident.id}">Request Handoff</button>
+          </div></div>
+          <div><label>Direct handoff to ambulance</label><div class="grid2">
+            <select id="new-amb-${incident.id}"><option value="">Choose ambulance</option>${state.ambulances.map(a=>`<option value="${a.id}">${esc(a.name)} · ${esc(pretty(a.status))}</option>`).join("")}</select>
+            <button class="btn" data-new-handoff-amb="${incident.id}">Request Handoff</button>
+          </div></div>
+        </div>
+      </div>`:""}
+
+    ${!state.current.length && !(incident&&state.config.ems_role==="field_team")?`<p class="muted">No EMS incident currently in this unit's custody.</p>`:""}
   </div>`;
 }
 
@@ -317,7 +350,7 @@ function fieldEncounterActions(e,state){
     return `<div class="stack">
       <div><label>Handoff to treatment area</label><div class="grid2"><select id="ta-${e.id}"><option value="">Choose treatment area</option>${state.areas.filter(a=>a.accepting_patients&&!['FULL','CLOSED'].includes(a.status)).map(a=>`<option value="${a.id}">${esc(a.name)} · ${a.status}</option>`).join("")}</select><button class="btn" data-handoff-ta="${e.id}">Request Handoff</button></div></div>
       <div><label>Direct handoff to ambulance</label><div class="grid2"><select id="amb-${e.id}"><option value="">Choose ambulance</option>${state.ambulances.map(a=>`<option value="${a.id}">${esc(a.name)} · ${esc(pretty(a.status))}</option>`).join("")}</select><button class="btn" data-handoff-amb="${e.id}">Request Handoff</button></div></div>
-      <button class="btn secondary" data-release-encounter="${e.id}">Release / Close Patient Tracking</button>
+      <button class="btn secondary" data-release-encounter="${e.id}">Release / Close EMS Flow</button>
     </div>`;
   }
   return `<div class="muted small">This EMS command resource is not configured for patient custody actions.</div>`;
@@ -325,11 +358,38 @@ function fieldEncounterActions(e,state){
 
 export function bindFieldEmsPanel(state,{eventId,unitId,incident,refresh}){
   if(!state)return;
-  document.querySelector("#createFieldEncounter")?.addEventListener("click",async()=>{
-    const note=prompt("Optional operational note (do not enter detailed clinical information):","")||"";
-    const {data,error}=await supabase.rpc("ems_create_encounter",{p_event_id:eventId,p_incident_id:incident?.id||null,p_source_unit_id:unitId,p_source_treatment_area_id:null,p_operational_note:note});
-    if(error)return alert(error.message);
-    alert(`Patient tracking record created${data?".":""}`);await refresh();
+  const createAndRequest=async({incidentId,toUnitId=null,toTreatmentAreaId=null})=>{
+    const createResult=await supabase.rpc("ems_create_encounter",{
+      p_event_id:eventId,
+      p_incident_id:incidentId,
+      p_source_unit_id:unitId,
+      p_source_treatment_area_id:null,
+      p_operational_note:null
+    });
+    if(createResult.error)return alert(createResult.error.message);
+
+    const handoffResult=await supabase.rpc("ems_request_handoff",{
+      p_encounter_id:createResult.data,
+      p_to_unit_id:toUnitId,
+      p_to_treatment_area_id:toTreatmentAreaId,
+      p_note:null
+    });
+    if(handoffResult.error)return alert(handoffResult.error.message);
+    await refresh();
+  };
+
+  document.querySelectorAll("[data-new-handoff-ta]").forEach(b=>b.onclick=async()=>{
+    const incidentId=b.dataset.newHandoffTa;
+    const ta=document.querySelector(`#new-ta-${incidentId}`).value;
+    if(!ta)return alert("Choose a treatment area.");
+    await createAndRequest({incidentId,toTreatmentAreaId:ta});
+  });
+
+  document.querySelectorAll("[data-new-handoff-amb]").forEach(b=>b.onclick=async()=>{
+    const incidentId=b.dataset.newHandoffAmb;
+    const amb=document.querySelector(`#new-amb-${incidentId}`).value;
+    if(!amb)return alert("Choose an ambulance.");
+    await createAndRequest({incidentId,toUnitId:amb});
   });
   document.querySelectorAll("[data-handoff-ta]").forEach(b=>b.onclick=async()=>{
     const id=b.dataset.handoffTa;const ta=document.querySelector(`#ta-${id}`).value;if(!ta)return alert("Choose a treatment area.");
@@ -456,16 +516,20 @@ async function treatmentDashboard(app,ts,{header,onExit}){
 
         <div class="grid2 treatment-top-grid">
           <div class="card"><h3>Station Status</h3><div class="grid2"><select id="taStatus"><option ${area.status==="OPEN"?"selected":""}>OPEN</option><option ${area.status==="LIMITED"?"selected":""}>LIMITED</option><option ${area.status==="FULL"?"selected":""}>FULL</option><option ${area.status==="CLOSED"?"selected":""}>CLOSED</option></select><label style="font-weight:500"><input type="checkbox" id="taAccepting" ${area.accepting_patients?"checked":""}> Accepting patients</label></div><button class="btn secondary" id="saveTaStatus">Update Status</button></div>
-          <div class="card"><h3>Walk-in / Unlinked Patient</h3><p class="small muted">Creates an operational patient tracking ID without an incident.</p><input id="walkinNote" placeholder="Optional operational note"><button class="btn" id="createWalkin">+ Create Patient Tracking Record</button></div>
+          <div class="card"><h3>Walk-In Patient</h3><p class="small muted">Creates a normal CAD incident. That incident number is used as the patient reference throughout the handoff chain.</p>
+  <input id="walkinNature" value="Walk-In Medical" placeholder="Call type / nature">
+  <input id="walkinNote" placeholder="Optional operational note" style="margin-top:7px">
+  <button class="btn" id="createWalkin">+ Create Walk-In Incident</button>
+</div>
         </div>
 
-        ${incoming.length?`<section class="card incoming-section"><div class="row"><h2>Incoming Handoffs</h2><span class="badge">${incoming.length}</span></div>${incoming.map(h=>{const ie=incomingEncounters.find(e=>e.id===h.encounter_id);const inc=incidentMap[ie?.incident_id];return `<div class="incoming-handoff"><div><div class="big">${esc(ie?.tracking_number||"Incoming Patient")}</div><div>${esc(resourceName({unitId:h.from_unit_id,areaId:h.from_treatment_area_id,units,areas:[area]}))} → ${esc(area.name)}</div><div class="small muted">${inc?`${esc(inc.incident_number)} · ${esc(inc.call_type)} · `:""}requested ${fmt(h.requested_at)}</div>${h.note?`<p>${esc(h.note)}</p>`:""}</div><div class="grid2"><button class="btn good" data-ta-accept="${h.id}">Accept Handoff</button><button class="btn secondary" data-ta-decline="${h.id}">Decline</button></div></div>`;}).join("")}</section>`:""}
+        ${incoming.length?`<section class="card incoming-section"><div class="row"><h2>Incoming Handoffs</h2><span class="badge">${incoming.length}</span></div>${incoming.map(h=>{const ie=incomingEncounters.find(e=>e.id===h.encounter_id);const inc=incidentMap[ie?.incident_id];return `<div class="incoming-handoff"><div><div class="big">${esc(inc?.incident_number||"EMS Incident")}</div><div>${esc(resourceName({unitId:h.from_unit_id,areaId:h.from_treatment_area_id,units,areas:[area]}))} → ${esc(area.name)}</div><div class="small muted">${inc?`${esc(inc.incident_number)} · ${esc(inc.call_type)} · `:""}requested ${fmt(h.requested_at)}</div>${h.note?`<p>${esc(h.note)}</p>`:""}</div><div class="grid2"><button class="btn good" data-ta-accept="${h.id}">Accept Handoff</button><button class="btn secondary" data-ta-decline="${h.id}">Decline</button></div></div>`;}).join("")}</section>`:""}
 
         <section class="card"><div class="row"><h2>Patients in Treatment</h2><span class="badge">${encounters.length}</span></div>
           <div class="treatment-patient-grid">${encounters.map(e=>{
             const pending=outgoing.find(h=>h.encounter_id===e.id);
             const inc=incidentMap[e.incident_id];
-            return `<div class="treatment-patient-card"><div class="row"><div><div class="big">${esc(e.tracking_number)}</div><div class="small muted">${inc?`${esc(inc.incident_number)} · ${esc(inc.call_type)}`:"Walk-in"} · ${ageMinutes(e.created_at)} min</div></div><span class="badge">IN TREATMENT</span></div>
+            return `<div class="treatment-patient-card"><div class="row"><div><div class="big">${esc(inc?.incident_number||"EMS Incident")}</div><div class="small muted">${esc(inc?.call_type||"Medical")} · ${ageMinutes(e.created_at)} min in treatment</div></div><span class="badge">IN TREATMENT</span></div>
               ${inc?.landmark?`<div class="small">Origin: ${esc(inc.landmark)} ${inc.w3w?`· ///${esc(inc.w3w)}`:""}</div>`:""}
               ${e.operational_note?`<p>${esc(e.operational_note)}</p>`:""}
               ${pending?`<div class="notice">Awaiting ${esc(resourceName({unitId:pending.to_unit_id,areaId:pending.to_treatment_area_id,units,areas:[area]}))} acceptance<br><button class="btn secondary" data-ta-cancel="${pending.id}" style="margin-top:7px">Cancel Request</button></div>`:`<div class="stack"><div><label>Request ambulance handoff</label><div class="grid2"><select id="ta-amb-${e.id}"><option value="">Choose ambulance</option>${ambulances.map(a=>`<option value="${a.id}">${esc(a.name)} · ${esc(pretty(a.status))}</option>`).join("")}</select><button class="btn" data-ta-request-amb="${e.id}">Request Handoff</button></div></div><button class="btn secondary" data-ta-release="${e.id}">Release / Close Patient</button></div>`}
@@ -480,7 +544,17 @@ async function treatmentDashboard(app,ts,{header,onExit}){
       const {error}=await supabase.rpc("treatment_set_status",{p_treatment_area_id:area.id,p_status:document.querySelector("#taStatus").value,p_accepting:document.querySelector("#taAccepting").checked});if(error)alert(error.message);else treatmentDashboard(app,ts,{header,onExit});
     };
     document.querySelector("#createWalkin").onclick=async()=>{
-      const {error}=await supabase.rpc("ems_create_encounter",{p_event_id:ts.event_id,p_incident_id:null,p_source_unit_id:null,p_source_treatment_area_id:area.id,p_operational_note:document.querySelector("#walkinNote").value.trim()});if(error)alert(error.message);else treatmentDashboard(app,ts,{header,onExit});
+      const nature=document.querySelector("#walkinNature").value.trim()||"Walk-In Medical";
+      const note=document.querySelector("#walkinNote").value.trim();
+      const {data,error}=await supabase.rpc("treatment_create_walkin_incident",{
+        p_treatment_area_id:area.id,
+        p_call_type:nature,
+        p_priority:"Standard",
+        p_notes:note
+      });
+      if(error)return alert(error.message);
+      alert(`Created ${data}.`);
+      treatmentDashboard(app,ts,{header,onExit});
     };
     document.querySelectorAll("[data-ta-accept]").forEach(b=>b.onclick=async()=>{const {error}=await supabase.rpc("ems_accept_handoff",{p_handoff_id:b.dataset.taAccept});if(error)alert(error.message);else treatmentDashboard(app,ts,{header,onExit});});
     document.querySelectorAll("[data-ta-decline]").forEach(b=>b.onclick=async()=>{const note=prompt("Optional reason for declining:","")||"";const {error}=await supabase.rpc("ems_decline_handoff",{p_handoff_id:b.dataset.taDecline,p_note:note});if(error)alert(error.message);else treatmentDashboard(app,ts,{header,onExit});});
