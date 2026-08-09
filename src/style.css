@@ -2338,3 +2338,223 @@ body.modal-open{
     gap:3px;
   }
 }
+
+
+/* ============================================================
+   v0.9.0 — ICS OPERATIONAL PERIODS / MULTI-DAY EVENTS
+   ============================================================ */
+
+.operational-period-strip{
+  display:grid;
+  gap:3px;
+  margin-bottom:9px;
+  padding:10px 11px;
+  border:1px solid #235f46;
+  border-radius:10px;
+  background:linear-gradient(180deg,#123b2b,#0c291f);
+  color:#dcfce7;
+}
+
+.operational-period-strip .section-title{
+  color:#78dba5;
+}
+
+.operational-period-missing{
+  margin-bottom:9px;
+}
+
+.operational-period-form-context{
+  margin-top:5px;
+  color:#91a9c2;
+  font-size:12px;
+}
+
+.operational-period-create-card{
+  background:#0c1928;
+  border-color:#31465f;
+  box-shadow:none;
+}
+
+.operational-period-overview{
+  border-color:#31465f;
+}
+
+.operational-period-admin-list{
+  display:grid;
+  gap:10px;
+}
+
+.operational-period-admin-card{
+  display:grid;
+  gap:12px;
+  padding:14px;
+  border:1px solid var(--cc-line);
+  border-left-width:4px;
+  border-radius:12px;
+  background:linear-gradient(180deg,#132235,#0e1b2a);
+}
+
+.operational-period-admin-card.op-active{
+  border-left-color:#22b96e;
+}
+
+.operational-period-admin-card.op-planned{
+  border-left-color:#2382ff;
+}
+
+.operational-period-admin-card.op-complete{
+  border-left-color:#64748b;
+}
+
+.operational-period-admin-card.op-cancelled{
+  border-left-color:#a94a53;
+  opacity:.8;
+}
+
+.op-admin-title{
+  justify-content:flex-start;
+  gap:8px;
+}
+
+.op-prefix{
+  margin-top:4px;
+  color:#b9cee4;
+  font-size:13px;
+  font-weight:800;
+}
+
+.op-admin-actions{
+  display:flex;
+  justify-content:flex-end;
+  align-items:center;
+  gap:7px;
+  flex-wrap:wrap;
+}
+
+.badge.op-active{
+  background:#123b2b;
+  color:#6ee7a6;
+  border-color:#21613f;
+}
+
+.badge.op-planned{
+  background:#123e5e;
+  color:#67baff;
+  border-color:#24658e;
+}
+
+.badge.op-complete{
+  background:#263445;
+  color:#b3c2d3;
+  border-color:#435469;
+}
+
+.badge.op-cancelled{
+  background:#4f2026;
+  color:#ff8b92;
+  border-color:#77333b;
+}
+
+.operational-period-stats{
+  display:grid;
+  grid-template-columns:repeat(4,minmax(0,1fr));
+  gap:8px;
+}
+
+.operational-period-stats>div{
+  display:grid;
+  gap:3px;
+  padding:8px 9px;
+  border:1px solid #26394d;
+  border-radius:8px;
+  background:#0a1725;
+}
+
+.operational-period-stats span{
+  color:var(--cc-muted);
+  font-size:11px;
+}
+
+.operational-period-stats strong{
+  overflow-wrap:anywhere;
+}
+
+.operational-period-transition{
+  padding:20px;
+}
+
+.operational-period-transition-grid{
+  display:grid;
+  grid-template-columns:repeat(2,minmax(0,1fr));
+  gap:10px;
+}
+
+.operational-period-transition-grid>div{
+  display:grid;
+  gap:4px;
+  padding:12px;
+  border:1px solid #31465f;
+  border-radius:10px;
+  background:#0b1727;
+}
+
+.operational-period-transition-grid span{
+  color:var(--cc-muted);
+  font-size:11px;
+  text-transform:uppercase;
+  letter-spacing:.04em;
+}
+
+.operational-period-transition-grid small{
+  color:#8fa2b8;
+}
+
+.operational-period-ack{
+  border-color:#315d4a;
+  background:#10261d;
+}
+
+.report-filter-grid{
+  display:grid;
+  grid-template-columns:minmax(220px,.4fr) minmax(280px,1fr);
+  gap:10px;
+}
+
+.command-display-metrics small{
+  display:block;
+  margin-top:2px;
+  color:#8fa2b8;
+  font-size:10px;
+}
+
+@media(max-width:850px){
+  .operational-period-stats{
+    grid-template-columns:repeat(2,minmax(0,1fr));
+  }
+
+  .operational-period-transition-grid,
+  .report-filter-grid{
+    grid-template-columns:1fr;
+  }
+}
+
+@media(max-width:520px){
+  .operational-period-stats{
+    grid-template-columns:1fr;
+  }
+
+  .op-admin-actions{
+    justify-content:flex-start;
+  }
+}
+
+
+#commandOpName{
+  max-width:220px;
+  font-size:16px;
+  line-height:1.15;
+  overflow-wrap:anywhere;
+}
+#commandOpPrefix{
+  font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;
+}

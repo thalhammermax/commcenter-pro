@@ -11,6 +11,7 @@ const app=document.querySelector("#app");
 const S={
   mode:null,session:null,orgs:[],orgId:null,events:[],eventId:null,event:null,
   departments:[],units:[],incidents:[],pois:[],eventMap:null,mapLayers:[],zones:[],accessPoints:[],accessNodes:[],
+  operationalPeriods:[],activeOperationalPeriod:null,
   emsUnitConfigs:[],treatmentAreas:[],activeMapLayerId:null,map:null,realtime:[],
   fieldSession:null,currentLocation:null,isPlatformAdmin:false,callTimerInterval:null,
   unitLocations:[],unitLocationMarkers:new Map(),locationAgeInterval:null,
@@ -498,7 +499,7 @@ function updateDispatchScopeUi(){
   if(button)button.textContent=`Dispatching: ${scopeLabel()}`;
 
   const walkInButton=document.querySelector("#newWalkInPatient");
-  if(walkInButton)walkInButton.classList.toggle("hidden",!dispatchHasEmsEnabled());
+  if(walkInButton)walkInButton.classList.toggle("hidden",!dispatchHasEmsEnabled()||!S.activeOperationalPeriod);
 }
 
 const NAV_STATE_KEY="commcenter-pro-navigation-v1";
@@ -819,7 +820,16 @@ async function newEventForm(preselectedVersionId=null){
       <div><label>Event name</label><input id="eventName" placeholder="Event name"></div>
       <div><label>Event ID / field code</label><input id="eventCode" placeholder="Event code"></div>
       <div><label>4-digit field PIN</label><input id="fieldPin" inputmode="numeric" maxlength="4" placeholder="••••"></div>
-      <div><label>Incident prefix</label><input id="prefix" placeholder="Event code"></div>
+
+      <div class="card operational-period-create-card">
+        <div class="section-title">Initial Operational Period</div>
+        <div class="small muted">Every incident number is assigned from the ACTIVE Operational Period. Additional periods can be created in Event Admin.</div>
+        <div class="grid2">
+          <div><label>Operational Period Name</label><input id="initialOperationalPeriodName" value="Operational Period 1" placeholder="Operational Period 1"></div>
+          <div><label>Incident Prefix</label><input id="prefix" placeholder="SF20260809"></div>
+        </div>
+        <div class="small muted">Example: prefix <span class="mono">SF20260809</span> creates <span class="mono">SF20260809-001</span>, <span class="mono">SF20260809-002</span>, etc.</div>
+      </div>
 
       <div>
         <label>Venue / Map Setup</label>
@@ -841,11 +851,12 @@ async function newEventForm(preselectedVersionId=null){
     const status=document.querySelector("#eventErr");
     status.textContent="Creating event…";
 
-    const {data,error}=await supabase.rpc("create_event",{
+    const {data,error}=await supabase.rpc("create_event_v2",{
       p_organization_id:S.orgId,
       p_name:document.querySelector("#eventName").value.trim(),
       p_event_code:document.querySelector("#eventCode").value.trim().toUpperCase(),
       p_pin:document.querySelector("#fieldPin").value.trim(),
+      p_operational_period_name:document.querySelector("#initialOperationalPeriodName").value.trim(),
       p_incident_prefix:document.querySelector("#prefix").value.trim().toUpperCase()
     });
 
@@ -889,6 +900,7 @@ async function loadEventOps(){
     accessPointsRes,
     accessNodesRes,
     unitLocationsRes,
+    operationalPeriodsRes,
     emsUnitConfigsRes,
     treatmentAreasRes
   ] = await Promise.all([
@@ -910,6 +922,7 @@ async function loadEventOps(){
     supabase.from("venue_access_points").select("*").eq("event_id",S.eventId).eq("active",true).order("name"),
     supabase.from("venue_access_point_nodes").select("*"),
     supabase.from("unit_locations").select("*").eq("event_id",S.eventId),
+    supabase.from("operational_periods").select("*").eq("event_id",S.eventId).order("created_at"),
     supabase.from("ems_unit_config").select("*"),
     supabase.from("ems_treatment_areas").select("*").eq("event_id",S.eventId).eq("active",true).order("name")
   ]);
@@ -926,6 +939,7 @@ async function loadEventOps(){
     accessPoints: accessPointsRes,
     accessNodes: accessNodesRes,
     unitLocations: unitLocationsRes,
+    operationalPeriods: operationalPeriodsRes,
     emsUnitConfigs: emsUnitConfigsRes,
     treatmentAreas: treatmentAreasRes
   };
@@ -979,6 +993,8 @@ async function loadEventOps(){
   S.zones=zonesRes.data||[];
   S.accessPoints=accessPointsRes.data||[];
   S.unitLocations=unitLocationsRes.data||[];
+  S.operationalPeriods=operationalPeriodsRes.data||[];
+  S.activeOperationalPeriod=S.operationalPeriods.find(op=>op.status==="ACTIVE")||null;
   S.emsUnitConfigs=emsUnitConfigsRes.data||[];
   S.treatmentAreas=treatmentAreasRes.data||[];
   const apIds=new Set(S.accessPoints.map(a=>a.id));
@@ -992,6 +1008,49 @@ async function loadEventOps(){
 function activeMapLayer(){return S.mapLayers.find(l=>l.id===S.activeMapLayerId)||null;}
 function zoneName(id){return S.zones.find(z=>z.id===id)?.name||"";}
 function layerName(id){return S.mapLayers.find(l=>l.id===id)?.name||"";}
+
+function operationalPeriodById(id){
+  return (S.operationalPeriods||[]).find(op=>op.id===id)||null;
+}
+
+function operationalPeriodName(id){
+  return operationalPeriodById(id)?.name||"";
+}
+
+function operationalPeriodNextIncident(op=S.activeOperationalPeriod){
+  if(!op)return "";
+  return `${op.incident_prefix}-${String(op.next_incident_number||1).padStart(3,"0")}`;
+}
+
+function operationalPeriodDateTime(value){
+  if(!value)return "";
+  const d=new Date(value);
+  if(Number.isNaN(d.getTime()))return "";
+  return d.toLocaleString([],{year:"numeric",month:"short",day:"numeric",hour:"numeric",minute:"2-digit"});
+}
+
+function toDateTimeLocalValue(value){
+  if(!value)return "";
+  const d=new Date(value);
+  if(Number.isNaN(d.getTime()))return "";
+  const pad=n=>String(n).padStart(2,"0");
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function dateTimeLocalToIso(value){
+  if(!value)return null;
+  const d=new Date(value);
+  return Number.isNaN(d.getTime())?null:d.toISOString();
+}
+
+function operationalPeriodStatusClass(status){
+  return ({
+    ACTIVE:"op-active",
+    PLANNED:"op-planned",
+    COMPLETE:"op-complete",
+    CANCELLED:"op-cancelled"
+  })[status]||"";
+}
 
 
 
@@ -1266,8 +1325,22 @@ async function dispatchPage(){
       style="--dispatch-calls-size:${Math.round(S.dispatchLayout.callsSize)}px;--dispatch-units-size:${Math.round(S.dispatchLayout.unitsSize)}px;--dispatch-bottom-size:${Math.round(S.dispatchLayout.bottomSize)}px"
     >
       <aside class="panel calls-panel">
-        <button class="btn block" id="newIncident">+ New Incident</button>
-        <button class="btn secondary block ${dispatchHasEmsEnabled()?"":"hidden"}" id="newWalkInPatient">+ Walk-In Patient</button>
+        <div id="dispatchOperationalPeriodStatus">
+          ${S.activeOperationalPeriod?`
+            <div class="operational-period-strip">
+              <div class="section-title">Active Operational Period</div>
+              <strong>${esc(S.activeOperationalPeriod.name)}</strong>
+              <div class="small">${esc(S.activeOperationalPeriod.incident_prefix)} · Next ${esc(operationalPeriodNextIncident())}</div>
+            </div>
+          `:`
+            <div class="notice error operational-period-missing">
+              <strong>No Active Operational Period</strong><br>
+              New incidents are disabled until an Event Admin activates an Operational Period.
+            </div>
+          `}
+        </div>
+        <button class="btn block" id="newIncident" ${S.activeOperationalPeriod?"":"disabled"}>+ New Incident</button>
+        <button class="btn secondary block ${dispatchHasEmsEnabled()&&S.activeOperationalPeriod?"":"hidden"}" id="newWalkInPatient">+ Walk-In Patient</button>
         <button class="btn secondary block dispatch-scope-button" id="dispatchScopeBtn">Dispatching: ${esc(scopeLabel())}</button>
         <div class="section-title">Active incidents</div><div id="incidentList">${incidentList()}</div>
       </aside>
@@ -1298,6 +1371,10 @@ async function dispatchPage(){
           <strong>Layout</strong>
           <span>${esc(dispatchLayoutModeLabel(S.dispatchLayout.mode))}</span>
         </button>
+        <button class="topbar-menu-item" id="operationalPeriodsBtn">
+          <strong>Operational Periods</strong>
+          <span>${S.activeOperationalPeriod?`${esc(S.activeOperationalPeriod.name)} · ${esc(S.activeOperationalPeriod.incident_prefix)}`:"No active Operational Period"}</span>
+        </button>
         <button class="topbar-menu-item" id="emsOpsBtn">
           <strong>EMS Operations</strong>
           <span>Patient flow and treatment resources</span>
@@ -1327,13 +1404,20 @@ async function dispatchPage(){
   document.querySelector("#poiFinderBtn").onclick=()=>showPoiFinder();
   document.querySelector("#commandDisplayBtn").onclick=()=>commandDisplayPage();
   document.querySelector("#layoutButton").onclick=()=>{closeDispatchMenu();renderDispatchLayoutModal();};
+  document.querySelector("#operationalPeriodsBtn").onclick=()=>{closeDispatchMenu();eventAdmin("periods");};
   document.querySelector("#emsOpsBtn").onclick=()=>{closeDispatchMenu();renderEmsOps(app,{eventId:S.eventId,event:S.event,header,onBack:()=>dispatchPage(),onAdmin:()=>eventAdmin("ems")});};
   document.querySelector("#adminBtn").onclick=()=>{closeDispatchMenu();eventAdmin();};
   document.querySelector("#reportsBtn").onclick=()=>{closeDispatchMenu();reportsPage();};
   document.querySelector("#eventsBtn").onclick=()=>{closeDispatchMenu();closeIncidentModal();S.eventId=null;staffFlow();};
   document.querySelector("#logoutBtn").onclick=async()=>{closeDispatchMenu();closeIncidentModal();await supabase.auth.signOut();S.mode=null;reset();clearNavigationState();route();};
-  document.querySelector("#newIncident").onclick=()=>incidentForm(null);
-  document.querySelector("#newWalkInPatient").onclick=()=>treatmentWalkInForm();
+  document.querySelector("#newIncident").onclick=()=>{
+    if(!S.activeOperationalPeriod)return alert("No Operational Period is active. Event Admin must activate one before creating a call.");
+    incidentForm(null);
+  };
+  document.querySelector("#newWalkInPatient").onclick=()=>{
+    if(!S.activeOperationalPeriod)return alert("No Operational Period is active. Event Admin must activate one before creating a walk-in patient.");
+    treatmentWalkInForm();
+  };
   document.querySelector("#dispatchScopeBtn").onclick=()=>renderDispatchScopeModal();
   document.querySelector("#dispatchLayerSelect")?.addEventListener("change",e=>{S.activeMapLayerId=e.target.value;saveNavigationState();setupDispatchMap();});
   bindIncidentClicks();
@@ -1515,7 +1599,7 @@ function incidentList(){
     return `<div class="incident" data-incident="${i.id}">
       <div class="row"><strong>${esc(i.incident_number)}</strong><span class="incident-head-meta"><span class="call-timer" title="Elapsed call time" data-call-start="${esc(i.created_at)}">00:00</span><span class="badge">${esc(i.priority)}</span></span></div>
       <div>${esc(i.call_type)}</div>
-      <div class="small muted">${esc(deps)} · ${esc(layerName(i.map_layer_id))}${i.zone_id?` / ${esc(zoneName(i.zone_id))}`:""} · ${esc(i.landmark||"Mapped")}</div>
+      <div class="small muted">${i.operational_period_id?`${esc(operationalPeriodName(i.operational_period_id)||"Operational Period")} · `:""}${esc(deps)} · ${esc(layerName(i.map_layer_id))}${i.zone_id?` / ${esc(zoneName(i.zone_id))}`:""} · ${esc(i.landmark||"Mapped")}</div>
       ${assigned.length?`<div class="small" style="margin-top:5px"><strong>${esc(assigned.join(", "))}</strong></div>`:""}
     </div>`;
   }).join("")||`<div class="small muted">No active incidents.</div>`;
@@ -1699,6 +1783,11 @@ function activityTitle(action){
     EMS_HANDOFF_CANCELLED:"EMS handoff cancelled",
     EMS_HANDOFF_COMPLETED:"EMS custody transferred",
     TREATMENT_WALKIN_INCIDENT_CREATED:"Walk-in patient created",
+    OPERATIONAL_PERIOD_CREATED:"Operational Period created",
+    OPERATIONAL_PERIOD_UPDATED:"Operational Period updated",
+    OPERATIONAL_PERIOD_ACTIVATED:"Operational Period activated",
+    OPERATIONAL_PERIOD_COMPLETED:"Operational Period completed",
+    OPERATIONAL_PERIOD_CANCELLED:"Operational Period cancelled",
     EMS_TREATMENT_RECEIVED:"Treatment-area custody confirmed",
     EMS_CUSTODY_SET:"EMS custody recorded",
     UNIT_ARRIVED_TREATMENT_AREA:"Unit arrived at treatment area",
@@ -2170,6 +2259,7 @@ async function selectIncident(id){
       <section class="incident-info-section">
         <div class="section-title">Call Information</div>
         <div class="incident-summary-grid">
+          <div><span class="small muted">Operational Period</span><strong>${esc(operationalPeriodName(current.operational_period_id)||"Legacy")}</strong></div>
           <div><span class="small muted">Received</span><strong>${new Date(current.created_at).toLocaleString()}</strong></div>
           <div><span class="small muted">Elapsed</span><strong class="call-timer-text" data-call-start="${esc(current.created_at)}">00:00</strong></div>
           <div><span class="small muted">Departments</span><strong>${esc(deps.join(", ")||"None")}</strong></div>
@@ -2309,12 +2399,41 @@ async function selectIncident(id){
   }
 }
 
+function updateOperationalPeriodDispatchUi(){
+  const host=document.querySelector("#dispatchOperationalPeriodStatus");
+  if(host){
+    host.innerHTML=S.activeOperationalPeriod?`
+      <div class="operational-period-strip">
+        <div class="section-title">Active Operational Period</div>
+        <strong>${esc(S.activeOperationalPeriod.name)}</strong>
+        <div class="small">${esc(S.activeOperationalPeriod.incident_prefix)} · Next ${esc(operationalPeriodNextIncident())}</div>
+      </div>
+    `:`
+      <div class="notice error operational-period-missing">
+        <strong>No Active Operational Period</strong><br>
+        New incidents are disabled until an Event Admin activates an Operational Period.
+      </div>`;
+  }
+
+  const newIncident=document.querySelector("#newIncident");
+  if(newIncident)newIncident.disabled=!S.activeOperationalPeriod;
+
+  updateDispatchScopeUi();
+
+  const opMenuLabel=document.querySelector("#operationalPeriodsBtn span");
+  if(opMenuLabel){
+    opMenuLabel.textContent=S.activeOperationalPeriod
+      ?`${S.activeOperationalPeriod.name} · ${S.activeOperationalPeriod.incident_prefix}`
+      :"No active Operational Period";
+  }
+}
+
 function refreshDispatchBoards(){
   const incidentHost=document.querySelector("#incidentList");
   const unitHost=document.querySelector("#unitList");
   if(incidentHost)incidentHost.innerHTML=incidentList();
   if(unitHost)unitHost.innerHTML=unitList();
-  updateDispatchScopeUi();
+  updateOperationalPeriodDispatchUi();
   bindIncidentClicks();
   refreshLocationAges();
 }
@@ -2645,6 +2764,10 @@ async function setupDispatchMap(){
 
 
 function treatmentWalkInForm(){
+  if(!S.activeOperationalPeriod){
+    return alert("No Operational Period is active. Event Admin must activate one before creating a walk-in patient.");
+  }
+
   S.openIncidentId=null;
   S.openUnitId=null;
   S.incidentModalMode="walk-in";
@@ -2657,6 +2780,9 @@ function treatmentWalkInForm(){
       <div class="incident-modal-eyebrow">TREATMENT AREA WALK-IN</div>
       <div class="incident-modal-title-row"><h2 id="incidentModalTitle">Create Walk-In Patient</h2></div>
       <div class="incident-modal-nature">Creates a CAD incident with patient custody already assigned to the selected treatment area.</div>
+      <div class="operational-period-form-context">
+        ${esc(S.activeOperationalPeriod.name)} · Next <span class="mono">${esc(operationalPeriodNextIncident())}</span>
+      </div>
     </div>
     <button class="incident-modal-close" id="closeIncidentModal" aria-label="Close walk-in patient form">×</button>
   </div>
@@ -2764,6 +2890,10 @@ function treatmentWalkInForm(){
 
 
 function incidentForm(loc,draft=null){
+  if(!S.activeOperationalPeriod){
+    return alert("No Operational Period is active. Event Admin must activate one before creating a new incident.");
+  }
+
   S.openIncidentId=null;
   S.openUnitId=null;
   S.incidentModalMode="new";
@@ -2778,6 +2908,9 @@ function incidentForm(loc,draft=null){
       <div class="incident-modal-eyebrow">NEW INCIDENT</div>
       <div class="incident-modal-title-row"><h2 id="incidentModalTitle">Create Call</h2></div>
       <div class="incident-modal-nature">Dispatching for ${esc(scopeLabel())}</div>
+      <div class="operational-period-form-context">
+        ${esc(S.activeOperationalPeriod.name)} · Prefix <span class="mono">${esc(S.activeOperationalPeriod.incident_prefix)}</span> · Next <span class="mono">${esc(operationalPeriodNextIncident())}</span>
+      </div>
     </div>
     <button class="incident-modal-close" id="closeIncidentModal" aria-label="Close new incident form">×</button>
   </div>
@@ -3341,6 +3474,12 @@ async function refreshCommandDisplayStructure(){
 
   const filterHost=document.querySelector("#commandDepartmentFilters");
   if(filterHost)filterHost.innerHTML=commandDisplayDepartmentControls();
+
+  const opName=document.querySelector("#commandOpName");
+  const opPrefix=document.querySelector("#commandOpPrefix");
+  if(opName)opName.textContent=S.activeOperationalPeriod?.name||"NONE";
+  if(opPrefix)opPrefix.textContent=S.activeOperationalPeriod?.incident_prefix||"";
+
   bindCommandDisplayControls();
   renderCommandDisplayLayout();
 }
@@ -3366,6 +3505,7 @@ function updateCommandDisplayUnitLocation(payload){
 function subscribeCommandDisplay(){
   const ch=supabase.channel(`command-display-${S.eventId}-${Date.now()}`)
     .on("postgres_changes",{event:"*",schema:"public",table:"incidents",filter:`event_id=eq.${S.eventId}`},scheduleCommandDisplayRefresh)
+    .on("postgres_changes",{event:"*",schema:"public",table:"operational_periods",filter:`event_id=eq.${S.eventId}`},scheduleCommandDisplayRefresh)
     .on("postgres_changes",{event:"*",schema:"public",table:"incident_units"},scheduleCommandDisplayRefresh)
     .on("postgres_changes",{event:"UPDATE",schema:"public",table:"units",filter:`event_id=eq.${S.eventId}`},payload=>{
       const unit=S.units.find(u=>u.id===payload.new?.id);
@@ -3426,6 +3566,7 @@ async function commandDisplayPage(){
       </div>
       <div class="command-display-metrics">
         <div><span>ACTIVE CALLS</span><strong id="commandCallCount">${commandFilteredIncidents().length}</strong></div>
+        <div><span>OPERATIONAL PERIOD</span><strong id="commandOpName">${esc(S.activeOperationalPeriod?.name||"NONE")}</strong><small id="commandOpPrefix">${esc(S.activeOperationalPeriod?.incident_prefix||"")}</small></div>
         <div><span>TIME</span><strong id="commandClock"></strong></div>
       </div>
       <div class="command-display-actions">
@@ -3610,6 +3751,351 @@ async function renderArchivedResourcesModal(){
   ));
 }
 
+
+function openOperationalPeriodTransitionConfirmation({
+  period,
+  mode,
+  onComplete
+}){
+  const activating=mode==="activate";
+  const current=S.activeOperationalPeriod;
+
+  S.incidentModalMode="operational-period-transition";
+  const content=openIncidentModalShell();
+
+  const title=activating?"Activate Operational Period":"Complete Operational Period";
+  const warning=activating
+    ? `New incidents will immediately begin using ${period.incident_prefix}-###. Existing open incidents remain assigned to the Operational Period in which they were created.`
+    : "Completing the active Operational Period stops NEW incident creation until another Operational Period is activated. Existing open incidents remain open and can still be worked and closed.";
+
+  content.innerHTML=`<div class="incident-modal-header">
+    <div>
+      <div class="incident-modal-eyebrow">ICS OPERATIONAL PERIOD</div>
+      <div class="incident-modal-title-row"><h2 id="incidentModalTitle">${esc(title)}</h2></div>
+      <div class="incident-modal-nature">${esc(period.name)}</div>
+    </div>
+    <button class="incident-modal-close" id="closeIncidentModal" aria-label="Cancel">×</button>
+  </div>
+
+  <div class="operational-period-transition stack">
+    <div class="notice ${activating?"":"error"}">
+      <strong>${activating?"Incident numbering will change":"New incident creation will stop"}</strong><br>
+      ${esc(warning)}
+    </div>
+
+    <div class="operational-period-transition-grid">
+      ${activating&&current?`
+        <div>
+          <span>Current Operational Period</span>
+          <strong>${esc(current.name)}</strong>
+          <small>${esc(current.incident_prefix)} · next ${esc(operationalPeriodNextIncident(current))}</small>
+        </div>
+      `:""}
+      <div>
+        <span>${activating?"New Operational Period":"Operational Period"}</span>
+        <strong>${esc(period.name)}</strong>
+        <small>${esc(period.incident_prefix)}${activating?` · starts at ${esc(`${period.incident_prefix}-${String(period.next_incident_number||1).padStart(3,"0")}`)}`:""}</small>
+      </div>
+    </div>
+
+    <label class="destructive-ack operational-period-ack">
+      <input type="checkbox" id="opTransitionAcknowledge">
+      <span>${activating
+        ?"I understand that all NEW incidents will use this Operational Period and its incident prefix."
+        :"I understand that no NEW incidents can be created until another Operational Period is activated."}</span>
+    </label>
+
+    <div>
+      <label>Type incident prefix <span class="mono destructive-confirm-token">${esc(period.incident_prefix)}</span> to confirm</label>
+      <input id="opTransitionConfirmation" autocomplete="off" spellcheck="false">
+    </div>
+
+    <div id="opTransitionError" class="small destructive-error" role="alert" aria-live="polite"></div>
+  </div>
+
+  <div class="incident-modal-footer">
+    <button class="btn secondary" id="cancelOpTransition">Cancel</button>
+    <button class="btn ${activating?"":"danger"}" id="confirmOpTransition" disabled>${esc(title)}</button>
+  </div>`;
+
+  const ack=document.querySelector("#opTransitionAcknowledge");
+  const typed=document.querySelector("#opTransitionConfirmation");
+  const button=document.querySelector("#confirmOpTransition");
+  const errorHost=document.querySelector("#opTransitionError");
+
+  const update=()=>{
+    button.disabled=!(ack.checked&&typed.value===period.incident_prefix);
+  };
+  ack.addEventListener("change",update);
+  typed.addEventListener("input",update);
+
+  const close=()=>closeIncidentModal();
+  document.querySelector("#closeIncidentModal").onclick=close;
+  document.querySelector("#cancelOpTransition").onclick=close;
+
+  button.onclick=async()=>{
+    button.disabled=true;
+    button.textContent=activating?"Activating…":"Completing…";
+    errorHost.textContent="";
+
+    const rpc=activating
+      ?"admin_activate_operational_period"
+      :"admin_complete_operational_period";
+    const {error}=await supabase.rpc(rpc,{
+      p_operational_period_id:period.id,
+      p_confirmation:typed.value
+    });
+
+    if(error){
+      errorHost.textContent=error.message;
+      button.textContent=title;
+      update();
+      return;
+    }
+
+    closeIncidentModal();
+    await loadEventOps();
+    if(onComplete)await onComplete();
+  };
+
+  setTimeout(()=>typed.focus(),0);
+}
+
+function operationalPeriodCardHtml(op){
+  const incidentCount=S.incidents.filter(i=>i.operational_period_id===op.id).length;
+  const dateRange=[
+    operationalPeriodDateTime(op.starts_at),
+    operationalPeriodDateTime(op.ends_at)
+  ].filter(Boolean).join(" → ");
+
+  return `<div class="operational-period-admin-card ${operationalPeriodStatusClass(op.status)}">
+    <div class="row start">
+      <div>
+        <div class="row start op-admin-title">
+          <strong>${esc(op.name)}</strong>
+          <span class="badge ${operationalPeriodStatusClass(op.status)}">${esc(op.status)}</span>
+        </div>
+        <div class="mono op-prefix">${esc(op.incident_prefix)}-###</div>
+        ${dateRange?`<div class="small muted">${esc(dateRange)}</div>`:""}
+      </div>
+      <div class="op-admin-actions">
+        ${currentUserCanAdminEventUi()&&op.status==="PLANNED"?`
+          <button class="btn secondary compact" data-edit-op="${op.id}">Edit</button>
+          <button class="btn compact" data-activate-op="${op.id}">Activate</button>
+          <button class="btn danger compact" data-cancel-op="${op.id}">Remove</button>
+        `:""}
+        ${currentUserCanAdminEventUi()&&op.status==="ACTIVE"?`
+          <button class="btn danger compact" data-complete-op="${op.id}">Complete Period</button>
+        `:""}
+      </div>
+    </div>
+
+    <div class="operational-period-stats">
+      <div><span>Next Incident</span><strong>${esc(`${op.incident_prefix}-${String(op.next_incident_number||1).padStart(3,"0")}`)}</strong></div>
+      <div><span>Open Calls in Period</span><strong>${incidentCount}</strong></div>
+      <div><span>Activated</span><strong>${esc(operationalPeriodDateTime(op.activated_at)||"—")}</strong></div>
+      <div><span>Completed</span><strong>${esc(operationalPeriodDateTime(op.completed_at)||"—")}</strong></div>
+    </div>
+  </div>`;
+}
+
+function renderOperationalPeriodsAdmin(editId=null){
+  const host=document.querySelector("#adminContent");
+  if(!host)return;
+
+  const periods=[...(S.operationalPeriods||[])].sort((a,b)=>{
+    const rank={ACTIVE:0,PLANNED:1,COMPLETE:2,CANCELLED:3};
+    const statusDiff=(rank[a.status]??9)-(rank[b.status]??9);
+    if(statusDiff)return statusDiff;
+    return new Date(a.starts_at||a.created_at).getTime()-new Date(b.starts_at||b.created_at).getTime();
+  });
+
+  const editing=periods.find(op=>op.id===editId&&op.status==="PLANNED")||null;
+
+  host.innerHTML=`<div class="stack">
+    <div class="card operational-period-overview">
+      <div class="row">
+        <div>
+          <h2>Operational Periods</h2>
+          <p class="muted">CommCenter Pro uses the ICS Operational Period as the incident-numbering boundary for multi-day events.</p>
+        </div>
+        ${S.activeOperationalPeriod
+          ?`<span class="badge op-active">ACTIVE · ${esc(S.activeOperationalPeriod.incident_prefix)}</span>`
+          :`<span class="badge status-OUT_OF_SERVICE">NO ACTIVE PERIOD</span>`}
+      </div>
+
+      ${S.activeOperationalPeriod?`
+        <div class="notice ok">
+          <strong>${esc(S.activeOperationalPeriod.name)}</strong><br>
+          New incidents currently use <span class="mono">${esc(S.activeOperationalPeriod.incident_prefix)}-###</span>.
+          Next incident: <strong class="mono">${esc(operationalPeriodNextIncident())}</strong>
+        </div>
+      `:`
+        <div class="notice error">
+          <strong>New incident creation is disabled.</strong><br>
+          Activate a PLANNED Operational Period before Dispatch or a Treatment Area creates another incident.
+        </div>
+      `}
+
+      <div class="small muted">Start/end timestamps are planning information only. CommCenter does not automatically change Operational Periods based on the clock; activation is always deliberate.</div>
+    </div>
+
+    <div class="operational-period-admin-list">
+      ${periods.filter(op=>op.status!=="CANCELLED").map(operationalPeriodCardHtml).join("")||`<div class="card muted">No Operational Periods configured.</div>`}
+    </div>
+
+    ${currentUserCanAdminEventUi()?`<div class="card">
+      <div class="row">
+        <div>
+          <div class="section-title">${editing?"Edit Planned Operational Period":"Plan Next Operational Period"}</div>
+          <h2>${editing?esc(editing.name):"Add Operational Period"}</h2>
+        </div>
+        ${editing?`<button class="btn secondary compact" id="cancelOpEdit">Cancel Edit</button>`:""}
+      </div>
+
+      <div class="grid2">
+        <div>
+          <label>Operational Period Name</label>
+          <input id="opName" value="${esc(editing?.name||"")}" placeholder="Operational Period 2">
+        </div>
+        <div>
+          <label>Incident Prefix</label>
+          <input id="opPrefix" value="${esc(editing?.incident_prefix||"")}" placeholder="SF20260810">
+        </div>
+        <div>
+          <label>Planned Start</label>
+          <input id="opStartsAt" type="datetime-local" value="${esc(toDateTimeLocalValue(editing?.starts_at))}">
+        </div>
+        <div>
+          <label>Planned End</label>
+          <input id="opEndsAt" type="datetime-local" value="${esc(toDateTimeLocalValue(editing?.ends_at))}">
+        </div>
+      </div>
+
+      <div class="notice">
+        Prefix example: <span class="mono">SF20260809</span> creates
+        <span class="mono">SF20260809-001</span>,
+        <span class="mono">SF20260809-002</span>, and so on.
+        Each Operational Period starts its own sequence at 001.
+      </div>
+
+      <button class="btn" id="saveOperationalPeriod">${editing?"Save Planned Period":"Add Planned Operational Period"}</button>
+      <div id="opAdminMessage" class="small muted"></div>
+    </div>`:`
+      <div class="card">
+        <div class="notice">Operational Period changes require Event Admin access. You can view the current and planned periods here.</div>
+      </div>
+    `}
+
+    ${periods.some(op=>op.status==="CANCELLED")?`
+      <details class="card">
+        <summary><strong>Cancelled Operational Periods</strong></summary>
+        <div class="stack" style="margin-top:10px">
+          ${periods.filter(op=>op.status==="CANCELLED").map(op=>`
+            <div class="archived-resource-row">
+              <div><strong>${esc(op.name)}</strong><div class="small muted">${esc(op.incident_prefix)}</div></div>
+              <span class="badge op-cancelled">CANCELLED</span>
+            </div>
+          `).join("")}
+        </div>
+      </details>
+    `:""}
+  </div>`;
+
+  document.querySelector("#cancelOpEdit")?.addEventListener("click",()=>renderOperationalPeriodsAdmin());
+
+  document.querySelector("#saveOperationalPeriod")?.addEventListener("click",async()=>{
+    const name=document.querySelector("#opName").value.trim();
+    const prefix=document.querySelector("#opPrefix").value.trim().toUpperCase();
+    const startsAt=dateTimeLocalToIso(document.querySelector("#opStartsAt").value);
+    const endsAt=dateTimeLocalToIso(document.querySelector("#opEndsAt").value);
+    const message=document.querySelector("#opAdminMessage");
+
+    if(!name)return alert("Enter an Operational Period name.");
+    if(!prefix)return alert("Enter an incident prefix.");
+    if(/\s/.test(prefix))return alert("Incident prefix cannot contain spaces.");
+    if(startsAt&&endsAt&&new Date(endsAt)<=new Date(startsAt))return alert("Operational Period end must be after its start.");
+
+    const button=document.querySelector("#saveOperationalPeriod");
+    button.disabled=true;
+    button.textContent=editing?"Saving…":"Adding…";
+
+    const result=editing
+      ?await supabase.rpc("admin_update_operational_period",{
+          p_operational_period_id:editing.id,
+          p_name:name,
+          p_incident_prefix:prefix,
+          p_starts_at:startsAt,
+          p_ends_at:endsAt
+        })
+      :await supabase.rpc("admin_create_operational_period",{
+          p_event_id:S.eventId,
+          p_name:name,
+          p_incident_prefix:prefix,
+          p_starts_at:startsAt,
+          p_ends_at:endsAt
+        });
+
+    if(result.error){
+      button.disabled=false;
+      button.textContent=editing?"Save Planned Period":"Add Planned Operational Period";
+      message.textContent=result.error.message;
+      return;
+    }
+
+    await loadEventOps();
+    renderOperationalPeriodsAdmin();
+  });
+
+  document.querySelectorAll("[data-edit-op]").forEach(button=>{
+    button.onclick=()=>renderOperationalPeriodsAdmin(button.dataset.editOp);
+  });
+
+  document.querySelectorAll("[data-activate-op]").forEach(button=>{
+    const period=periods.find(op=>op.id===button.dataset.activateOp);
+    button.onclick=()=>openOperationalPeriodTransitionConfirmation({
+      period,
+      mode:"activate",
+      onComplete:()=>renderOperationalPeriodsAdmin()
+    });
+  });
+
+  document.querySelectorAll("[data-complete-op]").forEach(button=>{
+    const period=periods.find(op=>op.id===button.dataset.completeOp);
+    button.onclick=()=>openOperationalPeriodTransitionConfirmation({
+      period,
+      mode:"complete",
+      onComplete:()=>renderOperationalPeriodsAdmin()
+    });
+  });
+
+  document.querySelectorAll("[data-cancel-op]").forEach(button=>{
+    const period=periods.find(op=>op.id===button.dataset.cancelOp);
+    button.onclick=()=>openDestructiveConfirmation({
+      eyebrow:"EVENT ADMIN · OPERATIONAL PERIOD",
+      title:"Remove Planned Operational Period",
+      objectLabel:period.name,
+      confirmationText:period.name,
+      warning:"This PLANNED Operational Period will be cancelled. It cannot contain incidents. Existing event and incident history are unaffected.",
+      details:[
+        {label:"Incident Prefix",value:period.incident_prefix},
+        {label:"Status",value:period.status},
+        {label:"Incidents",value:"0 required"}
+      ],
+      confirmLabel:"Remove Planned Period",
+      onConfirm:async confirmation=>{
+        const {error}=await supabase.rpc("admin_cancel_operational_period",{
+          p_operational_period_id:period.id,
+          p_confirmation:confirmation
+        });
+        if(error)throw error;
+        await loadEventOps();
+        renderOperationalPeriodsAdmin();
+      }
+    });
+  });
+}
+
 async function eventAdmin(initialTab="setup"){
   closeIncidentModal();
   await loadEventOps();
@@ -3617,6 +4103,7 @@ async function eventAdmin(initialTab="setup"){
     <div class="admin-layout">
       <aside class="admin-menu">
         <button class="${initialTab==="setup"?"active":""}" id="setupTab">Setup</button>
+        <button class="${initialTab==="periods"?"active":""}" id="periodsTab">Operational Periods</button>
         <button class="${initialTab==="ems"?"active":""}" id="emsTab">EMS Setup</button>
         <button id="mapTab">Map Builder</button>
         <button id="backDispatch">Back to CAD</button>
@@ -3646,8 +4133,12 @@ async function eventAdmin(initialTab="setup"){
   };
   document.querySelector("#mapTab").onclick=()=>renderMapBuilder(app,S.eventId,()=>eventAdmin());
   document.querySelector("#setupTab").onclick=()=>{markAdminTab("setupTab");renderEventSetup();};
+  document.querySelector("#periodsTab").onclick=()=>{markAdminTab("periodsTab");renderOperationalPeriodsAdmin();};
   document.querySelector("#emsTab").onclick=showEmsAdmin;
-  if(initialTab==="ems")showEmsAdmin();else renderEventSetup();
+
+  if(initialTab==="ems")showEmsAdmin();
+  else if(initialTab==="periods")renderOperationalPeriodsAdmin();
+  else renderEventSetup();
 }
 
 function renderEventSetup(){
@@ -4142,6 +4633,7 @@ function reportIncidentRecordModal(row,activityRows,statusRows){
       <div class="incident-info-section">
         <div class="section-title">Call Record</div>
         <div class="report-kv-grid">
+          <span>Operational Period</span><strong>${esc(row.operational_period_name||"Legacy")}${row.operational_period_prefix?` · ${esc(row.operational_period_prefix)}`:""}</strong>
           <span>Received</span><strong>${esc(reportDateTime(row.received_time))}</strong>
           <span>Closed</span><strong>${esc(reportDateTime(row.closed_at)||"Open")}</strong>
           <span>Duration</span><strong>${esc(reportDuration(row.total_duration_seconds))}</strong>
@@ -4244,24 +4736,36 @@ function reportIncidentRecordModal(row,activityRows,statusRows){
 async function reportsPage(){
   closeIncidentModal();
 
-  const [summaryRes,activityRes,statusRes]=await Promise.all([
+  const [summaryRes,activityRes,statusRes,incidentPeriodRes,periodRes]=await Promise.all([
     supabase.from("dispatch_log").select("*").eq("event_id",S.eventId).order("received_time"),
     supabase.from("dispatch_activity_log").select("*").eq("event_id",S.eventId).order("activity_time"),
-    supabase.from("dispatch_unit_status_log").select("*").eq("event_id",S.eventId).order("server_time")
+    supabase.from("dispatch_unit_status_log").select("*").eq("event_id",S.eventId).order("server_time"),
+    supabase.from("incidents").select("id,operational_period_id").eq("event_id",S.eventId),
+    supabase.from("operational_periods").select("*").eq("event_id",S.eventId).order("created_at")
   ]);
 
-  if(summaryRes.error)return alert(summaryRes.error.message);
-  if(activityRes.error)return alert(activityRes.error.message);
-  if(statusRes.error)return alert(statusRes.error.message);
+  for(const result of [summaryRes,activityRes,statusRes,incidentPeriodRes,periodRes]){
+    if(result.error)return alert(result.error.message);
+  }
 
-  const rows=summaryRes.data||[];
-  const activities=activityRes.data||[];
-  const statuses=statusRes.data||[];
+  const reportPeriods=periodRes.data||[];
+  const periodById=new Map(reportPeriods.map(op=>[op.id,op]));
+  const incidentPeriodById=new Map((incidentPeriodRes.data||[]).map(i=>[i.id,i.operational_period_id||null]));
 
-  const closed=rows.filter(r=>r.incident_status==="CLOSED").length;
-  const open=rows.length-closed;
-  const transports=rows.filter(r=>r.ems_final_disposition==="TRANSPORTED"||r.transport_started_at).length;
-  const walkins=rows.filter(r=>r.walk_in).length;
+  const withPeriod=row=>{
+    const operationalPeriodId=incidentPeriodById.get(row.incident_id)||null;
+    const op=periodById.get(operationalPeriodId)||null;
+    return {
+      ...row,
+      operational_period_id:operationalPeriodId,
+      operational_period_name:op?.name||"",
+      operational_period_prefix:op?.incident_prefix||""
+    };
+  };
+
+  const rows=(summaryRes.data||[]).map(withPeriod);
+  const activities=(activityRes.data||[]).map(withPeriod);
+  const statuses=(statusRes.data||[]).map(withPeriod);
 
   app.innerHTML=`<div class="shell">${header(`${esc(S.event?.name||"Event")} · Reports`)}
     <div class="wrap stack dispatch-report-page">
@@ -4284,11 +4788,11 @@ async function reportsPage(){
       </div>
 
       <div class="ems-metrics report-metrics">
-        <div class="card"><div class="metric">${rows.length}</div><div class="small muted">Total Incidents</div></div>
-        <div class="card"><div class="metric">${open}</div><div class="small muted">Open</div></div>
-        <div class="card"><div class="metric">${closed}</div><div class="small muted">Closed</div></div>
-        <div class="card"><div class="metric">${transports}</div><div class="small muted">EMS Transports</div></div>
-        <div class="card"><div class="metric">${walkins}</div><div class="small muted">Walk-Ins</div></div>
+        <div class="card"><div class="metric" id="reportMetricTotal">0</div><div class="small muted">Total Incidents</div></div>
+        <div class="card"><div class="metric" id="reportMetricOpen">0</div><div class="small muted">Open</div></div>
+        <div class="card"><div class="metric" id="reportMetricClosed">0</div><div class="small muted">Closed</div></div>
+        <div class="card"><div class="metric" id="reportMetricTransports">0</div><div class="small muted">EMS Transports</div></div>
+        <div class="card"><div class="metric" id="reportMetricWalkins">0</div><div class="small muted">Walk-Ins</div></div>
       </div>
 
       <div class="card report-controls">
@@ -4297,13 +4801,23 @@ async function reportsPage(){
           <button class="btn secondary report-tab" data-report-tab="activity">CAD Activity (${activities.length})</button>
           <button class="btn secondary report-tab" data-report-tab="status">Unit Status (${statuses.length})</button>
         </div>
-        <input id="reportSearch" placeholder="Search incident, nature, location, unit, treatment area, destination, or disposition">
+        <div class="report-filter-grid">
+          <select id="reportOperationalPeriod">
+            <option value="">All Operational Periods</option>
+            ${reportPeriods.filter(op=>op.status!=="CANCELLED").map(op=>`
+              <option value="${op.id}" ${op.status==="ACTIVE"?"selected":""}>
+                ${esc(op.name)} · ${esc(op.incident_prefix)}${op.status==="ACTIVE"?" · ACTIVE":""}
+              </option>
+            `).join("")}
+          </select>
+          <input id="reportSearch" placeholder="Search incident, nature, location, unit, treatment area, destination, or disposition">
+        </div>
       </div>
 
       <section class="report-panel" data-report-panel="summary">
         <div class="table-wrap report-table-wrap"><table class="dispatch-log-table">
           <thead><tr>
-            <th>Incident</th><th>Received</th><th>Status</th><th>Departments</th><th>Nature / Priority</th>
+            <th>Incident</th><th>Operational Period</th><th>Received</th><th>Status</th><th>Departments</th><th>Nature / Priority</th>
             <th>Location</th><th>Units</th><th>En Route</th><th>On Scene</th><th>EMS / Transport</th>
             <th>Disposition</th><th>Closed</th><th>Duration</th><th></th>
           </tr></thead>
@@ -4313,14 +4827,14 @@ async function reportsPage(){
 
       <section class="report-panel hidden" data-report-panel="activity">
         <div class="table-wrap report-table-wrap"><table class="dispatch-log-table">
-          <thead><tr><th>Time</th><th>Incident</th><th>Elapsed</th><th>Actor</th><th>Unit</th><th>Activity</th><th>Details</th></tr></thead>
+          <thead><tr><th>Time</th><th>Incident</th><th>Operational Period</th><th>Elapsed</th><th>Actor</th><th>Unit</th><th>Activity</th><th>Details</th></tr></thead>
           <tbody id="reportActivityBody"></tbody>
         </table></div>
       </section>
 
       <section class="report-panel hidden" data-report-panel="status">
         <div class="table-wrap report-table-wrap"><table class="dispatch-log-table">
-          <thead><tr><th>Time</th><th>Incident</th><th>Elapsed</th><th>Unit</th><th>From</th><th>To</th><th>Destination</th><th>Actor</th></tr></thead>
+          <thead><tr><th>Time</th><th>Incident</th><th>Operational Period</th><th>Elapsed</th><th>Unit</th><th>From</th><th>To</th><th>Destination</th><th>Actor</th></tr></thead>
           <tbody id="reportStatusBody"></tbody>
         </table></div>
       </section>
@@ -4328,6 +4842,8 @@ async function reportsPage(){
 
   const summaryColumns=[
     {label:"Incident",value:"incident_number"},
+    {label:"Operational Period",value:"operational_period_name"},
+    {label:"Operational Period Prefix",value:"operational_period_prefix"},
     {label:"Status",value:"incident_status"},
     {label:"Received",value:"received_time"},
     {label:"Closed",value:"closed_at"},
@@ -4376,6 +4892,8 @@ async function reportsPage(){
 
   const activityColumns=[
     {label:"Incident",value:"incident_number"},
+    {label:"Operational Period",value:"operational_period_name"},
+    {label:"Operational Period Prefix",value:"operational_period_prefix"},
     {label:"Activity Time",value:"activity_time"},
     {label:"Elapsed Seconds",value:"elapsed_seconds"},
     {label:"Action",value:"action"},
@@ -4396,6 +4914,8 @@ async function reportsPage(){
 
   const statusColumns=[
     {label:"Incident",value:"incident_number"},
+    {label:"Operational Period",value:"operational_period_name"},
+    {label:"Operational Period Prefix",value:"operational_period_prefix"},
     {label:"Server Time",value:"server_time"},
     {label:"Client Time",value:"client_time"},
     {label:"Elapsed Seconds",value:"elapsed_seconds"},
@@ -4418,6 +4938,13 @@ async function reportsPage(){
     return value.trim().toLowerCase();
   };
 
+  const selectedOperationalPeriodId=()=>document.querySelector("#reportOperationalPeriod")?.value||"";
+
+  const matchesPeriod=row=>{
+    const selected=selectedOperationalPeriodId();
+    return !selected||row.operational_period_id===selected;
+  };
+
   const matches=(row,needle)=>!needle||Object.values(row).some(value=>{
     if(value===null||value===undefined)return false;
     if(typeof value==="object")value=JSON.stringify(value);
@@ -4427,9 +4954,17 @@ async function reportsPage(){
   const render=()=>{
     const needle=filterText();
 
-    const summaryRows=rows.filter(r=>matches(r,needle));
+    const summaryRows=rows.filter(r=>matchesPeriod(r)&&matches(r,needle));
+    const metricRows=rows.filter(matchesPeriod);
+    document.querySelector("#reportMetricTotal").textContent=metricRows.length;
+    document.querySelector("#reportMetricOpen").textContent=metricRows.filter(r=>r.incident_status!=="CLOSED").length;
+    document.querySelector("#reportMetricClosed").textContent=metricRows.filter(r=>r.incident_status==="CLOSED").length;
+    document.querySelector("#reportMetricTransports").textContent=metricRows.filter(r=>r.ems_final_disposition==="TRANSPORTED"||r.transport_started_at).length;
+    document.querySelector("#reportMetricWalkins").textContent=metricRows.filter(r=>r.walk_in).length;
+
     document.querySelector("#reportSummaryBody").innerHTML=summaryRows.map(r=>`<tr>
       <td><strong>${esc(r.incident_number)}</strong>${r.walk_in?`<br><span class="badge">WALK-IN</span>`:""}</td>
+      <td>${esc(r.operational_period_name||"Legacy")}${r.operational_period_prefix?`<br><span class="small mono muted">${esc(r.operational_period_prefix)}</span>`:""}</td>
       <td>${esc(reportDateTime(r.received_time))}</td>
       <td><span class="badge">${esc(r.incident_status)}</span></td>
       <td>${esc(r.departments||"")}</td>
@@ -4443,30 +4978,32 @@ async function reportsPage(){
       <td>${esc(reportDateTime(r.closed_at))}</td>
       <td>${esc(reportDuration(r.total_duration_seconds))}</td>
       <td><button class="btn secondary compact" data-report-record="${r.incident_id}">View Record</button></td>
-    </tr>`).join("")||`<tr><td colspan="14" class="muted">No matching incidents.</td></tr>`;
+    </tr>`).join("")||`<tr><td colspan="15" class="muted">No matching incidents.</td></tr>`;
 
-    const activityRows=activities.filter(r=>matches(r,needle));
+    const activityRows=activities.filter(r=>matchesPeriod(r)&&matches(r,needle));
     document.querySelector("#reportActivityBody").innerHTML=activityRows.map(r=>`<tr>
       <td>${esc(reportDateTime(r.activity_time))}</td>
       <td><strong>${esc(r.incident_number)}</strong></td>
+      <td>${esc(r.operational_period_name||"Legacy")}</td>
       <td>${esc(reportDuration(r.elapsed_seconds))}</td>
       <td>${esc(reportActorLabel(r))}</td>
       <td>${esc([r.unit_department,r.unit_name].filter(Boolean).join(" · "))}</td>
       <td><strong>${esc(activityTitle(r.action))}</strong></td>
       <td>${esc(reportActivityDetail(r))}</td>
-    </tr>`).join("")||`<tr><td colspan="7" class="muted">No matching CAD activity.</td></tr>`;
+    </tr>`).join("")||`<tr><td colspan="8" class="muted">No matching CAD activity.</td></tr>`;
 
-    const statusRows=statuses.filter(r=>matches(r,needle));
+    const statusRows=statuses.filter(r=>matchesPeriod(r)&&matches(r,needle));
     document.querySelector("#reportStatusBody").innerHTML=statusRows.map(r=>`<tr>
       <td>${esc(reportDateTime(r.server_time))}</td>
       <td><strong>${esc(r.incident_number)}</strong></td>
+      <td>${esc(r.operational_period_name||"Legacy")}</td>
       <td>${esc(reportDuration(r.elapsed_seconds))}</td>
       <td>${esc([r.unit_department,r.unit_name].filter(Boolean).join(" · "))}</td>
       <td>${esc(String(r.old_status||"").replaceAll("_"," "))}</td>
       <td><strong>${esc(String(r.new_status||"").replaceAll("_"," "))}</strong></td>
       <td>${esc(r.transport_destination_text||r.transport_treatment_area||"")}</td>
       <td>${esc(reportActorLabel(r))}</td>
-    </tr>`).join("")||`<tr><td colspan="8" class="muted">No matching unit status activity.</td></tr>`;
+    </tr>`).join("")||`<tr><td colspan="9" class="muted">No matching unit status activity.</td></tr>`;
 
     document.querySelectorAll("[data-report-record]").forEach(btn=>btn.onclick=()=>{
       const row=rows.find(r=>r.incident_id===btn.dataset.reportRecord);
@@ -4476,6 +5013,7 @@ async function reportsPage(){
 
   document.querySelector("#backCad").onclick=()=>dispatchPage();
   document.querySelector("#reportSearch").addEventListener("input",render);
+  document.querySelector("#reportOperationalPeriod").addEventListener("change",render);
 
   document.querySelectorAll("[data-report-tab]").forEach(btn=>btn.onclick=()=>{
     activeTab=btn.dataset.reportTab;
@@ -4487,20 +5025,26 @@ async function reportsPage(){
     document.querySelectorAll("[data-report-panel]").forEach(panel=>panel.classList.toggle("hidden",panel.dataset.reportPanel!==activeTab));
   });
 
+  const reportFileScope=()=>{
+    const selected=selectedOperationalPeriodId();
+    const op=periodById.get(selected);
+    return op?op.incident_prefix:(S.event?.event_code||"event");
+  };
+
   document.querySelector("#downloadSummaryCsv").onclick=()=>downloadNamedCsv(
-    `${S.event?.event_code||"event"}-dispatch-log-detailed.csv`,
+    `${reportFileScope()}-dispatch-log-detailed.csv`,
     summaryColumns,
-    rows
+    rows.filter(matchesPeriod)
   );
   document.querySelector("#downloadActivityCsv").onclick=()=>downloadNamedCsv(
-    `${S.event?.event_code||"event"}-cad-activity.csv`,
+    `${reportFileScope()}-cad-activity.csv`,
     activityColumns,
-    activities
+    activities.filter(matchesPeriod)
   );
   document.querySelector("#downloadStatusCsv").onclick=()=>downloadNamedCsv(
-    `${S.event?.event_code||"event"}-unit-status-history.csv`,
+    `${reportFileScope()}-unit-status-history.csv`,
     statusColumns,
-    statuses
+    statuses.filter(matchesPeriod)
   );
 
   render();
@@ -5103,6 +5647,7 @@ function subscribeDispatch(){
     // incident modal. If the call editor has unsaved changes, the refresh is
     // deferred rather than destroying dispatcher input.
     .on("postgres_changes",{event:"*",schema:"public",table:"incidents",filter:`event_id=eq.${S.eventId}`},()=>refreshDispatchStructure())
+    .on("postgres_changes",{event:"*",schema:"public",table:"operational_periods",filter:`event_id=eq.${S.eventId}`},()=>refreshDispatchStructure())
     .on("postgres_changes",{event:"*",schema:"public",table:"incident_units"},()=>refreshDispatchStructure())
     // GPS changes update only the unit's map marker/readout.
     .on("postgres_changes",{event:"*",schema:"public",table:"unit_locations"},payload=>updateDispatcherUnitLocation(payload))
@@ -5151,6 +5696,8 @@ function reset(){
   S.unitLocationMarkers.clear();
   S.emsUnitConfigs=[];
   S.treatmentAreas=[];
+  S.operationalPeriods=[];
+  S.activeOperationalPeriod=null;
   S.dispatchLayout=null;
   S.dispatchDepartmentIds=[];
   S.commandDepartmentIds=[];
