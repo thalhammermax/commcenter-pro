@@ -1895,17 +1895,17 @@ function showAmbulanceTransportOutcomeModal({
     <div class="transport-outcome-options">
       <button class="transport-outcome-card delivered" id="transportDelivered">
         <strong>Patient Delivered</strong>
-        <span>Patient was delivered to the destination facility.</span>
+        <span>Patient was delivered to the destination facility. This will close the call.</span>
       </button>
 
       <button class="transport-outcome-card refusal" id="transportRefusal">
         <strong>Patient Refusal</strong>
-        <span>The transport unit obtained a patient refusal.</span>
+        <span>The transport unit obtained a patient refusal. This will close the call.</span>
       </button>
     </div>
 
     <div class="small muted">
-      Either selection closes the EMS patient flow, clears the ambulance from the CAD incident, and returns the ambulance to AVAILABLE. The incident itself remains open.
+      Either selection closes the EMS patient flow and the CAD incident, clears all committed units from the call, and returns those units to AVAILABLE.
     </div>
   </div>
 
