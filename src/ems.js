@@ -117,8 +117,8 @@ export async function renderEmsOps(app,ctx){
           <div class="row"><h3>Active EMS Patient Flow</h3><span class="small muted">Incident number is the patient reference</span></div>
           <div class="table-wrap"><table><thead><tr><th>Incident</th><th>Nature</th><th>Status</th><th>Current Custody</th><th>Age</th><th>Note</th></tr></thead><tbody>
             ${encounters.map(e=>`<tr>
-              <td><strong>${esc(e.tracking_number)}</strong></td>
-              <td>${esc(incidents[e.incident_id]?.incident_number||"Walk-in")}</td>
+              <td><strong>${esc(encounterIncidentNumber(e,incidents))}</strong></td>
+              <td>${esc(encounterIncidentNature(e,incidents))}</td>
               <td>${esc(pretty(e.current_status))}</td>
               <td>${esc(resourceName({unitId:e.current_unit_id,areaId:e.current_treatment_area_id,units,areas}))}</td>
               <td>${ageMinutes(e.created_at)} min</td>
@@ -136,6 +136,7 @@ export async function renderEmsOps(app,ctx){
               <div>${esc(resourceName({unitId:h.from_unit_id,areaId:h.from_treatment_area_id,units,areas}))}</div>
               <div class="handoff-arrow">→</div>
               <div>${esc(resourceName({unitId:h.to_unit_id,areaId:h.to_treatment_area_id,units,areas}))}</div>
+              ${h.to_treatment_area_id&&e?`<div><button class="btn good" data-dispatch-confirm-treatment="${h.id}" data-incident-id="${e.incident_id}" data-area-id="${h.to_treatment_area_id}">Mark Handed Off</button></div>`:""}
             </div>`;
           }).join("")||`<div class="muted">No handoffs waiting for acceptance.</div>`}
         </section>
@@ -149,6 +150,18 @@ export async function renderEmsOps(app,ctx){
 
     document.querySelector("#emsBack").onclick=()=>{clearEmsOpsRealtime();onBack();};
     document.querySelector("#emsAdmin").onclick=()=>{clearEmsOpsRealtime();onAdmin();};
+
+    document.querySelectorAll("[data-dispatch-confirm-treatment]").forEach(btn=>btn.onclick=async()=>{
+      const area=areas.find(a=>a.id===btn.dataset.areaId);
+      if(!confirm(`Mark this patient as handed off to ${area?.name||"the treatment area"}?`))return;
+      const {error}=await supabase.rpc("ems_dispatch_mark_treatment_handoff",{
+        p_incident_id:btn.dataset.incidentId,
+        p_treatment_area_id:btn.dataset.areaId,
+        p_note:"Confirmed by Dispatch"
+      });
+      if(error)return alert(error.message);
+      renderEmsOps(app,ctx);
+    });
 
     let refreshTimer=null;
     const refresh=()=>{
@@ -164,6 +177,87 @@ export async function renderEmsOps(app,ctx){
     console.error("EMS Ops load error",err);
     app.innerHTML=`<div class="shell">${header("EMS Operations Error")}<div class="wrap"><div class="notice error"><strong>EMS Operations could not load.</strong><br>${esc(err.message)}</div><button class="btn" id="emsBack">Back to CAD</button></div></div>`;
     document.querySelector("#emsBack").onclick=onBack;
+  }
+}
+
+
+export async function renderDispatchIncidentTreatmentPanel(container,{eventId,incidentId,onBack}){
+  try{
+    const [incidentRes,areasRes,encRes,handoffRes,units]=await Promise.all([
+      supabase.from("incidents").select("id,incident_number,call_type,priority,landmark").eq("id",incidentId).single(),
+      supabase.from("ems_treatment_areas").select("*").eq("event_id",eventId).eq("active",true).order("name"),
+      supabase.from("ems_encounters").select("*").eq("event_id",eventId).eq("incident_id",incidentId).neq("current_status","CLOSED").order("created_at").limit(1).maybeSingle(),
+      supabase.from("ems_handoffs").select("*").eq("event_id",eventId).eq("status","PENDING").order("requested_at"),
+      getUnitsAndConfigs(eventId)
+    ]);
+
+    for(const r of [incidentRes,areasRes,encRes,handoffRes])if(r.error)throw r.error;
+
+    const incident=incidentRes.data;
+    const areas=areasRes.data||[];
+    const encounter=encRes.data||null;
+    const pending=(handoffRes.data||[]).find(h=>encounter&&h.encounter_id===encounter.id)||null;
+    const current=encounter
+      ? resourceName({unitId:encounter.current_unit_id,areaId:encounter.current_treatment_area_id,units,areas})
+      : "No EMS custody record yet";
+
+    container.innerHTML=`<div class="card stack treatment-dispatch-panel">
+      <div class="row">
+        <div>
+          <div class="section-title">EMS Treatment Handoff</div>
+          <strong>${esc(incident.incident_number)} · ${esc(incident.call_type)}</strong>
+        </div>
+        <button class="btn secondary" id="emsTreatmentBack">Back</button>
+      </div>
+
+      <div class="notice">
+        <strong>Current EMS custody</strong><br>
+        ${esc(current)}
+        ${encounter?` · ${esc(pretty(encounter.current_status))}`:""}
+      </div>
+
+      ${pending?`<div class="notice">
+        <strong>Pending handoff</strong><br>
+        ${esc(resourceName({unitId:pending.from_unit_id,areaId:pending.from_treatment_area_id,units,areas}))}
+        → ${esc(resourceName({unitId:pending.to_unit_id,areaId:pending.to_treatment_area_id,units,areas}))}
+      </div>`:""}
+
+      <div>
+        <label>Patient handed off to treatment area</label>
+        <select id="dispatchTreatmentArea">
+          <option value="">Choose treatment area</option>
+          ${areas.map(a=>`<option value="${a.id}" ${pending?.to_treatment_area_id===a.id?"selected":""}>${esc(a.name)} · ${esc(a.status)} · ${a.accepting_patients?"Accepting":"Not accepting"}</option>`).join("")}
+        </select>
+      </div>
+
+      <div><label>Optional operational note</label><input id="dispatchTreatmentNote" placeholder="e.g. Radio confirmation from Bike Team 2"></div>
+
+      <button class="btn good" id="dispatchMarkTreatment">Mark Patient Handed Off</button>
+      <div class="small muted">This reconciles current custody to the selected treatment area. If a matching handoff request is pending, it is completed. No separate patient number is created.</div>
+    </div>`;
+
+    document.querySelector("#emsTreatmentBack").onclick=onBack;
+    document.querySelector("#dispatchMarkTreatment").onclick=async()=>{
+      const areaId=document.querySelector("#dispatchTreatmentArea").value;
+      if(!areaId)return alert("Choose a treatment area.");
+      const area=areas.find(a=>a.id===areaId);
+      if(!confirm(`Confirm ${incident.incident_number} was handed off to ${area?.name||"this treatment area"}?`))return;
+
+      const {data,error}=await supabase.rpc("ems_dispatch_mark_treatment_handoff",{
+        p_incident_id:incident.id,
+        p_treatment_area_id:areaId,
+        p_note:document.querySelector("#dispatchTreatmentNote").value.trim()||null
+      });
+      if(error)return alert(error.message);
+
+      alert(data==="ALREADY_HERE"
+        ? `${incident.incident_number} is already recorded at ${area?.name||"that treatment area"}.`
+        : `${incident.incident_number} is now recorded in ${area?.name||"the treatment area"}.`);
+      onBack();
+    };
+  }catch(error){
+    container.innerHTML=`<div class="card stack"><div class="notice error">${esc(error.message)}</div><button class="btn secondary" id="emsTreatmentBack">Back</button></div>`;
+    document.querySelector("#emsTreatmentBack").onclick=onBack;
   }
 }
 
@@ -523,7 +617,16 @@ async function treatmentDashboard(app,ts,{header,onExit}){
 </div>
         </div>
 
-        ${incoming.length?`<section class="card incoming-section"><div class="row"><h2>Incoming Handoffs</h2><span class="badge">${incoming.length}</span></div>${incoming.map(h=>{const ie=incomingEncounters.find(e=>e.id===h.encounter_id);const inc=incidentMap[ie?.incident_id];return `<div class="incoming-handoff"><div><div class="big">${esc(inc?.incident_number||"EMS Incident")}</div><div>${esc(resourceName({unitId:h.from_unit_id,areaId:h.from_treatment_area_id,units,areas:[area]}))} → ${esc(area.name)}</div><div class="small muted">${inc?`${esc(inc.incident_number)} · ${esc(inc.call_type)} · `:""}requested ${fmt(h.requested_at)}</div>${h.note?`<p>${esc(h.note)}</p>`:""}</div><div class="grid2"><button class="btn good" data-ta-accept="${h.id}">Accept Handoff</button><button class="btn secondary" data-ta-decline="${h.id}">Decline</button></div></div>`;}).join("")}</section>`:""}
+        <section class="card receive-existing-card">
+          <div class="row"><div><h3>Receive Existing Patient</h3><div class="small muted">Use this when the patient physically arrives even if a handoff request was never entered.</div></div><span class="badge">INCIDENT #</span></div>
+          <div class="grid2">
+            <input id="treatmentIncidentSearch" autocomplete="off" placeholder="Search XR26-041, call type, or location">
+            <button class="btn secondary" id="treatmentSearchBtn">Search Incidents</button>
+          </div>
+          <div id="treatmentIncidentResults" class="treatment-incident-results"><div class="small muted">Enter an incident number to receive a patient into ${esc(area.name)}.</div></div>
+        </section>
+
+        ${incoming.length?`<section class="card incoming-section"><div class="row"><h2>Incoming Handoffs</h2><span class="badge">${incoming.length}</span></div>${incoming.map(h=>{const ie=incomingEncounters.find(e=>e.id===h.encounter_id);const inc=incidentMap[ie?.incident_id];return `<div class="incoming-handoff"><div><div class="big">${esc(inc?.incident_number||"EMS Incident")}</div><div>${esc(resourceName({unitId:h.from_unit_id,areaId:h.from_treatment_area_id,units,areas:[area]}))} → ${esc(area.name)}</div><div class="small muted">${inc?`${esc(inc.incident_number)} · ${esc(inc.call_type)} · `:""}requested ${fmt(h.requested_at)}</div>${h.note?`<p>${esc(h.note)}</p>`:""}</div><div class="grid2"><button class="btn good" data-ta-accept="${h.id}">Patient Received Here</button><button class="btn secondary" data-ta-decline="${h.id}">Decline</button></div></div>`;}).join("")}</section>`:""}
 
         <section class="card"><div class="row"><h2>Patients in Treatment</h2><span class="badge">${encounters.length}</span></div>
           <div class="treatment-patient-grid">${encounters.map(e=>{
@@ -556,6 +659,54 @@ async function treatmentDashboard(app,ts,{header,onExit}){
       alert(`Created ${data}.`);
       treatmentDashboard(app,ts,{header,onExit});
     };
+
+    const searchTreatmentIncidents=async()=>{
+      const query=document.querySelector("#treatmentIncidentSearch").value.trim();
+      const host=document.querySelector("#treatmentIncidentResults");
+      host.innerHTML=`<div class="small muted">Searching…</div>`;
+
+      const {data,error}=await supabase.rpc("treatment_search_open_incidents",{
+        p_treatment_area_id:area.id,
+        p_query:query||null
+      });
+      if(error){
+        host.innerHTML=`<div class="notice error">${esc(error.message)}</div>`;
+        return;
+      }
+
+      const rows=data||[];
+      host.innerHTML=rows.map(row=>{
+        const alreadyHere=row.current_treatment_area_id===area.id&&row.current_ems_status==="IN_TREATMENT";
+        return `<div class="treatment-search-result">
+          <div>
+            <strong>${esc(row.incident_number)}</strong> · ${esc(row.call_type)}
+            <div class="small muted">${esc(row.priority||"")} ${row.landmark?`· ${esc(row.landmark)}`:""}${row.current_ems_status?` · EMS: ${esc(pretty(row.current_ems_status))}`:""}</div>
+          </div>
+          <button class="btn ${alreadyHere?"secondary":"good"}" data-treatment-receive="${row.incident_id}" ${alreadyHere?"disabled":""}>${alreadyHere?"Already Here":"Mark Received Here"}</button>
+        </div>`;
+      }).join("")||`<div class="small muted">No open incidents matched that search.</div>`;
+
+      host.querySelectorAll("[data-treatment-receive]").forEach(btn=>btn.onclick=async()=>{
+        const row=rows.find(r=>r.incident_id===btn.dataset.treatmentReceive);
+        if(!row)return;
+        if(!confirm(`Mark ${row.incident_number} as received at ${area.name}?`))return;
+        const note=prompt("Optional operational note:","")||"";
+        const {data:result,error:receiveError}=await supabase.rpc("treatment_receive_incident",{
+          p_treatment_area_id:area.id,
+          p_incident_id:row.incident_id,
+          p_note:note||null
+        });
+        if(receiveError)return alert(receiveError.message);
+        if(result==="ALREADY_HERE")alert(`${row.incident_number} is already recorded at ${area.name}.`);
+        treatmentDashboard(app,ts,{header,onExit});
+      });
+    };
+
+    document.querySelector("#treatmentSearchBtn").onclick=searchTreatmentIncidents;
+    document.querySelector("#treatmentIncidentSearch").addEventListener("keydown",e=>{
+      if(e.key==="Enter")searchTreatmentIncidents();
+    });
+
     document.querySelectorAll("[data-ta-accept]").forEach(b=>b.onclick=async()=>{const {error}=await supabase.rpc("ems_accept_handoff",{p_handoff_id:b.dataset.taAccept});if(error)alert(error.message);else treatmentDashboard(app,ts,{header,onExit});});
     document.querySelectorAll("[data-ta-decline]").forEach(b=>b.onclick=async()=>{const note=prompt("Optional reason for declining:","")||"";const {error}=await supabase.rpc("ems_decline_handoff",{p_handoff_id:b.dataset.taDecline,p_note:note});if(error)alert(error.message);else treatmentDashboard(app,ts,{header,onExit});});
     document.querySelectorAll("[data-ta-cancel]").forEach(b=>b.onclick=async()=>{const {error}=await supabase.rpc("ems_cancel_handoff",{p_handoff_id:b.dataset.taCancel});if(error)alert(error.message);else treatmentDashboard(app,ts,{header,onExit});});
