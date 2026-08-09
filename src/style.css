@@ -1813,3 +1813,153 @@ body.modal-open{
 .calls-panel #newWalkInPatient{
   margin-top:7px;
 }
+
+
+/* v0.8.4 — detailed dispatch reporting */
+.dispatch-report-page{
+  max-width:none;
+}
+.report-heading{
+  align-items:flex-start;
+}
+.report-metrics{
+  grid-template-columns:repeat(5,minmax(0,1fr));
+}
+.report-controls{
+  display:grid;
+  gap:12px;
+}
+.report-tabs{
+  display:flex;
+  gap:7px;
+  flex-wrap:wrap;
+}
+.report-tab.active{
+  box-shadow:0 0 0 2px rgba(96,165,250,.3);
+}
+.report-panel.hidden{
+  display:none;
+}
+.report-table-wrap{
+  max-height:calc(100vh - 310px);
+  overflow:auto;
+  border:1px solid #dbe2ea;
+  border-radius:12px;
+}
+.dispatch-log-table{
+  min-width:1450px;
+  width:100%;
+  border-collapse:separate;
+  border-spacing:0;
+}
+.dispatch-log-table th{
+  position:sticky;
+  top:0;
+  z-index:2;
+  background:#f1f5f9;
+  color:#334155;
+  text-align:left;
+  white-space:nowrap;
+  border-bottom:1px solid #cbd5e1;
+}
+.dispatch-log-table th,
+.dispatch-log-table td{
+  padding:9px 10px;
+  vertical-align:top;
+}
+.dispatch-log-table tbody tr:nth-child(even){
+  background:#f8fafc;
+}
+.dispatch-log-table tbody tr:hover{
+  background:#eef6ff;
+}
+.report-download-menu{
+  position:relative;
+}
+.report-download-menu>summary{
+  list-style:none;
+}
+.report-download-menu>summary::-webkit-details-marker{
+  display:none;
+}
+.report-download-panel{
+  position:absolute;
+  right:0;
+  top:calc(100% + 7px);
+  z-index:4300;
+  display:grid;
+  width:220px;
+  padding:7px;
+  border:1px solid #cbd5e1;
+  border-radius:10px;
+  background:#fff;
+  box-shadow:0 15px 35px rgba(0,0,0,.22);
+}
+.report-download-panel button{
+  padding:9px 10px;
+  border:0;
+  border-radius:7px;
+  background:transparent;
+  text-align:left;
+  font-weight:700;
+}
+.report-download-panel button:hover{
+  background:#f1f5f9;
+}
+.report-record-modal{
+  padding:20px;
+}
+.report-record-grid{
+  display:grid;
+  grid-template-columns:repeat(2,minmax(0,1fr));
+  gap:12px;
+}
+.report-kv-grid{
+  display:grid;
+  grid-template-columns:minmax(120px,.7fr) minmax(0,1.3fr);
+  gap:7px 12px;
+}
+.report-kv-grid>span{
+  color:#64748b;
+  font-size:12px;
+}
+.report-kv-grid>strong{
+  overflow-wrap:anywhere;
+}
+.report-notes{
+  white-space:pre-wrap;
+  line-height:1.45;
+}
+.report-detail-table-wrap{
+  overflow:auto;
+  max-height:390px;
+  border:1px solid #334155;
+  border-radius:9px;
+}
+.report-detail-table{
+  min-width:950px;
+  width:100%;
+  border-collapse:collapse;
+}
+.report-detail-table th{
+  position:sticky;
+  top:0;
+  z-index:1;
+  background:#111827;
+  color:#e5e7eb;
+  text-align:left;
+}
+.report-detail-table th,
+.report-detail-table td{
+  padding:8px 9px;
+  border-bottom:1px solid #334155;
+  vertical-align:top;
+}
+@media(max-width:950px){
+  .report-metrics{
+    grid-template-columns:repeat(2,minmax(0,1fr));
+  }
+  .report-record-grid{
+    grid-template-columns:1fr;
+  }
+}

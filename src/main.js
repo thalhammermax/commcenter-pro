@@ -1539,11 +1539,14 @@ function activityTitle(action){
     UNIT_ASSIGNED:"Unit assigned",
     UNIT_UNASSIGNED:"Unit unassigned",
     UNIT_STATUS_CHANGED:"Unit status changed",
+    UNIT_TRANSPORT_DESTINATION_UPDATED:"Transport destination updated",
     EMS_FLOW_STARTED:"EMS flow started",
     EMS_HANDOFF_REQUESTED:"EMS handoff requested",
     EMS_HANDOFF_ACCEPTED:"EMS handoff accepted",
     EMS_HANDOFF_DECLINED:"EMS handoff declined",
     EMS_HANDOFF_CANCELLED:"EMS handoff cancelled",
+    EMS_HANDOFF_COMPLETED:"EMS custody transferred",
+    TREATMENT_WALKIN_INCIDENT_CREATED:"Walk-in patient created",
     EMS_TREATMENT_RECEIVED:"Treatment-area custody confirmed",
     EMS_CUSTODY_SET:"EMS custody recorded",
     UNIT_ARRIVED_TREATMENT_AREA:"Unit arrived at treatment area",
@@ -1567,7 +1570,10 @@ function activitySummary(row){
   }
   if(row.action==="UNIT_STATUS_CHANGED"){
     const u=S.units.find(x=>x.id===row.unit_id);
-    return `${u?.name||"Unit"}${d.old_status||d.new_status?` · ${String(d.old_status||"").replaceAll("_"," ")}${d.new_status?` → ${String(d.new_status).replaceAll("_"," ")}`:""}`:""}`;
+    const from=d.from??d.old_status??"";
+    const to=d.to??d.new_status??"";
+    const destination=d.transport_destination_text||d.destination||"";
+    return `${u?.name||row.unit_name||"Unit"}${from||to?` · ${String(from||"").replaceAll("_"," ")}${to?` → ${String(to).replaceAll("_"," ")}`:""}`:""}${destination?` · ${destination}`:""}`;
   }
   if(row.action==="INCIDENT_UPDATED"){
     const changes=[];
@@ -3590,28 +3596,497 @@ function renderDepartmentStatusEditor(departmentId){
 
 /* ---------------- REPORTS ---------------- */
 
+
+function reportDateTime(value){
+  if(!value)return "";
+  const d=new Date(value);
+  if(Number.isNaN(d.getTime()))return "";
+  return d.toLocaleString([],{
+    year:"numeric",month:"2-digit",day:"2-digit",
+    hour:"2-digit",minute:"2-digit",second:"2-digit"
+  });
+}
+
+function reportDuration(seconds){
+  if(seconds===null||seconds===undefined||seconds==="")return "";
+  const total=Math.max(0,Math.floor(Number(seconds)||0));
+  const h=Math.floor(total/3600);
+  const m=Math.floor((total%3600)/60);
+  const s=total%60;
+  if(h)return `${h}h ${String(m).padStart(2,"0")}m ${String(s).padStart(2,"0")}s`;
+  if(m)return `${m}m ${String(s).padStart(2,"0")}s`;
+  return `${s}s`;
+}
+
+function reportActorLabel(row){
+  const kind=String(row.actor_kind||"system").toLowerCase();
+  if(kind==="staff")return "Dispatch / Staff";
+  if(kind==="field")return row.unit_name?`Field · ${row.unit_name}`:"Field Unit";
+  if(kind==="treatment")return "Treatment Area";
+  return "System";
+}
+
+function reportActivityDetail(row){
+  const d=row.detail||{};
+  const values=[];
+
+  if(row.action==="UNIT_ASSIGNED"&&row.unit_name)values.push(`${row.unit_name} committed`);
+  if(row.action==="UNIT_UNASSIGNED"&&row.unit_name)values.push(`${row.unit_name} cleared`);
+  if(row.action==="UNIT_STATUS_CHANGED"){
+    const from=d.from??d.old_status;
+    const to=d.to??d.new_status;
+    if(from||to)values.push(`${row.unit_name||"Unit"}: ${String(from||"").replaceAll("_"," ")}${to?` → ${String(to).replaceAll("_"," ")}`:""}`);
+  }
+  if(row.action==="INCIDENT_UPDATED"){
+    if(d.old_call_type!==undefined&&d.old_call_type!==d.new_call_type)values.push(`Nature: ${d.old_call_type||"—"} → ${d.new_call_type||"—"}`);
+    if(d.old_priority!==undefined&&d.old_priority!==d.new_priority)values.push(`Priority: ${d.old_priority||"—"} → ${d.new_priority||"—"}`);
+    if(d.old_landmark!==undefined&&d.old_landmark!==d.new_landmark)values.push(`Location: ${d.old_landmark||"—"} → ${d.new_landmark||"—"}`);
+  }
+
+  if(row.destination||d.destination)values.push(`Destination: ${row.destination||d.destination}`);
+  if(row.treatment_area_name||d.treatment_area_name)values.push(`Treatment Area: ${row.treatment_area_name||d.treatment_area_name}`);
+  if(row.activity_disposition||d.disposition)values.push(`Disposition: ${row.activity_disposition||d.disposition}`);
+  if(row.reason||d.reason)values.push(`Reason: ${String(row.reason||d.reason).replaceAll("_"," ")}`);
+  if(d.note)values.push(`Note: ${d.note}`);
+  if(d.incident_number&&!values.length)values.push(d.incident_number);
+
+  if(!values.length){
+    const keys=Object.entries(d)
+      .filter(([key,value])=>value!==null&&value!==undefined&&value!==""&&!["encounter_id","handoff_id"].includes(key))
+      .slice(0,8)
+      .map(([key,value])=>`${key.replaceAll("_"," ")}: ${typeof value==="object"?JSON.stringify(value):String(value)}`);
+    values.push(...keys);
+  }
+
+  return values.join(" · ");
+}
+
+function reportEmsSummary(row){
+  const parts=[];
+  if(row.walk_in)parts.push("Walk-In");
+  if(row.treatment_areas)parts.push(`Treatment: ${row.treatment_areas}`);
+  if(row.ambulances)parts.push(`Amb: ${row.ambulances}`);
+  if(row.transport_destination)parts.push(`Destination: ${row.transport_destination}`);
+  if(row.ems_final_disposition)parts.push(`EMS: ${row.ems_final_disposition}`);
+  else if(row.latest_ems_status)parts.push(`EMS: ${String(row.latest_ems_status).replaceAll("_"," ")}`);
+  return parts.join(" · ");
+}
+
+function reportLocationSummary(row){
+  return [
+    row.landmark,
+    row.poi_name&&row.poi_name!==row.landmark?row.poi_name:null,
+    row.map_layer,
+    row.zone
+  ].filter(Boolean).join(" · ");
+}
+
+function csvValue(value){
+  if(value&&typeof value==="object")value=JSON.stringify(value);
+  return `"${String(value??"").replaceAll('"','""')}"`;
+}
+
+function downloadNamedCsv(filename,columns,rows){
+  const headerRow=columns.map(c=>csvValue(c.label)).join(",");
+  const body=rows.map(row=>columns.map(c=>csvValue(
+    typeof c.value==="function"?c.value(row):row[c.value]
+  )).join(","));
+  const csv=[headerRow,...body].join("\n");
+  const href=URL.createObjectURL(new Blob([csv],{type:"text/csv;charset=utf-8"}));
+  const a=document.createElement("a");
+  a.href=href;
+  a.download=filename;
+  a.click();
+  setTimeout(()=>URL.revokeObjectURL(href),0);
+}
+
+function reportIncidentRecordModal(row,activityRows,statusRows){
+  S.incidentModalMode="report-record";
+  const content=openIncidentModalShell();
+
+  const callActivity=activityRows.filter(x=>x.incident_id===row.incident_id);
+  const callStatuses=statusRows.filter(x=>x.incident_id===row.incident_id);
+
+  content.innerHTML=`<div class="incident-modal-header">
+    <div>
+      <div class="incident-modal-eyebrow">DISPATCH LOG RECORD</div>
+      <div class="incident-modal-title-row">
+        <h2 id="incidentModalTitle">${esc(row.incident_number)}</h2>
+        <span class="badge">${esc(row.incident_status)}</span>
+        <span class="badge">${esc(row.priority)}</span>
+      </div>
+      <div class="incident-modal-nature">${esc(row.call_type)}</div>
+    </div>
+    <button class="incident-modal-close" id="closeIncidentModal" aria-label="Close dispatch log record">×</button>
+  </div>
+
+  <div class="report-record-modal stack">
+    <section class="report-record-grid">
+      <div class="incident-info-section">
+        <div class="section-title">Call Record</div>
+        <div class="report-kv-grid">
+          <span>Received</span><strong>${esc(reportDateTime(row.received_time))}</strong>
+          <span>Closed</span><strong>${esc(reportDateTime(row.closed_at)||"Open")}</strong>
+          <span>Duration</span><strong>${esc(reportDuration(row.total_duration_seconds))}</strong>
+          <span>Departments</span><strong>${esc(row.departments||"")}</strong>
+          <span>Disposition</span><strong>${esc(row.disposition||"")}</strong>
+          <span>Activity Entries</span><strong>${esc(String(row.activity_count||0))}</strong>
+        </div>
+      </div>
+
+      <div class="incident-info-section">
+        <div class="section-title">Location</div>
+        <strong>${esc(row.landmark||row.poi_name||"")}</strong>
+        ${row.poi_name?`<div class="small muted">POI: ${esc(row.poi_name)}${row.poi_category?` · ${esc(row.poi_category)}`:""}</div>`:""}
+        ${row.map_layer||row.zone?`<div class="small muted">${esc([row.map_layer,row.zone].filter(Boolean).join(" · "))}</div>`:""}
+        <div class="small mono muted">${row.latitude!=null&&row.longitude!=null?`${Number(row.latitude).toFixed(6)}, ${Number(row.longitude).toFixed(6)}`:""}</div>
+      </div>
+
+      <div class="incident-info-section">
+        <div class="section-title">Unit Response</div>
+        <div class="report-kv-grid">
+          <span>Units</span><strong>${esc(row.units||"None")}</strong>
+          <span>First Assigned</span><strong>${esc(reportDateTime(row.first_unit_assigned))}</strong>
+          <span>First Responding</span><strong>${esc(reportDateTime(row.first_responding))}</strong>
+          <span>First En Route</span><strong>${esc(reportDateTime(row.first_enroute))}</strong>
+          <span>First On Scene</span><strong>${esc(reportDateTime(row.first_onscene))}</strong>
+          <span>First Transporting</span><strong>${esc(reportDateTime(row.first_transporting))}</strong>
+          <span>Dispatch → En Route</span><strong>${esc(reportDuration(row.dispatch_to_enroute_seconds))}</strong>
+          <span>Received → On Scene</span><strong>${esc(reportDuration(row.received_to_onscene_seconds))}</strong>
+        </div>
+      </div>
+
+      <div class="incident-info-section">
+        <div class="section-title">EMS / Patient Flow</div>
+        <div class="report-kv-grid">
+          <span>Walk-In</span><strong>${row.walk_in?"Yes":"No"}</strong>
+          <span>Treatment Areas</span><strong>${esc(row.treatment_areas||"")}</strong>
+          <span>Ambulances</span><strong>${esc(row.ambulances||"")}</strong>
+          <span>Transport Destination</span><strong>${esc(row.transport_destination||"")}</strong>
+          <span>Transport Started</span><strong>${esc(reportDateTime(row.transport_started_at))}</strong>
+          <span>Transport Completed</span><strong>${esc(reportDateTime(row.transport_completed_at))}</strong>
+          <span>EMS Disposition</span><strong>${esc(row.ems_final_disposition||row.latest_ems_status||"")}</strong>
+        </div>
+      </div>
+    </section>
+
+    <section class="incident-info-section">
+      <div class="section-title">Dispatch Notes</div>
+      <div class="report-notes">${row.notes?esc(row.notes):`<span class="muted">No dispatch notes.</span>`}</div>
+    </section>
+
+    <section class="incident-info-section">
+      <div class="row">
+        <div class="section-title">Complete CAD Activity</div>
+        <span class="badge">${callActivity.length}</span>
+      </div>
+      <div class="report-detail-table-wrap">
+        <table class="report-detail-table">
+          <thead><tr><th>Time</th><th>Elapsed</th><th>Actor</th><th>Unit</th><th>Activity</th><th>Detail</th></tr></thead>
+          <tbody>
+            ${callActivity.map(a=>`<tr>
+              <td>${esc(reportDateTime(a.activity_time))}</td>
+              <td>${esc(reportDuration(a.elapsed_seconds))}</td>
+              <td>${esc(reportActorLabel(a))}</td>
+              <td>${esc(a.unit_name||"")}</td>
+              <td><strong>${esc(activityTitle(a.action))}</strong></td>
+              <td>${esc(reportActivityDetail(a))}</td>
+            </tr>`).join("")||`<tr><td colspan="6" class="muted">No activity records.</td></tr>`}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="incident-info-section">
+      <div class="row">
+        <div class="section-title">Unit Status History</div>
+        <span class="badge">${callStatuses.length}</span>
+      </div>
+      <div class="report-detail-table-wrap">
+        <table class="report-detail-table">
+          <thead><tr><th>Time</th><th>Elapsed</th><th>Unit</th><th>From</th><th>To</th><th>Destination</th><th>Actor</th></tr></thead>
+          <tbody>
+            ${callStatuses.map(x=>`<tr>
+              <td>${esc(reportDateTime(x.server_time))}</td>
+              <td>${esc(reportDuration(x.elapsed_seconds))}</td>
+              <td>${esc([x.unit_department,x.unit_name].filter(Boolean).join(" · "))}</td>
+              <td>${esc(String(x.old_status||"").replaceAll("_"," "))}</td>
+              <td><strong>${esc(String(x.new_status||"").replaceAll("_"," "))}</strong></td>
+              <td>${esc(x.transport_destination_text||x.transport_treatment_area||"")}</td>
+              <td>${esc(reportActorLabel(x))}</td>
+            </tr>`).join("")||`<tr><td colspan="7" class="muted">No unit status records.</td></tr>`}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </div>`;
+
+  document.querySelector("#closeIncidentModal").onclick=()=>closeIncidentModal();
+}
+
 async function reportsPage(){
   closeIncidentModal();
-  const {data,error}=await supabase.from("dispatch_log").select("*").eq("event_id",S.eventId).order("received_time");
-  if(error)return alert(error.message);
+
+  const [summaryRes,activityRes,statusRes]=await Promise.all([
+    supabase.from("dispatch_log").select("*").eq("event_id",S.eventId).order("received_time"),
+    supabase.from("dispatch_activity_log").select("*").eq("event_id",S.eventId).order("activity_time"),
+    supabase.from("dispatch_unit_status_log").select("*").eq("event_id",S.eventId).order("server_time")
+  ]);
+
+  if(summaryRes.error)return alert(summaryRes.error.message);
+  if(activityRes.error)return alert(activityRes.error.message);
+  if(statusRes.error)return alert(statusRes.error.message);
+
+  const rows=summaryRes.data||[];
+  const activities=activityRes.data||[];
+  const statuses=statusRes.data||[];
+
+  const closed=rows.filter(r=>r.incident_status==="CLOSED").length;
+  const open=rows.length-closed;
+  const transports=rows.filter(r=>r.ems_final_disposition==="TRANSPORTED"||r.transport_started_at).length;
+  const walkins=rows.filter(r=>r.walk_in).length;
+
   app.innerHTML=`<div class="shell">${header(`${esc(S.event?.name||"Event")} · Reports`)}
-    <div class="wrap stack">
-      <div class="row"><h2>Dispatch Log</h2><div class="nav"><button class="btn secondary" id="backCad">Back to CAD</button><button class="btn" id="downloadCsv">Download CSV</button></div></div>
-      <div class="table-wrap"><table><thead><tr>
-        <th>Incident</th><th>Received</th><th>Departments</th><th>Nature</th><th>Priority</th><th>Location</th><th>Units</th><th>En Route</th><th>On Scene</th><th>Disposition</th><th>Clear</th>
-      </tr></thead><tbody>${(data||[]).map(r=>`<tr>
-        <td>${esc(r.incident_number)}</td><td>${fmt(r.received_time)}</td><td>${esc(r.departments||"")}</td><td>${esc(r.call_type)}</td><td>${esc(r.priority)}</td>
-        <td>${esc(r.landmark||"")}</td><td>${esc(r.units||"")}</td><td>${fmt(r.first_enroute)}</td><td>${fmt(r.first_onscene)}</td><td>${esc(r.disposition||"")}</td><td>${fmt(r.last_clear||r.closed_at)}</td>
-      </tr>`).join("")}</tbody></table></div>
+    <div class="wrap stack dispatch-report-page">
+      <div class="row report-heading">
+        <div>
+          <h2>Detailed Dispatch Log</h2>
+          <div class="small muted">Complete incident summary, EMS flow, unit response, status history, and CAD activity.</div>
+        </div>
+        <div class="nav">
+          <button class="btn secondary" id="backCad">Back to CAD</button>
+          <details class="report-download-menu">
+            <summary class="btn">Download CSV ▾</summary>
+            <div class="report-download-panel">
+              <button id="downloadSummaryCsv">Incident Summary CSV</button>
+              <button id="downloadActivityCsv">CAD Activity CSV</button>
+              <button id="downloadStatusCsv">Unit Status CSV</button>
+            </div>
+          </details>
+        </div>
+      </div>
+
+      <div class="ems-metrics report-metrics">
+        <div class="card"><div class="metric">${rows.length}</div><div class="small muted">Total Incidents</div></div>
+        <div class="card"><div class="metric">${open}</div><div class="small muted">Open</div></div>
+        <div class="card"><div class="metric">${closed}</div><div class="small muted">Closed</div></div>
+        <div class="card"><div class="metric">${transports}</div><div class="small muted">EMS Transports</div></div>
+        <div class="card"><div class="metric">${walkins}</div><div class="small muted">Walk-Ins</div></div>
+      </div>
+
+      <div class="card report-controls">
+        <div class="report-tabs">
+          <button class="btn report-tab active" data-report-tab="summary">Incident Summary</button>
+          <button class="btn secondary report-tab" data-report-tab="activity">CAD Activity (${activities.length})</button>
+          <button class="btn secondary report-tab" data-report-tab="status">Unit Status (${statuses.length})</button>
+        </div>
+        <input id="reportSearch" placeholder="Search incident, nature, location, unit, treatment area, destination, or disposition">
+      </div>
+
+      <section class="report-panel" data-report-panel="summary">
+        <div class="table-wrap report-table-wrap"><table class="dispatch-log-table">
+          <thead><tr>
+            <th>Incident</th><th>Received</th><th>Status</th><th>Departments</th><th>Nature / Priority</th>
+            <th>Location</th><th>Units</th><th>En Route</th><th>On Scene</th><th>EMS / Transport</th>
+            <th>Disposition</th><th>Closed</th><th>Duration</th><th></th>
+          </tr></thead>
+          <tbody id="reportSummaryBody"></tbody>
+        </table></div>
+      </section>
+
+      <section class="report-panel hidden" data-report-panel="activity">
+        <div class="table-wrap report-table-wrap"><table class="dispatch-log-table">
+          <thead><tr><th>Time</th><th>Incident</th><th>Elapsed</th><th>Actor</th><th>Unit</th><th>Activity</th><th>Details</th></tr></thead>
+          <tbody id="reportActivityBody"></tbody>
+        </table></div>
+      </section>
+
+      <section class="report-panel hidden" data-report-panel="status">
+        <div class="table-wrap report-table-wrap"><table class="dispatch-log-table">
+          <thead><tr><th>Time</th><th>Incident</th><th>Elapsed</th><th>Unit</th><th>From</th><th>To</th><th>Destination</th><th>Actor</th></tr></thead>
+          <tbody id="reportStatusBody"></tbody>
+        </table></div>
+      </section>
     </div></div>`;
+
+  const summaryColumns=[
+    {label:"Incident",value:"incident_number"},
+    {label:"Status",value:"incident_status"},
+    {label:"Received",value:"received_time"},
+    {label:"Closed",value:"closed_at"},
+    {label:"Duration Seconds",value:"total_duration_seconds"},
+    {label:"Departments",value:"departments"},
+    {label:"Nature",value:"call_type"},
+    {label:"Priority",value:"priority"},
+    {label:"POI",value:"poi_name"},
+    {label:"POI Category",value:"poi_category"},
+    {label:"Location Description",value:"landmark"},
+    {label:"Map Layer",value:"map_layer"},
+    {label:"Zone",value:"zone"},
+    {label:"Latitude",value:"latitude"},
+    {label:"Longitude",value:"longitude"},
+    {label:"Dispatch Notes",value:"notes"},
+    {label:"Units",value:"units"},
+    {label:"First Unit Assigned",value:"first_unit_assigned"},
+    {label:"First Responding",value:"first_responding"},
+    {label:"First En Route",value:"first_enroute"},
+    {label:"First On Scene",value:"first_onscene"},
+    {label:"First Working",value:"first_working"},
+    {label:"First Transporting",value:"first_transporting"},
+    {label:"First At Hospital",value:"first_at_hospital"},
+    {label:"Last Clear",value:"last_clear"},
+    {label:"Dispatch to En Route Seconds",value:"dispatch_to_enroute_seconds"},
+    {label:"Received to On Scene Seconds",value:"received_to_onscene_seconds"},
+    {label:"On Scene to Transport Seconds",value:"onscene_to_transport_seconds"},
+    {label:"Unit Status Change Count",value:"unit_status_change_count"},
+    {label:"Unit Status History",value:"unit_status_history"},
+    {label:"Walk-In",value:r=>r.walk_in?"Yes":"No"},
+    {label:"Treatment Areas",value:"treatment_areas"},
+    {label:"Ambulances",value:"ambulances"},
+    {label:"EMS Started",value:"ems_started_at"},
+    {label:"EMS Status",value:"latest_ems_status"},
+    {label:"Transport Destination",value:"transport_destination"},
+    {label:"Transport Started",value:"transport_started_at"},
+    {label:"Transport Completed",value:"transport_completed_at"},
+    {label:"EMS Final Disposition",value:"ems_final_disposition"},
+    {label:"EMS Closed",value:"ems_closed_at"},
+    {label:"Incident Disposition",value:"disposition"},
+    {label:"CAD Activity Count",value:"activity_count"},
+    {label:"Last CAD Activity",value:"last_activity_at"},
+    {label:"Incident ID",value:"incident_id"},
+    {label:"Created By User ID",value:"created_by"}
+  ];
+
+  const activityColumns=[
+    {label:"Incident",value:"incident_number"},
+    {label:"Activity Time",value:"activity_time"},
+    {label:"Elapsed Seconds",value:"elapsed_seconds"},
+    {label:"Action",value:"action"},
+    {label:"Actor Type",value:"actor_kind"},
+    {label:"Actor User ID",value:"actor_user_id"},
+    {label:"Unit Department",value:"unit_department"},
+    {label:"Unit",value:"unit_name"},
+    {label:"Status From",value:"status_from"},
+    {label:"Status To",value:"status_to"},
+    {label:"Destination",value:"destination"},
+    {label:"Treatment Area",value:"treatment_area_name"},
+    {label:"Disposition",value:"activity_disposition"},
+    {label:"Reason",value:"reason"},
+    {label:"Detail JSON",value:"detail"},
+    {label:"Activity ID",value:"activity_id"},
+    {label:"Incident ID",value:"incident_id"}
+  ];
+
+  const statusColumns=[
+    {label:"Incident",value:"incident_number"},
+    {label:"Server Time",value:"server_time"},
+    {label:"Client Time",value:"client_time"},
+    {label:"Elapsed Seconds",value:"elapsed_seconds"},
+    {label:"Unit Department",value:"unit_department"},
+    {label:"Unit",value:"unit_name"},
+    {label:"Old Status",value:"old_status"},
+    {label:"New Status",value:"new_status"},
+    {label:"Transport Destination",value:"transport_destination_text"},
+    {label:"Treatment Area Destination",value:"transport_treatment_area"},
+    {label:"Actor Type",value:"actor_kind"},
+    {label:"Actor User ID",value:"actor_user_id"},
+    {label:"Status Log ID",value:"status_log_id"},
+    {label:"Incident ID",value:"incident_id"}
+  ];
+
+  let activeTab="summary";
+
+  const filterText=()=>{
+    const value=document.querySelector("#reportSearch")?.value||"";
+    return value.trim().toLowerCase();
+  };
+
+  const matches=(row,needle)=>!needle||Object.values(row).some(value=>{
+    if(value===null||value===undefined)return false;
+    if(typeof value==="object")value=JSON.stringify(value);
+    return String(value).toLowerCase().includes(needle);
+  });
+
+  const render=()=>{
+    const needle=filterText();
+
+    const summaryRows=rows.filter(r=>matches(r,needle));
+    document.querySelector("#reportSummaryBody").innerHTML=summaryRows.map(r=>`<tr>
+      <td><strong>${esc(r.incident_number)}</strong>${r.walk_in?`<br><span class="badge">WALK-IN</span>`:""}</td>
+      <td>${esc(reportDateTime(r.received_time))}</td>
+      <td><span class="badge">${esc(r.incident_status)}</span></td>
+      <td>${esc(r.departments||"")}</td>
+      <td><strong>${esc(r.call_type)}</strong><br><span class="small muted">${esc(r.priority)}</span></td>
+      <td>${esc(reportLocationSummary(r))}${r.latitude!=null&&r.longitude!=null?`<br><span class="small mono muted">${Number(r.latitude).toFixed(5)}, ${Number(r.longitude).toFixed(5)}</span>`:""}</td>
+      <td>${esc(r.units||"")}</td>
+      <td>${esc(reportDateTime(r.first_enroute))}${r.dispatch_to_enroute_seconds!=null?`<br><span class="small muted">+${esc(reportDuration(r.dispatch_to_enroute_seconds))}</span>`:""}</td>
+      <td>${esc(reportDateTime(r.first_onscene))}${r.received_to_onscene_seconds!=null?`<br><span class="small muted">+${esc(reportDuration(r.received_to_onscene_seconds))}</span>`:""}</td>
+      <td>${esc(reportEmsSummary(r))}</td>
+      <td>${esc(r.disposition||r.ems_final_disposition||"")}</td>
+      <td>${esc(reportDateTime(r.closed_at))}</td>
+      <td>${esc(reportDuration(r.total_duration_seconds))}</td>
+      <td><button class="btn secondary compact" data-report-record="${r.incident_id}">View Record</button></td>
+    </tr>`).join("")||`<tr><td colspan="14" class="muted">No matching incidents.</td></tr>`;
+
+    const activityRows=activities.filter(r=>matches(r,needle));
+    document.querySelector("#reportActivityBody").innerHTML=activityRows.map(r=>`<tr>
+      <td>${esc(reportDateTime(r.activity_time))}</td>
+      <td><strong>${esc(r.incident_number)}</strong></td>
+      <td>${esc(reportDuration(r.elapsed_seconds))}</td>
+      <td>${esc(reportActorLabel(r))}</td>
+      <td>${esc([r.unit_department,r.unit_name].filter(Boolean).join(" · "))}</td>
+      <td><strong>${esc(activityTitle(r.action))}</strong></td>
+      <td>${esc(reportActivityDetail(r))}</td>
+    </tr>`).join("")||`<tr><td colspan="7" class="muted">No matching CAD activity.</td></tr>`;
+
+    const statusRows=statuses.filter(r=>matches(r,needle));
+    document.querySelector("#reportStatusBody").innerHTML=statusRows.map(r=>`<tr>
+      <td>${esc(reportDateTime(r.server_time))}</td>
+      <td><strong>${esc(r.incident_number)}</strong></td>
+      <td>${esc(reportDuration(r.elapsed_seconds))}</td>
+      <td>${esc([r.unit_department,r.unit_name].filter(Boolean).join(" · "))}</td>
+      <td>${esc(String(r.old_status||"").replaceAll("_"," "))}</td>
+      <td><strong>${esc(String(r.new_status||"").replaceAll("_"," "))}</strong></td>
+      <td>${esc(r.transport_destination_text||r.transport_treatment_area||"")}</td>
+      <td>${esc(reportActorLabel(r))}</td>
+    </tr>`).join("")||`<tr><td colspan="8" class="muted">No matching unit status activity.</td></tr>`;
+
+    document.querySelectorAll("[data-report-record]").forEach(btn=>btn.onclick=()=>{
+      const row=rows.find(r=>r.incident_id===btn.dataset.reportRecord);
+      if(row)reportIncidentRecordModal(row,activities,statuses);
+    });
+  };
+
   document.querySelector("#backCad").onclick=()=>dispatchPage();
-  document.querySelector("#downloadCsv").onclick=()=>downloadCsv(data||[]);
-}
-function downloadCsv(rows){
-  const cols=["incident_number","received_time","departments","call_type","priority","landmark","latitude","longitude","units","first_enroute","first_onscene","first_transporting","last_clear","disposition","closed_at"];
-  const q=v=>`"${String(v??"").replaceAll('"','""')}"`;
-  const csv=[cols.join(","),...rows.map(r=>cols.map(c=>q(r[c])).join(","))].join("\n");
-  const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([csv],{type:"text/csv;charset=utf-8"}));a.download=`${S.event?.event_code||"event"}-dispatch-log.csv`;a.click();URL.revokeObjectURL(a.href);
+  document.querySelector("#reportSearch").addEventListener("input",render);
+
+  document.querySelectorAll("[data-report-tab]").forEach(btn=>btn.onclick=()=>{
+    activeTab=btn.dataset.reportTab;
+    document.querySelectorAll("[data-report-tab]").forEach(b=>{
+      const active=b.dataset.reportTab===activeTab;
+      b.classList.toggle("active",active);
+      b.classList.toggle("secondary",!active);
+    });
+    document.querySelectorAll("[data-report-panel]").forEach(panel=>panel.classList.toggle("hidden",panel.dataset.reportPanel!==activeTab));
+  });
+
+  document.querySelector("#downloadSummaryCsv").onclick=()=>downloadNamedCsv(
+    `${S.event?.event_code||"event"}-dispatch-log-detailed.csv`,
+    summaryColumns,
+    rows
+  );
+  document.querySelector("#downloadActivityCsv").onclick=()=>downloadNamedCsv(
+    `${S.event?.event_code||"event"}-cad-activity.csv`,
+    activityColumns,
+    activities
+  );
+  document.querySelector("#downloadStatusCsv").onclick=()=>downloadNamedCsv(
+    `${S.event?.event_code||"event"}-unit-status-history.csv`,
+    statusColumns,
+    statuses
+  );
+
+  render();
 }
 
 /* ---------------- FIELD ---------------- */
