@@ -1963,3 +1963,222 @@ body.modal-open{
     grid-template-columns:1fr;
   }
 }
+
+
+/* ============================================================
+   v0.8.6 — DETAILED REPORTS DARK-THEME FIX
+   v0.8.4 introduced several hard-coded light report surfaces after the
+   app-wide dark-theme declarations. Keep reports on the CommCenter palette.
+   ============================================================ */
+
+.dispatch-report-page{
+  color:var(--cc-text);
+}
+
+.dispatch-report-page .card,
+.report-record-modal .incident-info-section{
+  color:var(--cc-text);
+}
+
+/* Search / controls */
+.report-controls{
+  background:linear-gradient(180deg,var(--cc-panel-2),var(--cc-panel));
+  border-color:var(--cc-line);
+}
+.report-controls input{
+  background:#091523;
+  border-color:#31465f;
+  color:var(--cc-text);
+}
+.report-controls input::placeholder{
+  color:#657b92;
+}
+
+/* Main report table shell */
+.report-table-wrap{
+  background:var(--cc-panel);
+  border-color:var(--cc-line);
+  scrollbar-color:#496179 #0a1420;
+}
+
+.dispatch-log-table{
+  color:var(--cc-text);
+  background:var(--cc-panel);
+}
+
+.dispatch-log-table th{
+  background:#0b1727;
+  color:#a9bfd6;
+  border-bottom-color:#31465f;
+  box-shadow:inset 0 -1px 0 #31465f;
+}
+
+.dispatch-log-table td{
+  color:var(--cc-text);
+  border-bottom:1px solid #25364a;
+}
+
+.dispatch-log-table tbody tr{
+  background:#0f1c2b;
+}
+
+.dispatch-log-table tbody tr:nth-child(even){
+  background:#111f30;
+}
+
+.dispatch-log-table tbody tr:hover{
+  background:#162a42;
+}
+
+.dispatch-log-table .mono{
+  color:#91a9c2;
+}
+
+/* Metrics */
+.report-metrics .card{
+  background:linear-gradient(180deg,#14253a,#0d1a29);
+  border-color:#2b4056;
+  color:var(--cc-text);
+}
+.report-metrics .metric{
+  color:#f4f8ff;
+}
+.report-metrics .muted{
+  color:var(--cc-muted);
+}
+
+/* Report tabs */
+.report-tab.active{
+  color:#fff;
+  background:linear-gradient(180deg,#2989ff,#176bd9);
+  border-color:#3b91ff;
+  box-shadow:0 0 0 2px rgba(96,165,250,.25),0 5px 14px rgba(14,96,205,.2);
+}
+.report-tab.secondary{
+  background:#162638;
+  color:#d9e7f6;
+  border-color:#30465d;
+}
+
+/* CSV dropdown — this was the most obvious white-on-white offender. */
+.report-download-panel{
+  background:#0d1a29;
+  border-color:#31465f;
+  box-shadow:0 18px 45px rgba(0,0,0,.48);
+  color:var(--cc-text);
+}
+
+.report-download-panel button{
+  color:#dce9f7;
+  background:transparent;
+}
+
+.report-download-panel button:hover,
+.report-download-panel button:focus-visible{
+  background:#172a40;
+  color:#fff;
+  outline:none;
+}
+
+/* Full incident report modal */
+.report-record-modal{
+  color:var(--cc-text);
+}
+
+.report-record-modal .incident-info-section{
+  background:#0c1928;
+  border:1px solid #26394d;
+  border-radius:10px;
+  padding:12px;
+}
+
+.report-record-modal .section-title{
+  color:#8ea6c0;
+}
+
+.report-kv-grid>span{
+  color:#8fa2b8;
+}
+
+.report-kv-grid>strong,
+.report-notes{
+  color:#edf4ff;
+}
+
+.report-detail-table-wrap{
+  background:#091522;
+  border-color:#31465f;
+  scrollbar-color:#496179 #0a1420;
+}
+
+.report-detail-table{
+  color:var(--cc-text);
+  background:#0c1928;
+}
+
+.report-detail-table th{
+  background:#08131f;
+  color:#a9bfd6;
+  border-bottom-color:#31465f;
+  box-shadow:inset 0 -1px 0 #31465f;
+}
+
+.report-detail-table td{
+  color:#e4edf7;
+  border-bottom-color:#26394d;
+}
+
+.report-detail-table tbody tr:nth-child(even){
+  background:#101f31;
+}
+
+.report-detail-table tbody tr:hover{
+  background:#162a42;
+}
+
+/* Keep badges readable on the dark report surfaces. */
+.dispatch-report-page .badge,
+.report-record-modal .badge{
+  background:#24364b;
+  border-color:#344b63;
+  color:#dce9f7;
+}
+
+/* Buttons inside report records should inherit the command UI palette. */
+.dispatch-report-page .btn.secondary,
+.report-record-modal .btn.secondary{
+  background:#162638;
+  color:#d9e7f6;
+  border-color:#30465d;
+}
+
+/* Native controls / menu affordances. */
+.report-download-menu>summary{
+  color:#fff;
+}
+
+.report-download-menu[open]>summary{
+  background:#176bd9;
+  border-color:#4b9cff;
+}
+
+/* Empty-state cells and secondary text need visible contrast. */
+.dispatch-report-page td.muted,
+.report-record-modal td.muted{
+  color:#8fa2b8;
+}
+
+/* Browser autofill / selected text can otherwise flash white surfaces. */
+.dispatch-report-page input:-webkit-autofill{
+  -webkit-text-fill-color:var(--cc-text);
+  box-shadow:0 0 0 1000px #091523 inset;
+}
+
+/* Accessible focus indication against dark surfaces. */
+.dispatch-report-page button:focus-visible,
+.dispatch-report-page input:focus-visible,
+.report-record-modal button:focus-visible{
+  outline:2px solid #60a5fa;
+  outline-offset:2px;
+}
+
