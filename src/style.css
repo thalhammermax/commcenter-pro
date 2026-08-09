@@ -1317,3 +1317,26 @@ body.modal-open{
     border-bottom:1px solid #253249;
   }
 }
+
+
+/* v0.7.3 — transport destination workflow */
+.transport-destination-editor{
+  display:grid;
+  gap:8px;
+  margin-top:12px;
+  padding:12px;
+  border:1px solid #475569;
+  border-radius:10px;
+  background:#0b1324;
+}
+.transport-destination-editor.hidden{
+  display:none;
+}
+.transport-destination-readout{
+  color:#fde68a;
+  font-weight:700;
+}
+.assignment-unit-actions .transport-destination-readout{
+  align-self:center;
+  max-width:220px;
+}

@@ -10,7 +10,8 @@ import { loadVenueChoices, applyVenueVersionToEvent, saveEventToVenueLibrary, re
 const app=document.querySelector("#app");
 const S={
   mode:null,session:null,orgs:[],orgId:null,events:[],eventId:null,event:null,
-  departments:[],units:[],incidents:[],pois:[],eventMap:null,mapLayers:[],zones:[],accessPoints:[],accessNodes:[],activeMapLayerId:null,map:null,realtime:[],
+  departments:[],units:[],incidents:[],pois:[],eventMap:null,mapLayers:[],zones:[],accessPoints:[],accessNodes:[],
+  emsUnitConfigs:[],treatmentAreas:[],activeMapLayerId:null,map:null,realtime:[],
   fieldSession:null,currentLocation:null,isPlatformAdmin:false,callTimerInterval:null,
   unitLocations:[],unitLocationMarkers:new Map(),locationAgeInterval:null,
   locationWatchId:null,locationLastSentAt:0,locationLastSent:null,locationWriteInFlight:false,
@@ -545,7 +546,9 @@ async function loadEventOps(){
     zonesRes,
     accessPointsRes,
     accessNodesRes,
-    unitLocationsRes
+    unitLocationsRes,
+    emsUnitConfigsRes,
+    treatmentAreasRes
   ] = await Promise.all([
     supabase.from("events").select("*").eq("id",S.eventId).single(),
     supabase.from("event_departments").select("*").eq("event_id",S.eventId).order("sort_order"),
@@ -564,7 +567,9 @@ async function loadEventOps(){
     supabase.from("event_zones").select("*").eq("event_id",S.eventId).eq("active",true).order("sort_order"),
     supabase.from("venue_access_points").select("*").eq("event_id",S.eventId).eq("active",true).order("name"),
     supabase.from("venue_access_point_nodes").select("*"),
-    supabase.from("unit_locations").select("*").eq("event_id",S.eventId)
+    supabase.from("unit_locations").select("*").eq("event_id",S.eventId),
+    supabase.from("ems_unit_config").select("*"),
+    supabase.from("ems_treatment_areas").select("*").eq("event_id",S.eventId).eq("active",true).order("name")
   ]);
 
   const baseResults = {
@@ -578,7 +583,9 @@ async function loadEventOps(){
     zones: zonesRes,
     accessPoints: accessPointsRes,
     accessNodes: accessNodesRes,
-    unitLocations: unitLocationsRes
+    unitLocations: unitLocationsRes,
+    emsUnitConfigs: emsUnitConfigsRes,
+    treatmentAreas: treatmentAreasRes
   };
 
   const failed = Object.entries(baseResults).filter(([,res])=>res.error);
@@ -630,6 +637,8 @@ async function loadEventOps(){
   S.zones=zonesRes.data||[];
   S.accessPoints=accessPointsRes.data||[];
   S.unitLocations=unitLocationsRes.data||[];
+  S.emsUnitConfigs=emsUnitConfigsRes.data||[];
+  S.treatmentAreas=treatmentAreasRes.data||[];
   const apIds=new Set(S.accessPoints.map(a=>a.id));
   S.accessNodes=(accessNodesRes.data||[]).filter(n=>apIds.has(n.access_point_id));
   const preferred=S.mapLayers.find(l=>l.id===S.activeMapLayerId);
@@ -1216,6 +1225,7 @@ function unitList(){
           <span class="badge status-${esc(u.status)}" data-dispatch-unit-status="${u.id}">${esc(u.status.replaceAll("_"," "))}</span>
         </div>
         <div class="small muted">${active?`Assigned: ${esc(active.incident.incident_number)} · ${esc(active.incident.call_type)}`:"Unassigned"}</div>
+        ${unitTransportDestinationLabel(u)?`<div class="small transport-destination-readout">Transport → ${esc(unitTransportDestinationLabel(u))}</div>`:""}
         <div class="small unit-gps-readout ${unitLocation(u.id)?`gps-${locationFreshness(unitLocation(u.id))}`:"muted"}" data-unit-gps="${u.id}">${unitLocation(u.id)?`${locationAgeLabel(unitLocation(u.id))}${unitLocation(u.id).accuracy_m!=null?` · ±${Math.round(unitLocation(u.id).accuracy_m)}m`:""}`:(S.event?.field_location_enabled?"GPS not shared":"GPS disabled")}</div>
       </button>`;
     }).join("")}
@@ -1431,6 +1441,54 @@ function unitStatusOptions(unit){
   return [...new Set(["ASSIGNED",...raw])];
 }
 
+
+function unitEmsConfig(unitId){
+  return S.emsUnitConfigs.find(c=>c.unit_id===unitId&&c.active)||null;
+}
+
+function isAmbulanceUnit(unit){
+  const config=unitEmsConfig(unit?.id);
+  return !!(config&&(config.ems_role==="ambulance"||config.transport_capable));
+}
+
+function treatmentAreaName(id){
+  return S.treatmentAreas.find(a=>a.id===id)?.name||"";
+}
+
+function unitTransportDestinationLabel(unit){
+  if(!unit||unit.status!=="TRANSPORTING")return "";
+  if(unit.current_transport_destination_text)return unit.current_transport_destination_text;
+  if(unit.current_transport_treatment_area_id)return treatmentAreaName(unit.current_transport_treatment_area_id);
+  return "";
+}
+
+function transportDestinationEditorHtml(unit){
+  const ambulance=isAmbulanceUnit(unit);
+  const visible=unit.status==="TRANSPORTING"?"":"hidden";
+  return `<div class="transport-destination-editor ${visible}" id="unitTransportDestinationPanel">
+    <div class="section-title">Transport Destination</div>
+    ${ambulance?`
+      <label>Destination facility</label>
+      <input id="unitTransportFacility" value="${esc(unit.current_transport_destination_text||"")}" placeholder="Destination facility">
+    `:`
+      <label>Treatment area destination</label>
+      <select id="unitTransportTreatmentArea">
+        <option value="">Choose treatment area</option>
+        ${S.treatmentAreas.filter(a=>a.status!=="CLOSED").map(a=>`
+          <option value="${a.id}" ${unit.current_transport_treatment_area_id===a.id?"selected":""}>
+            ${esc(a.name)} · ${esc(a.status)}
+          </option>
+        `).join("")}
+      </select>
+    `}
+    <div class="grid2">
+      <button class="btn" id="confirmUnitTransport">${unit.status==="TRANSPORTING"?"Update Destination":"Set Transporting"}</button>
+      <button class="btn secondary" id="cancelUnitTransport">Cancel</button>
+    </div>
+  </div>`;
+}
+
+
 function updateDispatcherUnitStatusUI(unitId,status){
   const unit=S.units.find(u=>u.id===unitId);
   if(unit)unit.status=status;
@@ -1460,14 +1518,28 @@ function updateDispatcherUnitStatusUI(unitId,status){
   if(currentLabel)currentLabel.textContent=String(status||"").replaceAll("_"," ");
 }
 
-async function dispatcherSetUnitStatus(unitId,status,incidentId=null){
-  const {error}=await supabase.rpc("staff_set_unit_status",{
+async function dispatcherSetUnitStatus(unitId,status,incidentId=null,{destinationText=null,treatmentAreaId=null}={}){
+  const {error}=await supabase.rpc("staff_set_unit_status_v2",{
     p_unit_id:unitId,
     p_status:status,
-    p_incident_id:incidentId
+    p_incident_id:incidentId,
+    p_transport_destination_text:destinationText,
+    p_transport_treatment_area_id:treatmentAreaId
   });
-  if(error)return alert(error.message);
+  if(error){
+    alert(error.message);
+    return false;
+  }
+
+  const unit=S.units.find(u=>u.id===unitId);
+  if(unit){
+    unit.status=status;
+    unit.current_transport_destination_text=status==="TRANSPORTING"?destinationText:null;
+    unit.current_transport_treatment_area_id=status==="TRANSPORTING"?treatmentAreaId:null;
+  }
   updateDispatcherUnitStatusUI(unitId,status);
+  refreshDispatchBoards();
+  return true;
 }
 
 async function dispatcherUnassign(incidentId,unitId){
@@ -1578,10 +1650,8 @@ async function selectIncident(id){
                 <span class="small ${unitLocation(u.id)?`gps-${locationFreshness(unitLocation(u.id))}`:"muted"}" data-unit-gps="${u.id}">${unitLocation(u.id)?`${locationAgeLabel(unitLocation(u.id))}${unitLocation(u.id).accuracy_m!=null?` · ±${Math.round(unitLocation(u.id).accuracy_m)}m`:""}`:(S.event?.field_location_enabled?"GPS not shared":"GPS disabled")}</span>
               </div>
               <div class="assignment-unit-actions">
-                <select data-status-unit="${u.id}">
-                  ${unitStatusOptions(u).map(st=>`<option value="${esc(st)}" ${st===u.status?"selected":""}>${esc(st.replaceAll("_"," "))}</option>`).join("")}
-                </select>
-                <button class="btn secondary" data-apply-status="${u.id}">Set Status</button>
+                ${unitTransportDestinationLabel(u)?`<span class="small transport-destination-readout">→ ${esc(unitTransportDestinationLabel(u))}</span>`:""}
+                <button class="btn secondary" data-open-unit-controls="${u.id}">Unit Controls</button>
                 <button class="btn danger" data-unassign-unit="${u.id}">Unassign</button>
               </div>
             </div>`;
@@ -1658,11 +1728,7 @@ async function selectIncident(id){
     selectIncident(current.id);
   };
 
-  document.querySelectorAll("[data-apply-status]").forEach(b=>b.onclick=()=>{
-    const unitId=b.dataset.applyStatus;
-    const status=document.querySelector(`[data-status-unit="${unitId}"]`).value;
-    dispatcherSetUnitStatus(unitId,status,current.id);
-  });
+  document.querySelectorAll("[data-open-unit-controls]").forEach(b=>b.onclick=()=>selectUnit(b.dataset.openUnitControls));
 
   document.querySelectorAll("[data-unassign-unit]").forEach(b=>b.onclick=async()=>{
     if(!confirm("Remove this unit from the incident?"))return;
@@ -1769,7 +1835,7 @@ function selectUnit(unitId){
         <h2 id="incidentModalTitle">${esc(u.name)}</h2>
         <span class="badge status-${esc(u.status)}" data-dispatch-unit-status="${u.id}" data-unit-current-status="${u.id}">${esc(u.status.replaceAll("_"," "))}</span>
       </div>
-      <div class="incident-modal-nature">${active?`Committed to ${esc(active.incident.incident_number)}`:"Available for assignment"}</div>
+      <div class="incident-modal-nature">${active?`Committed to ${esc(active.incident.incident_number)}`:"Available for assignment"}${unitTransportDestinationLabel(u)?` · Transporting to ${esc(unitTransportDestinationLabel(u))}`:""}</div>
     </div>
     <button class="incident-modal-close" id="closeIncidentModal" aria-label="Close unit controls">×</button>
   </div>
@@ -1779,6 +1845,7 @@ function selectUnit(unitId){
       <div class="incident-info-section">
         <div class="section-title">Unit Status</div>
         ${unitStatusButtonsHtml(u,active)}
+        ${transportDestinationEditorHtml(u)}
       </div>
 
       <div class="incident-info-section">
@@ -1839,11 +1906,43 @@ function selectUnit(unitId){
 
   document.querySelectorAll(`[data-dispatch-status-option="${u.id}"]`).forEach(btn=>btn.onclick=async()=>{
     const status=btn.dataset.status;
+
+    if(status==="TRANSPORTING"){
+      document.querySelector("#unitTransportDestinationPanel")?.classList.remove("hidden");
+      document.querySelector(isAmbulanceUnit(u)?"#unitTransportFacility":"#unitTransportTreatmentArea")?.focus();
+      return;
+    }
+
     if(status===u.status)return;
 
     document.querySelectorAll(`[data-dispatch-status-option="${u.id}"]`).forEach(b=>b.disabled=true);
-    await dispatcherSetUnitStatus(unitId,status,active?.incident.id||null);
+    const ok=await dispatcherSetUnitStatus(unitId,status,active?.incident.id||null);
     document.querySelectorAll(`[data-dispatch-status-option="${u.id}"]`).forEach(b=>b.disabled=false);
+    if(ok)selectUnit(unitId);
+  });
+
+  document.querySelector("#cancelUnitTransport")?.addEventListener("click",()=>{
+    if(u.status!=="TRANSPORTING")document.querySelector("#unitTransportDestinationPanel")?.classList.add("hidden");
+  });
+
+  document.querySelector("#confirmUnitTransport")?.addEventListener("click",async()=>{
+    const ambulance=isAmbulanceUnit(u);
+    const destinationText=ambulance?document.querySelector("#unitTransportFacility").value.trim():null;
+    const treatmentAreaId=ambulance?null:(document.querySelector("#unitTransportTreatmentArea").value||null);
+
+    if(ambulance&&!destinationText)return alert("Enter the destination facility.");
+    if(!ambulance&&!treatmentAreaId)return alert("Choose the treatment area destination.");
+
+    const button=document.querySelector("#confirmUnitTransport");
+    button.disabled=true;
+    const ok=await dispatcherSetUnitStatus(
+      unitId,
+      "TRANSPORTING",
+      active?.incident.id||null,
+      {destinationText,treatmentAreaId}
+    );
+    button.disabled=false;
+    if(ok)selectUnit(unitId);
   });
 
   document.querySelector("#unitLayer").onchange=e=>{
@@ -2280,7 +2379,7 @@ function commandCallCardsHtml(){
       .map(link=>{
         const unit=S.units.find(u=>u.id===link.unit_id);
         if(!unit)return "";
-        return `<span class="command-unit-chip"><strong>${esc(unit.name)}</strong> · ${esc(String(unit.status||"").replaceAll("_"," "))}</span>`;
+        return `<span class="command-unit-chip"><strong>${esc(unit.name)}</strong> · ${esc(String(unit.status||"").replaceAll("_"," "))}${unitTransportDestinationLabel(unit)?` → ${esc(unitTransportDestinationLabel(unit))}`:""}</span>`;
       }).filter(Boolean).join("");
 
     return `<div class="command-call-card ${commandPriorityClass(i.priority)}">
@@ -2934,7 +3033,7 @@ async function fieldUnitPicker(){
 }
 async function fieldUnitCad(){
   const {data:fs,error}=await supabase.from("field_sessions")
-    .select("*,events(name,field_location_enabled,venue_type),units(name,status,event_id,current_map_layer_id,current_zone_id,event_departments(name,status_profile))")
+    .select("*,events(name,field_location_enabled,venue_type),units(name,status,event_id,current_map_layer_id,current_zone_id,current_transport_destination_text,current_transport_treatment_area_id,event_departments(name,status_profile))")
     .eq("auth_user_id",S.session.user.id).eq("active",true).order("started_at",{ascending:false}).limit(1).single();
   if(error)return fieldJoin();
   S.fieldSession=fs;S.eventId=fs.event_id;
@@ -2945,9 +3044,10 @@ async function fieldUnitCad(){
   if(incident?.map_layer_id){fieldLayer=(await supabase.from("event_map_layers").select("id,name,level_code").eq("id",incident.map_layer_id).maybeSingle()).data||null;}
   if(incident?.zone_id){fieldZone=(await supabase.from("event_zones").select("id,name").eq("id",incident.zone_id).maybeSingle()).data||null;}
   const statuses=fs.units?.event_departments?.status_profile||["AVAILABLE","RESPONDING","ON_SCENE","CLEAR"];
-  const [{data:fieldMapLayers},{data:fieldZones}]=await Promise.all([
+  const [{data:fieldMapLayers},{data:fieldZones},{data:fieldTreatmentAreas}]=await Promise.all([
     supabase.from("event_map_layers").select("id,name,level_code,is_default").eq("event_id",S.eventId).eq("active",true).eq("status","published").order("sort_order"),
-    supabase.from("event_zones").select("id,map_layer_id,name").eq("event_id",S.eventId).eq("active",true).order("sort_order")
+    supabase.from("event_zones").select("id,map_layer_id,name").eq("event_id",S.eventId).eq("active",true).order("sort_order"),
+    supabase.from("ems_treatment_areas").select("id,name,status,accepting_patients").eq("event_id",S.eventId).eq("active",true).order("name")
   ]);
   let emsState=null;
   try{emsState=await loadFieldEmsState(S.eventId,fs.unit_id,incident?.id||null);}catch(err){console.error("Field EMS panel failed to load",err);}
@@ -2988,20 +3088,85 @@ async function fieldUnitCad(){
       </div>`:""}
       ${fieldEmsPanelHtml(emsState,incident)}
       <div class="status-buttons">${statuses.map(status=>`<button class="btn field-status-button ${fieldStatusColorClass(status)} ${status===fs.units?.status?"field-status-active":""}" data-status="${esc(status)}" aria-pressed="${status===fs.units?.status?"true":"false"}">${esc(status.replaceAll("_"," "))}</button>`).join("")}</div>
+      <div class="card transport-destination-editor ${fs.units?.status==="TRANSPORTING"?"":"hidden"}" id="fieldTransportDestinationPanel">
+        <div class="section-title">Transport Destination</div>
+        ${emsState?.config?.active&&(emsState.config.ems_role==="ambulance"||emsState.config.transport_capable)?`
+          <label>Destination facility</label>
+          <input id="fieldTransportFacility" value="${esc(fs.units?.current_transport_destination_text||"")}" placeholder="Destination facility">
+        `:`
+          <label>Treatment area destination</label>
+          <select id="fieldTransportTreatmentArea">
+            <option value="">Choose treatment area</option>
+            ${(fieldTreatmentAreas||[]).filter(a=>a.status!=="CLOSED").map(a=>`
+              <option value="${a.id}" ${fs.units?.current_transport_treatment_area_id===a.id?"selected":""}>${esc(a.name)} · ${esc(a.status)}</option>
+            `).join("")}
+          </select>
+        `}
+        <div class="grid2">
+          <button class="btn" id="confirmFieldTransport">${fs.units?.status==="TRANSPORTING"?"Update Destination":"Set Transporting"}</button>
+          <button class="btn secondary" id="cancelFieldTransport">Cancel</button>
+        </div>
+      </div>
       <div class="notice ${navigator.onLine?"ok":""}">${navigator.onLine?"Connected":"Offline — CAD changes cannot reach dispatch until connectivity returns."}</div>
       <button class="btn secondary" id="downloadOffline">Download Event Map for Offline Use</button>
       <div id="offlineStatus" class="small muted"></div>
       <button class="btn secondary" id="changeUnit">Change Unit</button><button class="btn secondary" id="leaveEvent">Leave Event</button>
     </div></div>`;
   ensureCallTimerTicker();
+  const fieldIsAmbulance=!!(emsState?.config?.active&&(emsState.config.ems_role==="ambulance"||emsState.config.transport_capable));
+
+  const setFieldStatus=async(requested,{destinationText=null,treatmentAreaId=null}={})=>{
+    const {error}=await supabase.rpc("field_set_unit_status_v2",{
+      p_unit_id:fs.unit_id,
+      p_status:requested,
+      p_incident_id:incident?.id||null,
+      p_client_time:new Date().toISOString(),
+      p_transport_destination_text:destinationText,
+      p_transport_treatment_area_id:treatmentAreaId
+    });
+    if(error){
+      alert(error.message);
+      return false;
+    }
+
+    fs.units.status=requested;
+    fs.units.current_transport_destination_text=requested==="TRANSPORTING"?destinationText:null;
+    fs.units.current_transport_treatment_area_id=requested==="TRANSPORTING"?treatmentAreaId:null;
+    updateFieldUnitStatusUI(requested);
+    return true;
+  };
+
   document.querySelectorAll("[data-status]").forEach(b=>b.onclick=async()=>{
     const requested=b.dataset.status;
+
+    if(requested==="TRANSPORTING"){
+      document.querySelector("#fieldTransportDestinationPanel")?.classList.remove("hidden");
+      document.querySelector(fieldIsAmbulance?"#fieldTransportFacility":"#fieldTransportTreatmentArea")?.focus();
+      return;
+    }
+
+    if(requested===fs.units.status)return;
     b.disabled=true;
-    const {error}=await supabase.rpc("field_set_unit_status",{p_unit_id:fs.unit_id,p_status:requested,p_incident_id:incident?.id||null,p_client_time:new Date().toISOString()});
+    const ok=await setFieldStatus(requested);
     b.disabled=false;
-    if(error)return alert(error.message);
-    fs.units.status=requested;
-    updateFieldUnitStatusUI(requested);
+    if(ok)document.querySelector("#fieldTransportDestinationPanel")?.classList.add("hidden");
+  });
+
+  document.querySelector("#cancelFieldTransport")?.addEventListener("click",()=>{
+    if(fs.units.status!=="TRANSPORTING")document.querySelector("#fieldTransportDestinationPanel")?.classList.add("hidden");
+  });
+
+  document.querySelector("#confirmFieldTransport")?.addEventListener("click",async()=>{
+    const destinationText=fieldIsAmbulance?document.querySelector("#fieldTransportFacility").value.trim():null;
+    const treatmentAreaId=fieldIsAmbulance?null:(document.querySelector("#fieldTransportTreatmentArea").value||null);
+    if(fieldIsAmbulance&&!destinationText)return alert("Enter the destination facility.");
+    if(!fieldIsAmbulance&&!treatmentAreaId)return alert("Choose the treatment area destination.");
+
+    const button=document.querySelector("#confirmFieldTransport");
+    button.disabled=true;
+    const ok=await setFieldStatus("TRANSPORTING",{destinationText,treatmentAreaId});
+    button.disabled=false;
+    if(ok)fieldUnitCad();
   });
   if(fs.events?.field_location_enabled){
     bindFieldLocationControls(fs,fieldMapLayers||[],fieldZones||[]);
@@ -3407,6 +3572,8 @@ function reset(){
   S.locationWriteInFlight=false;
   S.unitLocations=[];
   S.unitLocationMarkers.clear();
+  S.emsUnitConfigs=[];
+  S.treatmentAreas=[];
   S.dispatchDepartmentIds=[];
   S.commandDepartmentIds=[];
   S.commandDisplayMode="calls";

@@ -541,13 +541,13 @@ export function fieldEmsPanelHtml(state,incident){
 function fieldEncounterActions(e,state){
   if(state.config.ems_role==="ambulance"||state.config.transport_capable){
     if(e.current_status==="TRANSPORTING"){
-      return `<div class="stack"><button class="btn good" data-complete-transport="${e.id}">Complete Transport</button></div>`;
+      return `<div class="stack">
+        ${e.transport_destination?`<div class="notice"><strong>Destination</strong><br>${esc(e.transport_destination)}</div>`:""}
+        <button class="btn good" data-complete-transport="${e.id}">Complete Transport</button>
+      </div>`;
     }
     return `<div class="stack">
-      <div class="grid2">
-        <input id="dest-${e.id}" placeholder="Transport destination">
-        <button class="btn" data-start-transport="${e.id}">Start Transport</button>
-      </div>
+      <div class="small muted">Use the unit status controls below and choose TRANSPORTING to enter the destination facility and start transport.</div>
       <button class="btn secondary" data-release-encounter="${e.id}">Close / Other Disposition</button>
     </div>`;
   }
@@ -648,13 +648,6 @@ export function bindFieldEmsPanel(state,{eventId,unitId,incident,refresh}){
     if(error)alert(error.message);else await refresh();
   });
 
-  document.querySelectorAll("[data-start-transport]").forEach(b=>b.onclick=async()=>{
-    const id=b.dataset.startTransport;
-    const dest=document.querySelector(`#dest-${id}`).value.trim();
-    if(!dest)return alert("Enter the transport destination.");
-    const {error}=await supabase.rpc("ems_mark_transporting",{p_encounter_id:id,p_destination:dest});
-    if(error)alert(error.message);else await refresh();
-  });
 
   document.querySelectorAll("[data-complete-transport]").forEach(b=>b.onclick=async()=>{
     if(!confirm("Mark transport complete and close this EMS flow?"))return;
