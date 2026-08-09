@@ -1319,6 +1319,7 @@ function activityTitle(action){
     EMS_HANDOFF_CANCELLED:"EMS handoff cancelled",
     EMS_TREATMENT_RECEIVED:"Treatment-area custody confirmed",
     EMS_CUSTODY_SET:"EMS custody recorded",
+    UNIT_ARRIVED_TREATMENT_AREA:"Unit arrived at treatment area",
     EMS_TRANSPORT_STARTED:"Transport started",
     EMS_TRANSPORT_COMPLETED:"Transport completed",
     INCIDENT_CLOSED:"Incident closed"
@@ -1353,6 +1354,9 @@ function activitySummary(row){
   if(row.action==="EMS_CUSTODY_SET"){
     const unit=d.to_unit_id?S.units.find(u=>u.id===d.to_unit_id)?.name:null;
     return `${d.incident_number||""}${unit?` → ${unit}`:""}`;
+  }
+  if(row.action==="UNIT_ARRIVED_TREATMENT_AREA"){
+    return d.treatment_area_name?`Patient received at ${d.treatment_area_name}`:"Patient received at treatment area";
   }
   if(d.incident_number)return d.incident_number;
   if(d.status)return String(d.status).replaceAll("_"," ");
@@ -1867,6 +1871,16 @@ function selectUnit(unitId){
         <div class="section-title">Unit Status</div>
         ${unitStatusButtonsHtml(u,active)}
         ${transportDestinationEditorHtml(u)}
+        ${active&&!isAmbulanceUnit(u)&&u.status==="TRANSPORTING"&&u.current_transport_treatment_area_id?`
+          <div class="treatment-arrival-action">
+            <div>
+              <div class="section-title">Treatment Area Arrival</div>
+              <strong>${esc(treatmentAreaName(u.current_transport_treatment_area_id)||"Treatment Area")}</strong>
+              <div class="small muted">Marks the patient received at the treatment area, clears this unit from the incident, and returns the unit to AVAILABLE.</div>
+            </div>
+            <button class="btn good block" id="arriveUnitTreatmentArea">Arrived at Treatment Area</button>
+          </div>
+        `:""}
       </div>
 
       <div class="incident-info-section">
@@ -1964,6 +1978,32 @@ function selectUnit(unitId){
     );
     button.disabled=false;
     if(ok)selectUnit(unitId);
+  });
+
+  document.querySelector("#arriveUnitTreatmentArea")?.addEventListener("click",async()=>{
+    if(!active)return;
+    const areaName=treatmentAreaName(u.current_transport_treatment_area_id)||"the treatment area";
+    if(!confirm(`Confirm ${u.name} has arrived at ${areaName} with the patient?`))return;
+
+    const button=document.querySelector("#arriveUnitTreatmentArea");
+    button.disabled=true;
+    button.textContent="Recording Arrival…";
+
+    const {data,error}=await supabase.rpc("unit_arrive_treatment_area",{
+      p_unit_id:unitId,
+      p_incident_id:active.incident.id
+    });
+
+    if(error){
+      button.disabled=false;
+      button.textContent="Arrived at Treatment Area";
+      return alert(error.message);
+    }
+
+    await loadEventOps();
+    refreshDispatchBoards();
+    alert(`${u.name} arrived at ${data||areaName}. Patient custody is now with the treatment area and the unit is AVAILABLE.`);
+    selectUnit(unitId);
   });
 
   document.querySelector("#unitLayer").onchange=e=>{
@@ -3072,6 +3112,7 @@ async function fieldUnitCad(){
   ]);
   let emsState=null;
   try{emsState=await loadFieldEmsState(S.eventId,fs.unit_id,incident?.id||null);}catch(err){console.error("Field EMS panel failed to load",err);}
+  const fieldIsAmbulance=!!(emsState?.config?.active&&(emsState.config.ems_role==="ambulance"||emsState.config.transport_capable));
 
   app.innerHTML=`<div class="shell">${header(`${esc(fs.events?.name||"")} · ${esc(fs.units?.event_departments?.name||"")}`)}
     <div class="field-shell stack">
@@ -3127,6 +3168,16 @@ async function fieldUnitCad(){
           <button class="btn" id="confirmFieldTransport">${fs.units?.status==="TRANSPORTING"?"Update Destination":"Set Transporting"}</button>
           <button class="btn secondary" id="cancelFieldTransport">Cancel</button>
         </div>
+        ${!fieldIsAmbulance&&fs.units?.status==="TRANSPORTING"&&fs.units?.current_transport_treatment_area_id&&incident?`
+          <div class="treatment-arrival-action field-treatment-arrival">
+            <div>
+              <div class="section-title">Treatment Area Arrival</div>
+              <strong>${esc((fieldTreatmentAreas||[]).find(a=>a.id===fs.units.current_transport_treatment_area_id)?.name||"Treatment Area")}</strong>
+              <div class="small muted">Use this when the unit and patient have physically arrived.</div>
+            </div>
+            <button class="btn good block" id="fieldArriveTreatmentArea">Arrived at Treatment Area</button>
+          </div>
+        `:""}
       </div>
       <div class="notice ${navigator.onLine?"ok":""}">${navigator.onLine?"Connected":"Offline — CAD changes cannot reach dispatch until connectivity returns."}</div>
       <button class="btn secondary" id="downloadOffline">Download Event Map for Offline Use</button>
@@ -3134,7 +3185,6 @@ async function fieldUnitCad(){
       <button class="btn secondary" id="changeUnit">Change Unit</button><button class="btn secondary" id="leaveEvent">Leave Event</button>
     </div></div>`;
   ensureCallTimerTicker();
-  const fieldIsAmbulance=!!(emsState?.config?.active&&(emsState.config.ems_role==="ambulance"||emsState.config.transport_capable));
 
   const setFieldStatus=async(requested,{destinationText=null,treatmentAreaId=null}={})=>{
     const {error}=await supabase.rpc("field_set_unit_status_v2",{
@@ -3188,6 +3238,29 @@ async function fieldUnitCad(){
     const ok=await setFieldStatus("TRANSPORTING",{destinationText,treatmentAreaId});
     button.disabled=false;
     if(ok)fieldUnitCad();
+  });
+
+  document.querySelector("#fieldArriveTreatmentArea")?.addEventListener("click",async()=>{
+    if(!incident)return;
+    const areaName=(fieldTreatmentAreas||[]).find(a=>a.id===fs.units?.current_transport_treatment_area_id)?.name||"the treatment area";
+    if(!confirm(`Confirm arrival at ${areaName} with the patient?`))return;
+
+    const button=document.querySelector("#fieldArriveTreatmentArea");
+    button.disabled=true;
+    button.textContent="Recording Arrival…";
+
+    const {error}=await supabase.rpc("unit_arrive_treatment_area",{
+      p_unit_id:fs.unit_id,
+      p_incident_id:incident.id
+    });
+
+    if(error){
+      button.disabled=false;
+      button.textContent="Arrived at Treatment Area";
+      return alert(error.message);
+    }
+
+    fieldUnitCad();
   });
   if(fs.events?.field_location_enabled){
     bindFieldLocationControls(fs,fieldMapLayers||[],fieldZones||[]);

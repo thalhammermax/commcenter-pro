@@ -1374,3 +1374,26 @@ body.modal-open{
 }
 .cc-field-incident-pin .cc-map-pin-dot{top:7px;left:7px;}
 .leaflet-marker-icon.cc-leaflet-div-icon{overflow:visible;}
+
+
+/* v0.7.5 — treatment-area arrival from unit workflow */
+.treatment-arrival-action{
+  display:grid;
+  gap:10px;
+  margin-top:12px;
+  padding:13px;
+  border:1px solid #166534;
+  border-radius:10px;
+  background:#0b1f16;
+}
+.treatment-arrival-action strong{
+  font-size:17px;
+  color:#dcfce7;
+}
+.treatment-arrival-action .btn.good{
+  min-height:46px;
+  font-weight:800;
+}
+.field-treatment-arrival{
+  margin-top:14px;
+}
