@@ -1804,3 +1804,12 @@ body.modal-open{
     width:min(280px,calc(100vw - 24px));
   }
 }
+
+
+/* v0.8.3 — dispatcher walk-in patient */
+.walkin-patient-modal{
+  padding:20px;
+}
+.calls-panel #newWalkInPatient{
+  margin-top:7px;
+}

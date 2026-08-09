@@ -1202,6 +1202,7 @@ async function dispatchPage(){
     >
       <aside class="panel calls-panel">
         <button class="btn block" id="newIncident">+ New Incident</button>
+        <button class="btn secondary block" id="newWalkInPatient">+ Walk-In Patient</button>
         <button class="btn secondary block dispatch-scope-button" id="dispatchScopeBtn">Dispatching: ${esc(scopeLabel())}</button>
         <div class="section-title">Active incidents</div><div id="incidentList">${incidentList()}</div>
       </aside>
@@ -1267,6 +1268,7 @@ async function dispatchPage(){
   document.querySelector("#eventsBtn").onclick=()=>{closeDispatchMenu();closeIncidentModal();S.eventId=null;staffFlow();};
   document.querySelector("#logoutBtn").onclick=async()=>{closeDispatchMenu();closeIncidentModal();await supabase.auth.signOut();S.mode=null;reset();clearNavigationState();route();};
   document.querySelector("#newIncident").onclick=()=>incidentForm(null);
+  document.querySelector("#newWalkInPatient").onclick=()=>treatmentWalkInForm();
   document.querySelector("#dispatchScopeBtn").onclick=()=>renderDispatchScopeModal();
   document.querySelector("#dispatchLayerSelect")?.addEventListener("change",e=>{S.activeMapLayerId=e.target.value;saveNavigationState();setupDispatchMap();});
   bindIncidentClicks();
@@ -2481,6 +2483,126 @@ async function setupDispatchMap(){
   }
 }
 
+
+
+
+function treatmentWalkInForm(){
+  S.openIncidentId=null;
+  S.openUnitId=null;
+  S.incidentModalMode="walk-in";
+
+  const areas=(S.treatmentAreas||[]).filter(a=>a.active!==false&&a.status!=="CLOSED");
+  const detail=openIncidentModalShell();
+
+  detail.innerHTML=`<div class="incident-modal-header">
+    <div>
+      <div class="incident-modal-eyebrow">TREATMENT AREA WALK-IN</div>
+      <div class="incident-modal-title-row"><h2 id="incidentModalTitle">Create Walk-In Patient</h2></div>
+      <div class="incident-modal-nature">Creates a CAD incident with patient custody already assigned to the selected treatment area.</div>
+    </div>
+    <button class="incident-modal-close" id="closeIncidentModal" aria-label="Close walk-in patient form">×</button>
+  </div>
+
+  <div class="walkin-patient-modal stack">
+    ${areas.length?`
+      <div>
+        <label>Treatment Area</label>
+        <select id="walkInTreatmentArea">
+          <option value="">Choose treatment area</option>
+          ${areas.map(a=>`
+            <option value="${a.id}">
+              ${esc(a.name)} · ${esc(a.status)}${a.accepting_patients?"":" · Not Accepting"}
+            </option>
+          `).join("")}
+        </select>
+        <div id="walkInAreaDetails" class="small muted">Choose the treatment area where the patient presented.</div>
+      </div>
+
+      <div class="grid2">
+        <div>
+          <label>Call Type / Nature</label>
+          <input id="walkInCallType" value="Walk-In Medical" placeholder="Call type / nature">
+        </div>
+        <div>
+          <label>Priority</label>
+          <select id="walkInPriority">
+            <option selected>Standard</option>
+            <option>Urgent</option>
+            <option>Critical</option>
+          </select>
+        </div>
+      </div>
+
+      <div>
+        <label>Dispatch / Treatment Notes</label>
+        <textarea id="walkInNotes" rows="6" placeholder="Operational notes"></textarea>
+      </div>
+
+      <div class="notice">
+        <strong>What this does</strong><br>
+        Creates a normal CAD incident using the treatment area's configured location and department, then places the patient directly into that treatment area's EMS custody.
+      </div>
+    `:`
+      <div class="notice error">
+        <strong>No treatment areas are available.</strong><br>
+        Configure an active treatment area in EMS Setup before creating a walk-in patient.
+      </div>
+    `}
+  </div>
+
+  <div class="incident-modal-footer">
+    <button class="btn secondary" id="cancelWalkInPatient">Cancel</button>
+    ${areas.length?`<button class="btn" id="createWalkInPatient">Create Walk-In Patient</button>`:""}
+  </div>`;
+
+  const close=()=>closeIncidentModal();
+  document.querySelector("#closeIncidentModal").onclick=close;
+  document.querySelector("#cancelWalkInPatient").onclick=close;
+
+  const areaSelect=document.querySelector("#walkInTreatmentArea");
+  areaSelect?.addEventListener("change",()=>{
+    const area=areas.find(a=>a.id===areaSelect.value);
+    const host=document.querySelector("#walkInAreaDetails");
+    if(!host)return;
+    host.textContent=area
+      ? `${area.name} · ${area.status}${area.accepting_patients?" · Accepting patients":" · Not accepting patients"}`
+      : "Choose the treatment area where the patient presented.";
+  });
+
+  document.querySelector("#createWalkInPatient")?.addEventListener("click",async()=>{
+    const areaId=document.querySelector("#walkInTreatmentArea").value||null;
+    if(!areaId)return alert("Choose a treatment area.");
+
+    const callType=document.querySelector("#walkInCallType").value.trim();
+    if(!callType)return alert("Enter a call type / nature.");
+
+    const button=document.querySelector("#createWalkInPatient");
+    button.disabled=true;
+    button.textContent="Creating…";
+
+    const {data,error}=await supabase.rpc("create_treatment_walkin_incident_v2",{
+      p_treatment_area_id:areaId,
+      p_call_type:callType,
+      p_priority:document.querySelector("#walkInPriority").value,
+      p_notes:document.querySelector("#walkInNotes").value.trim()||null
+    });
+
+    if(error){
+      button.disabled=false;
+      button.textContent="Create Walk-In Patient";
+      return alert(error.message);
+    }
+
+    closeIncidentModal();
+    await loadEventOps();
+    refreshDispatchBoards();
+    await setupDispatchMap();
+
+    if(data&&S.incidents.some(i=>i.id===data)){
+      selectIncident(data);
+    }
+  });
+}
 
 
 function incidentForm(loc,draft=null){
