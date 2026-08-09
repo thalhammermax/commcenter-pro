@@ -2750,3 +2750,211 @@ body.modal-open{
   outline:2px solid #60a5fa;
   outline-offset:3px;
 }
+
+
+/* ============================================================
+   v0.9.3 — FIELD REPORT TIME REFERENCE + TREATMENT QR
+   ============================================================ */
+
+.field-report-shell{
+  width:min(980px,calc(100% - 24px));
+  margin:18px auto 36px;
+}
+
+.field-report-header-card{
+  background:linear-gradient(180deg,#132235,#0d1a29);
+  border-color:#31465f;
+}
+
+.field-report-time-notice{
+  margin-top:12px;
+}
+
+.field-report-call-list{
+  display:grid;
+  gap:10px;
+}
+
+.field-report-call-card{
+  padding:0;
+  overflow:hidden;
+}
+
+.field-report-call-card>summary{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+  padding:14px;
+  cursor:pointer;
+  list-style:none;
+  background:#0f1c2b;
+}
+
+.field-report-call-card>summary::-webkit-details-marker{
+  display:none;
+}
+
+.field-report-call-card[open]>summary{
+  border-bottom:1px solid #31465f;
+  background:#13243a;
+}
+
+.field-report-incident-number{
+  font-size:18px;
+}
+
+.field-report-summary-chevron{
+  color:#91a9c2;
+  font-size:20px;
+  transition:transform .15s ease;
+}
+
+.field-report-call-card[open] .field-report-summary-chevron{
+  transform:rotate(180deg);
+}
+
+.field-report-call-body{
+  padding:14px;
+}
+
+.field-report-key-times{
+  display:grid;
+  grid-template-columns:repeat(3,minmax(0,1fr));
+  gap:8px;
+}
+
+.field-report-key-times>div{
+  display:grid;
+  gap:3px;
+  min-width:0;
+  padding:9px 10px;
+  border:1px solid #26394d;
+  border-radius:9px;
+  background:#091522;
+}
+
+.field-report-key-times span{
+  color:#8fa2b8;
+  font-size:11px;
+}
+
+.field-report-key-times strong{
+  color:#f1f7ff;
+  font-size:14px;
+}
+
+.field-report-key-times small{
+  color:#a9bfd6;
+  overflow-wrap:anywhere;
+}
+
+.field-report-status-timeline{
+  display:grid;
+  gap:0;
+  overflow:hidden;
+  border:1px solid #26394d;
+  border-radius:9px;
+}
+
+.field-report-timeline-row{
+  display:grid;
+  grid-template-columns:110px minmax(0,1fr);
+  gap:12px;
+  padding:9px 10px;
+  border-bottom:1px solid #26394d;
+  background:#0b1727;
+}
+
+.field-report-timeline-row:last-child{
+  border-bottom:0;
+}
+
+.field-report-timeline-row:nth-child(even){
+  background:#0f1d2d;
+}
+
+.field-report-call-meta{
+  padding:10px;
+  border:1px solid #26394d;
+  border-radius:9px;
+  background:#0a1725;
+}
+
+.field-report-reference-card{
+  border-color:#31556f;
+  background:linear-gradient(180deg,#11263a,#0c1a28);
+}
+
+.field-report-unit-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fill,minmax(180px,1fr));
+  gap:8px;
+  margin-top:9px;
+}
+
+.field-report-unit-choice{
+  display:grid;
+  gap:4px;
+  text-align:left;
+}
+
+.field-report-join-card{
+  width:min(440px,calc(100vw - 24px));
+}
+
+.treatment-report-qr-card{
+  display:grid;
+  grid-template-columns:minmax(0,1fr) auto;
+  gap:22px;
+  align-items:center;
+  border-color:#31556f;
+  background:linear-gradient(180deg,#102438,#0b1927);
+}
+
+.treatment-report-qr-copy{
+  display:grid;
+  gap:7px;
+  align-content:center;
+}
+
+.treatment-report-qr{
+  display:grid;
+  justify-items:center;
+  gap:6px;
+  text-align:center;
+}
+
+.treatment-report-qr img{
+  display:block;
+  width:220px;
+  max-width:100%;
+  height:auto;
+  padding:8px;
+  border-radius:10px;
+  background:#fff;
+}
+
+@media(max-width:760px){
+  .field-report-key-times{
+    grid-template-columns:repeat(2,minmax(0,1fr));
+  }
+
+  .treatment-report-qr-card{
+    grid-template-columns:1fr;
+  }
+
+  .treatment-report-qr{
+    justify-self:center;
+  }
+}
+
+@media(max-width:480px){
+  .field-report-key-times{
+    grid-template-columns:1fr;
+  }
+
+  .field-report-timeline-row{
+    grid-template-columns:90px minmax(0,1fr);
+  }
+}

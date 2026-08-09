@@ -29,7 +29,8 @@ const S={
   commandRefreshTimer:null,
   commandClockInterval:null,
   mapPickMode:null,
-  pendingIncidentDraft:null
+  pendingIncidentDraft:null,
+  fieldReportSessionOwned:false
 };
 
 const esc=(v="")=>String(v).replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m]));
@@ -539,6 +540,29 @@ function saveCommandDisplayPreferences(){
 function commandViewRequested(){
   try{return new URLSearchParams(window.location.search).get("view")==="command";}catch{return false;}
 }
+
+function fieldReportViewRequested(){
+  try{return new URLSearchParams(window.location.search).get("view")==="field-reports";}catch{return false;}
+}
+
+function fieldReportPrefillEventCode(){
+  try{return (new URLSearchParams(window.location.search).get("event")||"").trim().toUpperCase();}catch{return "";}
+}
+
+function setFieldReportViewUrl(active,eventCode=null){
+  try{
+    const url=new URL(window.location.href);
+    if(active){
+      url.searchParams.set("view","field-reports");
+      if(eventCode)url.searchParams.set("event",String(eventCode).trim().toUpperCase());
+    }else{
+      url.searchParams.delete("view");
+      url.searchParams.delete("event");
+    }
+    history.replaceState(null,"",url);
+  }catch{}
+}
+
 function setCommandViewUrl(active){
   try{
     const url=new URL(window.location.href);
@@ -644,6 +668,11 @@ async function init(){
 
 async function route(){
   cleanupRealtime();
+
+  if(fieldReportViewRequested()){
+    return fieldReportAccessFlow();
+  }
+
   saveNavigationState();
   if(!S.mode)return landing();
   if(S.mode==="staff"){
@@ -5250,6 +5279,418 @@ async function reportsPage(){
   render();
 }
 
+
+/* ---------------- FIELD REPORT TIMES ---------------- */
+
+function fieldReportDateTime(value){
+  if(!value)return "—";
+  const d=new Date(value);
+  if(Number.isNaN(d.getTime()))return "—";
+  return d.toLocaleString([],{
+    year:"numeric",
+    month:"2-digit",
+    day:"2-digit",
+    hour:"2-digit",
+    minute:"2-digit",
+    second:"2-digit"
+  });
+}
+
+function fieldReportTime(value){
+  if(!value)return "—";
+  const d=new Date(value);
+  if(Number.isNaN(d.getTime()))return "—";
+  return d.toLocaleTimeString([],{
+    hour:"2-digit",
+    minute:"2-digit",
+    second:"2-digit"
+  });
+}
+
+function fieldReportCompactDateTime(value){
+  if(!value)return "—";
+  const d=new Date(value);
+  if(Number.isNaN(d.getTime()))return "—";
+  return d.toLocaleString([],{
+    month:"2-digit",
+    day:"2-digit",
+    hour:"2-digit",
+    minute:"2-digit",
+    second:"2-digit"
+  });
+}
+
+function fieldReportDurationBetween(start,end){
+  if(!start||!end)return "";
+  const a=new Date(start).getTime();
+  const b=new Date(end).getTime();
+  if(!Number.isFinite(a)||!Number.isFinite(b)||b<a)return "";
+  return reportDuration(Math.floor((b-a)/1000));
+}
+
+function fieldReportKeyTimes(row){
+  return [
+    {label:"Call Received",time:row.received_at},
+    {label:"Unit Assigned",time:row.assigned_at},
+    {label:"Responding",time:row.first_responding_at},
+    {label:"En Route",time:row.first_enroute_at},
+    {label:"On Scene",time:row.first_onscene_at},
+    {label:"Working",time:row.first_working_at},
+    {label:"Transporting",time:row.first_transporting_at,detail:row.transport_destination||""},
+    {label:"At Hospital",time:row.first_at_hospital_at},
+    {label:"Treatment Area Handoff",time:row.treatment_handoff_at,detail:row.treatment_area_name||""},
+    {label:"Unit Cleared",time:row.cleared_at},
+    {label:"Incident Closed",time:row.incident_closed_at}
+  ].filter(item=>item.time);
+}
+
+function fieldReportTimelineHtml(row){
+  const timeline=Array.isArray(row.status_timeline)?row.status_timeline:[];
+  if(!timeline.length)return `<div class="small muted">No unit status transitions were recorded for this call.</div>`;
+
+  return `<div class="field-report-status-timeline">
+    ${timeline.map(item=>`
+      <div class="field-report-timeline-row">
+        <div class="mono">${esc(fieldReportCompactDateTime(item.time))}</div>
+        <div>
+          <strong>${esc(String(item.to||"Status").replaceAll("_"," "))}</strong>
+          ${item.from?`<div class="small muted">from ${esc(String(item.from).replaceAll("_"," "))}</div>`:""}
+          ${item.destination?`<div class="small">Destination: ${esc(item.destination)}</div>`:""}
+        </div>
+      </div>
+    `).join("")}
+  </div>`;
+}
+
+function fieldReportCallCard(row,index){
+  const keyTimes=fieldReportKeyTimes(row);
+  const responseDuration=fieldReportDurationBetween(
+    row.received_at,
+    row.first_onscene_at||row.first_enroute_at
+  );
+
+  return `<details class="card field-report-call-card" ${index===0?"open":""}>
+    <summary>
+      <div>
+        <div class="row start">
+          <strong class="big field-report-incident-number">${esc(row.incident_number)}</strong>
+          <span class="badge">${esc(row.incident_status||"")}</span>
+        </div>
+        <div>${esc(row.call_type||"Incident")}${row.priority?` · ${esc(row.priority)}`:""}</div>
+        <div class="small muted">
+          ${esc(fieldReportDateTime(row.received_at))}
+          ${row.operational_period_name?` · ${esc(row.operational_period_name)}`:""}
+          ${row.landmark?` · ${esc(row.landmark)}`:""}
+        </div>
+      </div>
+      <span class="field-report-summary-chevron" aria-hidden="true">⌄</span>
+    </summary>
+
+    <div class="field-report-call-body stack">
+      <div class="field-report-key-times">
+        ${keyTimes.map(item=>`
+          <div>
+            <span>${esc(item.label)}</span>
+            <strong class="mono">${esc(fieldReportCompactDateTime(item.time))}</strong>
+            ${item.detail?`<small>${esc(item.detail)}</small>`:""}
+          </div>
+        `).join("")}
+      </div>
+
+      ${responseDuration?`
+        <div class="small muted">Received → ${row.first_onscene_at?"On Scene":"En Route"}: <strong>${esc(responseDuration)}</strong></div>
+      `:""}
+
+      <div class="incident-info-section">
+        <div class="section-title">Complete Unit Status Timeline</div>
+        ${fieldReportTimelineHtml(row)}
+      </div>
+
+      <div class="report-kv-grid field-report-call-meta">
+        <span>Disposition</span><strong>${esc(row.disposition||"—")}</strong>
+        <span>Transport Destination</span><strong>${esc(row.transport_destination||"—")}</strong>
+        <span>Treatment Area</span><strong>${esc(row.treatment_area_name||"—")}</strong>
+        <span>Incident Closed</span><strong>${esc(fieldReportDateTime(row.incident_closed_at))}</strong>
+      </div>
+    </div>
+  </details>`;
+}
+
+async function fieldCallTimesPage({
+  unitId,
+  standalone=false
+}={}){
+  if(!unitId)return fieldReportUnitPicker();
+
+  const [unitRes,timesRes]=await Promise.all([
+    supabase.from("units")
+      .select("id,name,event_id,event_departments(name,short_name)")
+      .eq("id",unitId)
+      .single(),
+    supabase.rpc("field_report_call_times",{
+      p_unit_id:unitId,
+      p_limit:30
+    })
+  ]);
+
+  if(unitRes.error){
+    return fieldReportError(unitRes.error.message,{standalone});
+  }
+  if(timesRes.error){
+    return fieldReportError(timesRes.error.message,{standalone});
+  }
+
+  const unit=unitRes.data;
+  const rows=timesRes.data||[];
+
+  app.innerHTML=`<div class="shell">${header(`${esc(unit.event_departments?.name||"Field")} · Report Times`)}
+    <div class="field-report-shell stack">
+      <div class="card field-report-header-card">
+        <div class="row">
+          <div>
+            <div class="section-title">FIELD REPORT REFERENCE</div>
+            <div class="big">${esc(unit.name)}</div>
+            <div class="small muted">${esc(unit.event_departments?.name||"")}</div>
+          </div>
+          <div class="nav">
+            <button class="btn secondary" id="fieldReportRefresh">Refresh</button>
+            ${standalone
+              ?`<button class="btn secondary" id="fieldReportChangeUnit">Change Unit</button>`
+              :`<button class="btn secondary" id="fieldReportBack">Back to Unit CAD</button>`}
+          </div>
+        </div>
+
+        <div class="notice field-report-time-notice">
+          <strong>CAD timestamp reference</strong><br>
+          Use these recorded times when completing your operational or patient-care report. Times shown are CommCenter server timestamps unless otherwise indicated by the underlying CAD record.
+        </div>
+      </div>
+
+      <div class="field-report-call-list">
+        ${rows.map(fieldReportCallCard).join("")||`
+          <div class="card">
+            <strong>No calls found for ${esc(unit.name)}.</strong>
+            <p class="muted">CommCenter has no incident assignment history for this unit yet.</p>
+          </div>
+        `}
+      </div>
+
+      ${standalone?`
+        <button class="btn secondary" id="fieldReportExit">Exit Report Lookup</button>
+      `:""}
+    </div>
+  </div>`;
+
+  document.querySelector("#fieldReportRefresh").onclick=()=>fieldCallTimesPage({unitId,standalone});
+  document.querySelector("#fieldReportBack")?.addEventListener("click",()=>fieldUnitCad());
+  document.querySelector("#fieldReportChangeUnit")?.addEventListener("click",()=>fieldReportUnitPicker());
+  document.querySelector("#fieldReportExit")?.addEventListener("click",()=>exitFieldReportLookup());
+}
+
+function fieldReportError(message,{standalone=true}={}){
+  app.innerHTML=`<div class="shell">${header("Field Report Times")}
+    <div class="center"><div class="card stack">
+      <h2>Report Times Unavailable</h2>
+      <div class="notice error">${esc(message)}</div>
+      <button class="btn secondary" id="fieldReportErrorBack">${standalone?"Back to Unit Selection":"Back to Unit CAD"}</button>
+    </div></div>
+  </div>`;
+
+  document.querySelector("#fieldReportErrorBack").onclick=()=>standalone
+    ?fieldReportUnitPicker()
+    :fieldUnitCad();
+}
+
+async function fieldReportUnitPicker(){
+  if(!S.eventId){
+    return fieldReportAccessFlow();
+  }
+
+  const [eventRes,depsRes,unitsRes]=await Promise.all([
+    supabase.from("events").select("id,name,event_code").eq("id",S.eventId).single(),
+    supabase.from("event_departments").select("id,name,short_name,sort_order").eq("event_id",S.eventId).eq("active",true).order("sort_order"),
+    supabase.from("units").select("id,name,department_id,status").eq("event_id",S.eventId).eq("active",true).order("name")
+  ]);
+
+  for(const result of [eventRes,depsRes,unitsRes]){
+    if(result.error)return fieldReportError(result.error.message,{standalone:true});
+  }
+
+  const event=eventRes.data;
+  const departments=depsRes.data||[];
+  const units=unitsRes.data||[];
+  const currentUnitId=S.fieldSession?.unit_id||null;
+
+  app.innerHTML=`<div class="shell">${header(`${esc(event.name)} · Report Times`)}
+    <div class="field-report-shell stack">
+      <div class="card">
+        <div class="section-title">FIELD REPORT REFERENCE</div>
+        <h2>Select Your Unit</h2>
+        <p class="muted">This is a read-only report lookup. Selecting a unit here does not claim the unit, change its status, or affect the operational field device.</p>
+        <div class="small">Event ID: <strong class="mono">${esc(event.event_code)}</strong></div>
+      </div>
+
+      ${departments.map(dep=>`
+        <section class="card">
+          <div class="section-title">${esc(dep.name)}</div>
+          <div class="field-report-unit-grid">
+            ${units.filter(unit=>unit.department_id===dep.id).map(unit=>`
+              <button class="choice field-report-unit-choice" data-report-unit="${unit.id}">
+                <strong>${esc(unit.name)}</strong>
+                ${unit.id===currentUnitId?`<span class="badge">CURRENT UNIT</span>`:""}
+                <span class="small muted">${esc(String(unit.status||"").replaceAll("_"," "))}</span>
+              </button>
+            `).join("")||`<div class="small muted">No active units.</div>`}
+          </div>
+        </section>
+      `).join("")}
+
+      <button class="btn secondary" id="fieldReportExit">Exit Report Lookup</button>
+    </div>
+  </div>`;
+
+  document.querySelectorAll("[data-report-unit]").forEach(button=>{
+    button.onclick=()=>fieldCallTimesPage({
+      unitId:button.dataset.reportUnit,
+      standalone:true
+    });
+  });
+
+  document.querySelector("#fieldReportExit").onclick=()=>exitFieldReportLookup();
+}
+
+function fieldReportJoin(prefillCode=""){
+  app.innerHTML=`<div class="shell">${header("Field Report Times")}
+    <div class="center">
+      <div class="card stack field-report-join-card">
+        <div>
+          <div class="section-title">FIELD REPORT REFERENCE</div>
+          <h2>Access Call Times</h2>
+          <p class="muted">Enter the event access code, then choose your unit. This lookup is read-only and does not claim a unit.</p>
+        </div>
+
+        <div>
+          <label>Event ID</label>
+          <input id="fieldReportEventCode" value="${esc(prefillCode)}" placeholder="Event ID" autocapitalize="characters">
+        </div>
+
+        <div>
+          <label>4-digit access code</label>
+          <input id="fieldReportPin" inputmode="numeric" maxlength="4" placeholder="••••" autocomplete="off">
+        </div>
+
+        <div>
+          <label>Name (optional)</label>
+          <input id="fieldReportOperator" placeholder="Crew member name">
+        </div>
+
+        <button class="btn" id="fieldReportJoin">Continue to Call Times</button>
+        <button class="btn secondary" id="fieldReportExit">Cancel</button>
+        <div id="fieldReportJoinError" class="small destructive-error" role="alert" aria-live="polite"></div>
+      </div>
+    </div>
+  </div>`;
+
+  document.querySelector("#fieldReportJoin").onclick=async()=>{
+    const eventCode=document.querySelector("#fieldReportEventCode").value.trim().toUpperCase();
+    const pin=document.querySelector("#fieldReportPin").value.trim();
+    const operator=document.querySelector("#fieldReportOperator").value.trim();
+    const errorHost=document.querySelector("#fieldReportJoinError");
+    const button=document.querySelector("#fieldReportJoin");
+
+    if(!eventCode)return errorHost.textContent="Enter the Event ID.";
+    if(!/^[0-9]{4}$/.test(pin))return errorHost.textContent="Enter the 4-digit event access code.";
+
+    button.disabled=true;
+    button.textContent="Joining…";
+    errorHost.textContent="";
+
+    const {data,error}=await supabase.rpc("field_enter_event",{
+      p_event_code:eventCode,
+      p_pin:pin,
+      p_operator_name:operator||"Report Times Lookup"
+    });
+
+    if(error){
+      button.disabled=false;
+      button.textContent="Continue to Call Times";
+      errorHost.textContent=error.message;
+      return;
+    }
+
+    S.fieldSession=data;
+    S.eventId=data.event_id;
+    S.fieldReportSessionOwned=true;
+    setFieldReportViewUrl(true,eventCode);
+    fieldReportUnitPicker();
+  };
+
+  document.querySelector("#fieldReportPin").addEventListener("keydown",event=>{
+    if(event.key==="Enter")document.querySelector("#fieldReportJoin").click();
+  });
+
+  document.querySelector("#fieldReportExit").onclick=()=>exitFieldReportLookup();
+  setTimeout(()=>document.querySelector(prefillCode?"#fieldReportPin":"#fieldReportEventCode")?.focus(),0);
+}
+
+async function fieldReportAccessFlow(){
+  const prefillCode=fieldReportPrefillEventCode();
+
+  if(!S.session){
+    const {data,error}=await supabase.auth.signInAnonymously();
+    if(error)return fieldReportError(error.message,{standalone:true});
+    S.session=data.session;
+  }
+
+  const {data:fs,error}=await supabase.from("field_sessions")
+    .select("*,events(name,event_code)")
+    .eq("auth_user_id",S.session.user.id)
+    .eq("active",true)
+    .order("started_at",{ascending:false})
+    .limit(1)
+    .maybeSingle();
+
+  if(error)return fieldReportError(error.message,{standalone:true});
+
+  const sessionMatches=!!(
+    fs
+    &&(!prefillCode||String(fs.events?.event_code||"").toUpperCase()===prefillCode)
+  );
+
+  if(sessionMatches){
+    S.fieldSession=fs;
+    S.eventId=fs.event_id;
+    S.fieldReportSessionOwned=false;
+
+    if(fs.unit_id){
+      return fieldCallTimesPage({
+        unitId:fs.unit_id,
+        standalone:true
+      });
+    }
+
+    return fieldReportUnitPicker();
+  }
+
+  return fieldReportJoin(prefillCode);
+}
+
+async function exitFieldReportLookup(){
+  if(S.fieldReportSessionOwned&&S.fieldSession?.id){
+    try{
+      await supabase.rpc("field_end_session",{
+        p_field_session_id:S.fieldSession.id
+      });
+    }catch{}
+  }
+
+  S.fieldReportSessionOwned=false;
+  S.fieldSession=null;
+  S.eventId=null;
+  setFieldReportViewUrl(false);
+  route();
+}
+
 /* ---------------- FIELD ---------------- */
 
 async function fieldFlow(){
@@ -5394,6 +5835,16 @@ async function fieldUnitCad(){
           </div>
         `:""}
       </div>
+      <div class="card field-report-reference-card">
+        <div class="row">
+          <div>
+            <div class="section-title">Report Reference</div>
+            <strong>Need your CAD times?</strong>
+            <div class="small muted">View this unit's current and recent call timestamps for your report.</div>
+          </div>
+          <button class="btn secondary" id="fieldCallTimes">Call Times</button>
+        </div>
+      </div>
       <div class="notice ${navigator.onLine?"ok":""}">${navigator.onLine?"Connected":"Offline — CAD changes cannot reach dispatch until connectivity returns."}</div>
       <button class="btn secondary" id="downloadOffline">Download Event Map for Offline Use</button>
       <div id="offlineStatus" class="small muted"></div>
@@ -5493,6 +5944,10 @@ async function fieldUnitCad(){
     bindFieldLocationControls(fs,fieldMapLayers||[],fieldZones||[]);
   }
   bindFieldEmsPanel(emsState,{eventId:S.eventId,unitId:fs.unit_id,incident,refresh:()=>fieldUnitCad()});
+  document.querySelector("#fieldCallTimes")?.addEventListener("click",()=>fieldCallTimesPage({
+    unitId:fs.unit_id,
+    standalone:false
+  }));
   document.querySelector("#downloadOffline").onclick=()=>downloadOfflineEventData();
   getOfflineEvent(S.eventId).then(x=>{if(x)document.querySelector("#offlineStatus").textContent=`Offline package saved ${new Date(x.savedAt).toLocaleString()}`;}).catch(()=>{});
   document.querySelector("#changeUnit").onclick=async()=>{await stopFieldLocationSharing(fs.unit_id,{notifyServer:true});await supabase.rpc("field_release_unit",{p_field_session_id:fs.id});fieldUnitPicker();};
@@ -5899,6 +6354,7 @@ function reset(){
   S.operationalPeriods=[];
   S.activeOperationalPeriod=null;
   S.dispatchLayout=null;
+  S.fieldReportSessionOwned=false;
   S.dispatchDepartmentIds=[];
   S.commandDepartmentIds=[];
   S.commandDisplayMode="calls";

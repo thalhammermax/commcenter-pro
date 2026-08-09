@@ -1,3 +1,4 @@
+import QRCode from "qrcode";
 import { supabase } from "./supabase.js";
 
 const esc=(v="")=>String(v).replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m]));
@@ -789,6 +790,34 @@ async function treatmentDashboard(app,ts,{header,onExit}){
     const occupancy=encounters.length;
     const pct=Math.min(100,Math.round(occupancy/area.capacity*100));
 
+    const fieldReportUrl=(()=>{
+      try{
+        const url=new URL(window.location.href);
+        url.search="";
+        url.hash="";
+        url.searchParams.set("view","field-reports");
+        url.searchParams.set("event",event.event_code);
+        return url.toString();
+      }catch{
+        return `/?view=field-reports&event=${encodeURIComponent(event.event_code)}`;
+      }
+    })();
+
+    let fieldReportQrDataUrl="";
+    try{
+      fieldReportQrDataUrl=await QRCode.toDataURL(fieldReportUrl,{
+        width:260,
+        margin:2,
+        errorCorrectionLevel:"M",
+        color:{
+          dark:"#000000",
+          light:"#ffffff"
+        }
+      });
+    }catch(error){
+      console.warn("Field report QR generation failed",error);
+    }
+
     app.innerHTML=`<div class="shell">${header(`${esc(event.name)} · ${esc(area.name)}`)}
       <div class="treatment-shell stack">
         <div class="treatment-header card">
@@ -824,6 +853,25 @@ async function treatmentDashboard(app,ts,{header,onExit}){
             <button class="btn" id="createWalkin">+ Create Walk-In Incident</button>
           </div>
         </div>
+
+        <section class="card treatment-report-qr-card">
+          <div class="treatment-report-qr-copy">
+            <div class="section-title">Field Report Times</div>
+            <h3>Scan for CAD timestamps</h3>
+            <p class="muted">Field crews can scan this code to look up their unit's call times for report completion. The Event ID is preloaded; the 4-digit field access code is still required.</p>
+            <div class="small">
+              Event ID: <strong class="mono">${esc(event.event_code)}</strong>
+            </div>
+            <div class="small muted">Scan with the crew's field device or phone. Keep the Treatment Area Station in this view.</div>
+          </div>
+
+          <div class="treatment-report-qr">
+            ${fieldReportQrDataUrl
+              ?`<img src="${fieldReportQrDataUrl}" alt="QR code for ${esc(event.name)} field report times lookup">`
+              :`<div class="notice error">QR code could not be generated on this device. Report lookup address: <span class="mono">${esc(fieldReportUrl)}</span></div>`}
+            <div class="small muted">No PIN is stored in the QR code.</div>
+          </div>
+        </section>
 
         <section class="card receive-existing-card">
           <div class="row">
