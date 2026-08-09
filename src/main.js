@@ -12,6 +12,7 @@ const S={
   mode:null,session:null,orgs:[],orgId:null,events:[],eventId:null,event:null,
   departments:[],units:[],incidents:[],pois:[],eventMap:null,mapLayers:[],zones:[],accessPoints:[],accessNodes:[],
   operationalPeriods:[],activeOperationalPeriod:null,
+  dispositions:[],
   emsUnitConfigs:[],treatmentAreas:[],activeMapLayerId:null,map:null,realtime:[],
   fieldSession:null,currentLocation:null,isPlatformAdmin:false,callTimerInterval:null,
   unitLocations:[],unitLocationMarkers:new Map(),locationAgeInterval:null,
@@ -34,7 +35,49 @@ const S={
 };
 
 const esc=(v="")=>String(v).replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m]));
-const fmt=iso=>iso?new Date(iso).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}):"";
+
+const fmt=iso=>{
+  if(!iso)return "";
+  const d=new Date(iso);
+  if(Number.isNaN(d.getTime()))return "";
+  return d.toLocaleTimeString([],{
+    hour:"2-digit",
+    minute:"2-digit",
+    hour12:false,
+    hourCycle:"h23"
+  });
+};
+
+function dateTime24(value,{seconds=false,dateStyle="numeric"}={}){
+  if(!value)return "";
+  const d=new Date(value);
+  if(Number.isNaN(d.getTime()))return "";
+  const dateOptions=dateStyle==="short"
+    ?{year:"numeric",month:"short",day:"numeric"}
+    :{year:"numeric",month:"2-digit",day:"2-digit"};
+  return d.toLocaleString([],{
+    ...dateOptions,
+    hour:"2-digit",
+    minute:"2-digit",
+    ...(seconds?{second:"2-digit"}:{}),
+    hour12:false,
+    hourCycle:"h23"
+  });
+}
+
+function time24(value,{seconds=false}={}){
+  if(!value)return "";
+  const d=new Date(value);
+  if(Number.isNaN(d.getTime()))return "";
+  return d.toLocaleTimeString([],{
+    hour:"2-digit",
+    minute:"2-digit",
+    ...(seconds?{second:"2-digit"}:{}),
+    hour12:false,
+    hourCycle:"h23"
+  });
+}
+
 const header=(sub="")=>`<div class="topbar"><div class="brand">CommCenter Pro<small>${esc(sub)}</small></div><div class="nav" id="topActions"></div></div>`;
 
 function formatElapsed(startIso){
@@ -1026,6 +1069,7 @@ async function loadEventOps(){
     accessNodesRes,
     unitLocationsRes,
     operationalPeriodsRes,
+    dispositionsRes,
     emsUnitConfigsRes,
     treatmentAreasRes
   ] = await Promise.all([
@@ -1048,6 +1092,7 @@ async function loadEventOps(){
     supabase.from("venue_access_point_nodes").select("*"),
     supabase.from("unit_locations").select("*").eq("event_id",S.eventId),
     supabase.from("operational_periods").select("*").eq("event_id",S.eventId).order("created_at"),
+    supabase.from("event_dispositions").select("*").eq("event_id",S.eventId).eq("active",true).order("scope").order("sort_order").order("label"),
     supabase.from("ems_unit_config").select("*"),
     supabase.from("ems_treatment_areas").select("*").eq("event_id",S.eventId).eq("active",true).order("name")
   ]);
@@ -1065,6 +1110,7 @@ async function loadEventOps(){
     accessNodes: accessNodesRes,
     unitLocations: unitLocationsRes,
     operationalPeriods: operationalPeriodsRes,
+    dispositions: dispositionsRes,
     emsUnitConfigs: emsUnitConfigsRes,
     treatmentAreas: treatmentAreasRes
   };
@@ -1120,6 +1166,7 @@ async function loadEventOps(){
   S.unitLocations=unitLocationsRes.data||[];
   S.operationalPeriods=operationalPeriodsRes.data||[];
   S.activeOperationalPeriod=S.operationalPeriods.find(op=>op.status==="ACTIVE")||null;
+  S.dispositions=dispositionsRes.data||[];
   S.emsUnitConfigs=emsUnitConfigsRes.data||[];
   S.treatmentAreas=treatmentAreasRes.data||[];
   const apIds=new Set(S.accessPoints.map(a=>a.id));
@@ -1133,6 +1180,24 @@ async function loadEventOps(){
 function activeMapLayer(){return S.mapLayers.find(l=>l.id===S.activeMapLayerId)||null;}
 function zoneName(id){return S.zones.find(z=>z.id===id)?.name||"";}
 function layerName(id){return S.mapLayers.find(l=>l.id===id)?.name||"";}
+
+function dispositionOptions(scope){
+  return (S.dispositions||[])
+    .filter(d=>d.active!==false&&d.scope===scope)
+    .sort((a,b)=>(a.sort_order||0)-(b.sort_order||0)||String(a.label).localeCompare(String(b.label)));
+}
+
+function dispositionLabel(scope,code){
+  if(!code)return "";
+  return dispositionOptions(scope).find(d=>d.code===code)?.label||String(code).replaceAll("_"," ");
+}
+
+function incidentHasEmsDepartment(incident){
+  return (incident?.incident_departments||[]).some(link=>{
+    const dep=S.departments.find(d=>d.id===link.department_id);
+    return dep?.ems_enabled===true;
+  });
+}
 
 function operationalPeriodById(id){
   return (S.operationalPeriods||[]).find(op=>op.id===id)||null;
@@ -1151,7 +1216,11 @@ function operationalPeriodDateTime(value){
   if(!value)return "";
   const d=new Date(value);
   if(Number.isNaN(d.getTime()))return "";
-  return d.toLocaleString([],{year:"numeric",month:"short",day:"numeric",hour:"numeric",minute:"2-digit"});
+  return d.toLocaleString([],{
+    year:"numeric",month:"short",day:"numeric",
+    hour:"2-digit",minute:"2-digit",
+    hour12:false,hourCycle:"h23"
+  });
 }
 
 function toDateTimeLocalValue(value){
@@ -1159,13 +1228,42 @@ function toDateTimeLocalValue(value){
   const d=new Date(value);
   if(Number.isNaN(d.getTime()))return "";
   const pad=n=>String(n).padStart(2,"0");
-  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
 function dateTimeLocalToIso(value){
-  if(!value)return null;
-  const d=new Date(value);
-  return Number.isNaN(d.getTime())?null:d.toISOString();
+  const raw=String(value||"").trim();
+  if(!raw)return null;
+
+  // CommCenter uses an explicit 24-hour planning input so the browser cannot
+  // substitute a locale-specific AM/PM datetime picker.
+  const match=raw.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})$/);
+  if(!match)return null;
+
+  const [,year,month,day,hour,minute]=match;
+  const h=Number(hour);
+  const min=Number(minute);
+  if(h<0||h>23||min<0||min>59)return null;
+
+  const d=new Date(
+    Number(year),
+    Number(month)-1,
+    Number(day),
+    h,
+    min,
+    0,
+    0
+  );
+
+  if(
+    d.getFullYear()!==Number(year)
+    ||d.getMonth()!==Number(month)-1
+    ||d.getDate()!==Number(day)
+    ||d.getHours()!==h
+    ||d.getMinutes()!==min
+  )return null;
+
+  return d.toISOString();
 }
 
 function operationalPeriodStatusClass(status){
@@ -2007,6 +2105,7 @@ function activityTitle(action){
     EMS_TRANSPORT_STARTED:"Transport started",
     EMS_TRANSPORT_COMPLETED:"Patient delivered",
     EMS_TRANSPORT_REFUSAL:"Transport ended with refusal",
+    EMS_ENCOUNTER_CLOSED:"EMS patient flow closed",
     INCIDENT_CLOSED:"Incident closed"
   };
   return labels[action]||String(action||"Activity").replaceAll("_"," ").toLowerCase().replace(/^\w/,c=>c.toUpperCase());
@@ -2422,6 +2521,140 @@ async function dispatcherAssign(incidentId,unitId){
 }
 
 
+
+async function openCloseIncidentDispositionModal(incident,{hasEms=false}={}){
+  let existingEmsDisposition="";
+
+  const {data:emsHistory,error:emsHistoryError}=await supabase.from("ems_encounters")
+    .select("id,final_disposition,current_status,created_at")
+    .eq("event_id",S.eventId)
+    .eq("incident_id",incident.id)
+    .order("created_at",{ascending:false})
+    .limit(1);
+
+  if(emsHistoryError){
+    console.warn("Could not check EMS disposition history before incident close",emsHistoryError);
+  }else if(emsHistory?.length){
+    hasEms=true;
+    existingEmsDisposition=emsHistory[0].final_disposition||"";
+  }
+
+  const generalOptions=dispositionOptions("GENERAL");
+  const emsOptions=dispositionOptions("EMS");
+
+  if(!generalOptions.length){
+    return alert("No General disposition options are configured for this event. Run the v0.9.4 Supabase migration or contact an Event Admin.");
+  }
+
+  if(hasEms&&!emsOptions.length){
+    return alert("No EMS disposition options are configured for this event. Run the v0.9.4 Supabase migration or contact an Event Admin.");
+  }
+
+  S.incidentModalMode="close-disposition";
+  const content=openIncidentModalShell();
+
+  content.innerHTML=`<div class="incident-modal-header close-disposition-header">
+    <div>
+      <div class="incident-modal-eyebrow">CLOSE INCIDENT</div>
+      <div class="incident-modal-title-row">
+        <h2 id="incidentModalTitle">${esc(incident.incident_number)}</h2>
+        <span class="badge">${esc(incident.priority||"")}</span>
+      </div>
+      <div class="incident-modal-nature">${esc(incident.call_type||"Incident")}</div>
+    </div>
+    <button class="incident-modal-close" id="closeIncidentModal" aria-label="Cancel incident close">×</button>
+  </div>
+
+  <div class="close-disposition-modal stack">
+    <div class="notice">
+      <strong>Closing this call releases all units still committed to it.</strong><br>
+      Select the final call disposition${hasEms?" and EMS patient disposition":""}. These values are stored separately in the CAD record.
+    </div>
+
+    <div class="${hasEms?"grid2":""}">
+      <div>
+        <label>General Call Disposition</label>
+        <select id="closeGeneralDisposition">
+          <option value="">Choose disposition…</option>
+          ${generalOptions.map(option=>`
+            <option value="${esc(option.code)}" ${option.code==="COMPLETED"?"selected":""}>${esc(option.label)}</option>
+          `).join("")}
+        </select>
+        <div class="small muted">Overall operational outcome for the CAD incident.</div>
+      </div>
+
+      ${hasEms?`
+        <div>
+          <label>EMS Patient Disposition</label>
+          <select id="closeEmsDisposition">
+            <option value="">Choose EMS disposition…</option>
+            ${emsOptions.map(option=>`
+              <option value="${esc(option.code)}" ${option.code===existingEmsDisposition?"selected":""}>${esc(option.label)}</option>
+            `).join("")}
+          </select>
+          <div class="small muted">Patient-care / EMS outcome, stored separately from the general call disposition.</div>
+        </div>
+      `:""}
+    </div>
+
+    ${hasEms?`
+      <div class="notice close-disposition-ems-note">
+        If an event ambulance is actively TRANSPORTING this patient, use the ambulance's AVAILABLE → Delivered / Refusal workflow instead. CommCenter will prevent this close screen from bypassing that transport outcome.
+      </div>
+    `:""}
+
+    <div id="closeDispositionError" class="small destructive-error" role="alert" aria-live="polite"></div>
+  </div>
+
+  <div class="incident-modal-footer">
+    <button class="btn secondary" id="cancelCloseDisposition">Cancel</button>
+    <button class="btn danger" id="confirmCloseDisposition">Close Incident</button>
+  </div>`;
+
+  const close=()=>selectIncident(incident.id);
+  document.querySelector("#closeIncidentModal").onclick=close;
+  document.querySelector("#cancelCloseDisposition").onclick=close;
+
+  document.querySelector("#confirmCloseDisposition").onclick=async()=>{
+    const general=document.querySelector("#closeGeneralDisposition").value;
+    const ems=hasEms?document.querySelector("#closeEmsDisposition").value:null;
+    const errorHost=document.querySelector("#closeDispositionError");
+    const button=document.querySelector("#confirmCloseDisposition");
+
+    errorHost.textContent="";
+    if(!general){
+      errorHost.textContent="Choose a General Call Disposition.";
+      document.querySelector("#closeGeneralDisposition").focus();
+      return;
+    }
+    if(hasEms&&!ems){
+      errorHost.textContent="Choose an EMS Patient Disposition.";
+      document.querySelector("#closeEmsDisposition").focus();
+      return;
+    }
+
+    button.disabled=true;
+    button.textContent="Closing…";
+
+    const {error}=await supabase.rpc("close_incident_v2",{
+      p_incident_id:incident.id,
+      p_disposition:general,
+      p_ems_disposition:ems
+    });
+
+    if(error){
+      button.disabled=false;
+      button.textContent="Close Incident";
+      errorHost.textContent=error.message;
+      return;
+    }
+
+    closeIncidentModal();
+    await loadEventOps();
+    refreshDispatchBoards();
+  };
+}
+
 async function selectIncident(id){
   const i=S.incidents.find(x=>x.id===id);
   if(!i)return;
@@ -2473,7 +2706,7 @@ async function selectIncident(id){
         <div class="section-title">Call Information</div>
         <div class="incident-summary-grid">
           <div><span class="small muted">Operational Period</span><strong>${esc(operationalPeriodName(current.operational_period_id)||"Legacy")}</strong></div>
-          <div><span class="small muted">Received</span><strong>${new Date(current.created_at).toLocaleString()}</strong></div>
+          <div><span class="small muted">Received</span><strong>${dateTime24(current.created_at,{seconds:true})}</strong></div>
           <div><span class="small muted">Elapsed</span><strong class="call-timer-text" data-call-start="${esc(current.created_at)}">00:00</strong></div>
           <div><span class="small muted">Departments</span><strong>${esc(deps.join(", ")||"None")}</strong></div>
           <div><span class="small muted">Status</span><strong>${esc(current.status||"OPEN")}</strong></div>
@@ -2599,14 +2832,10 @@ async function selectIncident(id){
     selectIncident(current.id);
   });
 
-  document.querySelector("#closeIncident").onclick=async()=>{
-    const disposition=prompt("Disposition:","Complete");
-    if(disposition===null)return;
-    const {error}=await supabase.rpc("close_incident",{p_incident_id:current.id,p_disposition:disposition});
-    if(error)return alert(error.message);
-    closeIncidentModal();
-    await loadEventOps();
-    refreshDispatchBoards();
+  document.querySelector("#closeIncident").onclick=()=>{
+    openCloseIncidentDispositionModal(current,{
+      hasEms:incidentHasEmsDepartment(current)||!!extra.encounter
+    });
   };
 
   if(current.map_layer_id&&current.map_layer_id!==S.activeMapLayerId){
@@ -3446,7 +3675,7 @@ function editIncidentForm(incidentId){
     <aside class="incident-edit-context">
       <div class="section-title">Current Call</div>
       ${incidentLocationHtml(i)}
-      <div class="incident-edit-context-row"><span>Received</span><strong>${new Date(i.created_at).toLocaleString()}</strong></div>
+      <div class="incident-edit-context-row"><span>Received</span><strong>${dateTime24(i.created_at,{seconds:true})}</strong></div>
       <div class="incident-edit-context-row"><span>Elapsed</span><strong data-call-start="${esc(i.created_at)}">00:00</strong></div>
       <div class="incident-edit-context-row"><span>Incident #</span><strong>${esc(i.incident_number)}</strong></div>
       <div class="small muted">The incident number and received timestamp are intentionally not editable.</div>
@@ -3679,7 +3908,7 @@ function renderCommandDisplayLayout(){
 }
 function updateCommandClock(){
   const el=document.querySelector("#commandClock");
-  if(el)el.textContent=new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",second:"2-digit"});
+  if(el)el.textContent=time24(new Date(),{seconds:true});
 }
 async function refreshCommandDisplayStructure(){
   if(!document.querySelector("#commandDisplayShell"))return;
@@ -4193,11 +4422,11 @@ function renderOperationalPeriodsAdmin(editId=null){
         </div>
         <div>
           <label>Planned Start</label>
-          <input id="opStartsAt" type="datetime-local" value="${esc(toDateTimeLocalValue(editing?.starts_at))}">
+          <input id="opStartsAt" type="text" inputmode="numeric" value="${esc(toDateTimeLocalValue(editing?.starts_at))}" placeholder="YYYY-MM-DD HH:mm">
         </div>
         <div>
           <label>Planned End</label>
-          <input id="opEndsAt" type="datetime-local" value="${esc(toDateTimeLocalValue(editing?.ends_at))}">
+          <input id="opEndsAt" type="text" inputmode="numeric" value="${esc(toDateTimeLocalValue(editing?.ends_at))}" placeholder="YYYY-MM-DD HH:mm">
         </div>
       </div>
 
@@ -4236,13 +4465,17 @@ function renderOperationalPeriodsAdmin(editId=null){
   document.querySelector("#saveOperationalPeriod")?.addEventListener("click",async()=>{
     const name=document.querySelector("#opName").value.trim();
     const prefix=document.querySelector("#opPrefix").value.trim().toUpperCase();
-    const startsAt=dateTimeLocalToIso(document.querySelector("#opStartsAt").value);
-    const endsAt=dateTimeLocalToIso(document.querySelector("#opEndsAt").value);
+    const startsRaw=document.querySelector("#opStartsAt").value.trim();
+    const endsRaw=document.querySelector("#opEndsAt").value.trim();
+    const startsAt=dateTimeLocalToIso(startsRaw);
+    const endsAt=dateTimeLocalToIso(endsRaw);
     const message=document.querySelector("#opAdminMessage");
 
     if(!name)return alert("Enter an Operational Period name.");
     if(!prefix)return alert("Enter an incident prefix.");
     if(/\s/.test(prefix))return alert("Incident prefix cannot contain spaces.");
+    if(startsRaw&&!startsAt)return alert("Planned Start must use 24-hour format: YYYY-MM-DD HH:mm");
+    if(endsRaw&&!endsAt)return alert("Planned End must use 24-hour format: YYYY-MM-DD HH:mm");
     if(startsAt&&endsAt&&new Date(endsAt)<=new Date(startsAt))return alert("Operational Period end must be after its start.");
 
     const button=document.querySelector("#saveOperationalPeriod");
@@ -4735,13 +4968,7 @@ function renderDepartmentStatusEditor(departmentId){
 
 
 function reportDateTime(value){
-  if(!value)return "";
-  const d=new Date(value);
-  if(Number.isNaN(d.getTime()))return "";
-  return d.toLocaleString([],{
-    year:"numeric",month:"2-digit",day:"2-digit",
-    hour:"2-digit",minute:"2-digit",second:"2-digit"
-  });
+  return dateTime24(value,{seconds:true});
 }
 
 function reportDuration(seconds){
@@ -4782,7 +5009,11 @@ function reportActivityDetail(row){
 
   if(row.destination||d.destination)values.push(`Destination: ${row.destination||d.destination}`);
   if(row.treatment_area_name||d.treatment_area_name)values.push(`Treatment Area: ${row.treatment_area_name||d.treatment_area_name}`);
-  if(row.activity_disposition||d.disposition)values.push(`Disposition: ${row.activity_disposition||d.disposition}`);
+  if(d.general_disposition)values.push(`General Disposition: ${dispositionLabel("GENERAL",d.general_disposition)}`);
+  if(d.ems_disposition)values.push(`EMS Disposition: ${dispositionLabel("EMS",d.ems_disposition)}`);
+  if((row.activity_disposition||d.disposition)&&!d.general_disposition&&!d.ems_disposition){
+    values.push(`Disposition: ${String(row.activity_disposition||d.disposition).replaceAll("_"," ")}`);
+  }
   if(row.reason||d.reason)values.push(`Reason: ${String(row.reason||d.reason).replaceAll("_"," ")}`);
   if(d.note)values.push(`Note: ${d.note}`);
   if(d.incident_number&&!values.length)values.push(d.incident_number);
@@ -4804,7 +5035,7 @@ function reportEmsSummary(row){
   if(row.treatment_areas)parts.push(`Treatment: ${row.treatment_areas}`);
   if(row.ambulances)parts.push(`Amb: ${row.ambulances}`);
   if(row.transport_destination)parts.push(`Destination: ${row.transport_destination}`);
-  if(row.ems_final_disposition)parts.push(`EMS: ${row.ems_final_disposition}`);
+  if(row.ems_final_disposition)parts.push(`EMS: ${dispositionLabel("EMS",row.ems_final_disposition)}`);
   else if(row.latest_ems_status)parts.push(`EMS: ${String(row.latest_ems_status).replaceAll("_"," ")}`);
   return parts.join(" · ");
 }
@@ -4867,7 +5098,7 @@ function reportIncidentRecordModal(row,activityRows,statusRows){
           <span>Closed</span><strong>${esc(reportDateTime(row.closed_at)||"Open")}</strong>
           <span>Duration</span><strong>${esc(reportDuration(row.total_duration_seconds))}</strong>
           <span>Departments</span><strong>${esc(row.departments||"")}</strong>
-          <span>Disposition</span><strong>${esc(row.disposition||"")}</strong>
+          <span>General Disposition</span><strong>${esc(row.disposition?dispositionLabel("GENERAL",row.disposition):"")}</strong>
           <span>Activity Entries</span><strong>${esc(String(row.activity_count||0))}</strong>
         </div>
       </div>
@@ -4903,7 +5134,7 @@ function reportIncidentRecordModal(row,activityRows,statusRows){
           <span>Transport Destination</span><strong>${esc(row.transport_destination||"")}</strong>
           <span>Transport Started</span><strong>${esc(reportDateTime(row.transport_started_at))}</strong>
           <span>Transport Completed</span><strong>${esc(reportDateTime(row.transport_completed_at))}</strong>
-          <span>EMS Disposition</span><strong>${esc(row.ems_final_disposition||row.latest_ems_status||"")}</strong>
+          <span>EMS Disposition</span><strong>${esc(row.ems_final_disposition?dispositionLabel("EMS",row.ems_final_disposition):(row.latest_ems_status?String(row.latest_ems_status).replaceAll("_"," "):""))}</strong>
         </div>
       </div>
     </section>
@@ -5110,9 +5341,9 @@ async function reportsPage(){
     {label:"Transport Destination",value:"transport_destination"},
     {label:"Transport Started",value:"transport_started_at"},
     {label:"Transport Completed",value:"transport_completed_at"},
-    {label:"EMS Final Disposition",value:"ems_final_disposition"},
+    {label:"EMS Final Disposition",value:r=>r.ems_final_disposition?dispositionLabel("EMS",r.ems_final_disposition):""},
     {label:"EMS Closed",value:"ems_closed_at"},
-    {label:"Incident Disposition",value:"disposition"},
+    {label:"General Call Disposition",value:r=>r.disposition?dispositionLabel("GENERAL",r.disposition):""},
     {label:"CAD Activity Count",value:"activity_count"},
     {label:"Last CAD Activity",value:"last_activity_at"},
     {label:"Incident ID",value:"incident_id"},
@@ -5203,7 +5434,7 @@ async function reportsPage(){
       <td>${esc(reportDateTime(r.first_enroute))}${r.dispatch_to_enroute_seconds!=null?`<br><span class="small muted">+${esc(reportDuration(r.dispatch_to_enroute_seconds))}</span>`:""}</td>
       <td>${esc(reportDateTime(r.first_onscene))}${r.received_to_onscene_seconds!=null?`<br><span class="small muted">+${esc(reportDuration(r.received_to_onscene_seconds))}</span>`:""}</td>
       <td>${esc(reportEmsSummary(r))}</td>
-      <td>${esc(r.disposition||r.ems_final_disposition||"")}</td>
+      <td>${esc(r.disposition?dispositionLabel("GENERAL",r.disposition):(r.ems_final_disposition?dispositionLabel("EMS",r.ems_final_disposition):""))}</td>
       <td>${esc(reportDateTime(r.closed_at))}</td>
       <td>${esc(reportDuration(r.total_duration_seconds))}</td>
       <td><button class="btn secondary compact" data-report-record="${r.incident_id}">View Record</button></td>
@@ -5283,28 +5514,11 @@ async function reportsPage(){
 /* ---------------- FIELD REPORT TIMES ---------------- */
 
 function fieldReportDateTime(value){
-  if(!value)return "—";
-  const d=new Date(value);
-  if(Number.isNaN(d.getTime()))return "—";
-  return d.toLocaleString([],{
-    year:"numeric",
-    month:"2-digit",
-    day:"2-digit",
-    hour:"2-digit",
-    minute:"2-digit",
-    second:"2-digit"
-  });
+  return value?dateTime24(value,{seconds:true}):"—";
 }
 
 function fieldReportTime(value){
-  if(!value)return "—";
-  const d=new Date(value);
-  if(Number.isNaN(d.getTime()))return "—";
-  return d.toLocaleTimeString([],{
-    hour:"2-digit",
-    minute:"2-digit",
-    second:"2-digit"
-  });
+  return value?time24(value,{seconds:true}):"—";
 }
 
 function fieldReportCompactDateTime(value){
@@ -5316,7 +5530,9 @@ function fieldReportCompactDateTime(value){
     day:"2-digit",
     hour:"2-digit",
     minute:"2-digit",
-    second:"2-digit"
+    second:"2-digit",
+    hour12:false,
+    hourCycle:"h23"
   });
 }
 
@@ -5407,7 +5623,7 @@ function fieldReportCallCard(row,index){
       </div>
 
       <div class="report-kv-grid field-report-call-meta">
-        <span>Disposition</span><strong>${esc(row.disposition||"—")}</strong>
+        <span>General Disposition</span><strong>${esc(row.disposition?String(row.disposition).replaceAll("_"," "):"—")}</strong>
         <span>Transport Destination</span><strong>${esc(row.transport_destination||"—")}</strong>
         <span>Treatment Area</span><strong>${esc(row.treatment_area_name||"—")}</strong>
         <span>Incident Closed</span><strong>${esc(fieldReportDateTime(row.incident_closed_at))}</strong>
@@ -5949,7 +6165,7 @@ async function fieldUnitCad(){
     standalone:false
   }));
   document.querySelector("#downloadOffline").onclick=()=>downloadOfflineEventData();
-  getOfflineEvent(S.eventId).then(x=>{if(x)document.querySelector("#offlineStatus").textContent=`Offline package saved ${new Date(x.savedAt).toLocaleString()}`;}).catch(()=>{});
+  getOfflineEvent(S.eventId).then(x=>{if(x)document.querySelector("#offlineStatus").textContent=`Offline package saved ${dateTime24(x.savedAt,{seconds:true})}`;}).catch(()=>{});
   document.querySelector("#changeUnit").onclick=async()=>{await stopFieldLocationSharing(fs.unit_id,{notifyServer:true});await supabase.rpc("field_release_unit",{p_field_session_id:fs.id});fieldUnitPicker();};
   document.querySelector("#leaveEvent").onclick=leaveField;
   if(incident)document.querySelector("#viewFieldMap")?.addEventListener("click",()=>showFieldMap(incident));
@@ -6353,6 +6569,7 @@ function reset(){
   S.treatmentAreas=[];
   S.operationalPeriods=[];
   S.activeOperationalPeriod=null;
+  S.dispositions=[];
   S.dispatchLayout=null;
   S.fieldReportSessionOwned=false;
   S.dispatchDepartmentIds=[];

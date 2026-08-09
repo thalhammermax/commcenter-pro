@@ -2,9 +2,25 @@ import QRCode from "qrcode";
 import { supabase } from "./supabase.js";
 
 const esc=(v="")=>String(v).replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m]));
-const fmt=iso=>iso?new Date(iso).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}):"";
+const fmt=iso=>{
+  if(!iso)return "";
+  const d=new Date(iso);
+  if(Number.isNaN(d.getTime()))return "";
+  return d.toLocaleTimeString([],{
+    hour:"2-digit",
+    minute:"2-digit",
+    hour12:false,
+    hourCycle:"h23"
+  });
+};
 const ageMinutes=iso=>iso?Math.max(0,Math.round((Date.now()-new Date(iso).getTime())/60000)):0;
 const pretty=s=>String(s||"").replaceAll("_"," ");
+
+function dispositionOptionsHtml(options,{placeholder="Choose EMS disposition…",selected=""}={}){
+  return `<option value="">${esc(placeholder)}</option>${(options||[]).map(option=>`
+    <option value="${esc(option.code)}" ${option.code===selected?"selected":""}>${esc(option.label)}</option>
+  `).join("")}`;
+}
 
 let treatmentChannel=null;
 let treatmentChannelKey=null;
@@ -518,19 +534,29 @@ export async function loadFieldEmsState(eventId,unitId,incidentId){
   if(configErr)throw configErr;
   if(!config?.active)return null;
 
-  const [encRes,areasRes,units]=await Promise.all([
+  const [encRes,areasRes,dispRes,units]=await Promise.all([
     supabase.from("ems_encounters").select("*").eq("current_unit_id",unitId).neq("current_status","CLOSED").order("created_at"),
     supabase.from("ems_treatment_areas").select("*").eq("event_id",eventId).eq("active",true).order("name"),
+    supabase.from("event_dispositions").select("code,label,sort_order").eq("event_id",eventId).eq("scope","EMS").eq("active",true).order("sort_order").order("label"),
     getUnitsAndConfigs(eventId)
   ]);
-  for(const r of [encRes,areasRes])if(r.error)throw r.error;
+  for(const r of [encRes,areasRes,dispRes])if(r.error)throw r.error;
 
   const current=encRes.data||[];
   const areas=areasRes.data||[];
   const ambulances=units.filter(u=>u.id!==unitId&&u.ems_config?.active&&(u.ems_config.ems_role==="ambulance"||u.ems_config.transport_capable));
   const incidentMap=await getIncidentMap(current.map(e=>e.incident_id));
 
-  return {config,current,areas,units,ambulances,incidentId,incidentMap};
+  return {
+    config,
+    current,
+    areas,
+    units,
+    ambulances,
+    emsDispositions:dispRes.data||[],
+    incidentId,
+    incidentMap
+  };
 }
 
 export function fieldEmsPanelHtml(state,incident){
@@ -608,6 +634,12 @@ function fieldEncounterActions(e,state){
     }
     return `<div class="stack">
       <div class="small muted">Use the unit status controls below and choose TRANSPORTING to enter the destination facility and start transport.</div>
+      <div>
+        <label>EMS Patient Disposition</label>
+        <select id="ems-disp-${e.id}">
+          ${dispositionOptionsHtml(state.emsDispositions)}
+        </select>
+      </div>
       <button class="btn secondary" data-release-encounter="${e.id}">Close / Other Disposition</button>
     </div>`;
   }
@@ -633,6 +665,12 @@ function fieldEncounterActions(e,state){
           </select>
           <button class="btn" data-handoff-amb="${e.id}">Hand Off</button>
         </div>
+      </div>
+      <div>
+        <label>EMS Patient Disposition</label>
+        <select id="ems-disp-${e.id}">
+          ${dispositionOptionsHtml(state.emsDispositions,{selected:"TREATED_RELEASED"})}
+        </select>
       </div>
       <button class="btn secondary" data-release-encounter="${e.id}">Close EMS Flow</button>
     </div>`;
@@ -703,9 +741,26 @@ export function bindFieldEmsPanel(state,{eventId,unitId,incident,refresh}){
   });
 
   document.querySelectorAll("[data-release-encounter]").forEach(b=>b.onclick=async()=>{
-    const disp=prompt("Operational disposition:",state.config.ems_role==="field_team"?"RELEASED_ON_SCENE":"CLOSED")||"CLOSED";
-    const {error}=await supabase.rpc("ems_release_encounter",{p_encounter_id:b.dataset.releaseEncounter,p_disposition:disp});
-    if(error)alert(error.message);else await refresh();
+    const encounterId=b.dataset.releaseEncounter;
+    const disp=document.querySelector(`#ems-disp-${encounterId}`)?.value||"";
+    if(!disp)return alert("Choose an EMS Patient Disposition.");
+
+    b.disabled=true;
+    const original=b.textContent;
+    b.textContent="Closing…";
+
+    const {error}=await supabase.rpc("ems_release_encounter",{
+      p_encounter_id:encounterId,
+      p_disposition:disp
+    });
+
+    if(error){
+      b.disabled=false;
+      b.textContent=original;
+      return alert(error.message);
+    }
+
+    await refresh();
   });
 
 
@@ -773,18 +828,20 @@ async function treatmentPicker(app,ts,{header,onExit}){
 
 async function treatmentDashboard(app,ts,{header,onExit}){
   try{
-    const [eventRes,areaRes,encRes,units]=await Promise.all([
+    const [eventRes,areaRes,encRes,dispRes,units]=await Promise.all([
       supabase.from("events").select("id,name,event_code").eq("id",ts.event_id).single(),
       supabase.from("ems_treatment_areas").select("*").eq("id",ts.treatment_area_id).single(),
       supabase.from("ems_encounters").select("*").eq("current_treatment_area_id",ts.treatment_area_id).neq("current_status","CLOSED").order("created_at"),
+      supabase.from("event_dispositions").select("code,label,sort_order").eq("event_id",ts.event_id).eq("scope","EMS").eq("active",true).order("sort_order").order("label"),
       getUnitsAndConfigs(ts.event_id)
     ]);
 
-    for(const r of [eventRes,areaRes,encRes])if(r.error)throw r.error;
+    for(const r of [eventRes,areaRes,encRes,dispRes])if(r.error)throw r.error;
 
     const event=eventRes.data;
     const area=areaRes.data;
     const encounters=encRes.data||[];
+    const emsDispositions=dispRes.data||[];
     const ambulances=units.filter(u=>u.ems_config?.active&&(u.ems_config.ems_role==="ambulance"||u.ems_config.transport_capable));
     const incidentMap=await getIncidentMap(encounters.map(e=>e.incident_id));
     const occupancy=encounters.length;
@@ -916,6 +973,12 @@ async function treatmentDashboard(app,ts,{header,onExit}){
                       <button class="btn" data-ta-transfer-amb="${e.id}">Hand Off</button>
                     </div>
                   </div>
+                  <div>
+                    <label>EMS Patient Disposition</label>
+                    <select id="ta-disp-${e.id}">
+                      ${dispositionOptionsHtml(emsDispositions,{selected:"RELEASED_FROM_TREATMENT"})}
+                    </select>
+                  </div>
                   <button class="btn secondary" data-ta-release="${e.id}">Release / Close Patient</button>
                 </div>
               </div>`;
@@ -1019,12 +1082,26 @@ async function treatmentDashboard(app,ts,{header,onExit}){
     });
 
     document.querySelectorAll("[data-ta-release]").forEach(b=>b.onclick=async()=>{
-      const disp=prompt("Operational disposition:","RELEASED_FROM_TREATMENT")||"RELEASED_FROM_TREATMENT";
+      const encounterId=b.dataset.taRelease;
+      const disp=document.querySelector(`#ta-disp-${encounterId}`)?.value||"";
+      if(!disp)return alert("Choose an EMS Patient Disposition.");
+
+      b.disabled=true;
+      const original=b.textContent;
+      b.textContent="Closing…";
+
       const {error}=await supabase.rpc("ems_release_encounter",{
-        p_encounter_id:b.dataset.taRelease,
+        p_encounter_id:encounterId,
         p_disposition:disp
       });
-      if(error)alert(error.message);else treatmentDashboard(app,ts,{header,onExit});
+
+      if(error){
+        b.disabled=false;
+        b.textContent=original;
+        return alert(error.message);
+      }
+
+      treatmentDashboard(app,ts,{header,onExit});
     });
 
     document.querySelector("#taRefresh").onclick=()=>treatmentDashboard(app,ts,{header,onExit});

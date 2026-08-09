@@ -2958,3 +2958,38 @@ body.modal-open{
     grid-template-columns:90px minmax(0,1fr);
   }
 }
+
+
+/* ============================================================
+   v0.9.4 — STRUCTURED DISPOSITIONS
+   ============================================================ */
+
+.close-disposition-header{
+  border-bottom-color:#5f3a40;
+}
+
+.close-disposition-modal{
+  padding:20px;
+}
+
+.close-disposition-modal select{
+  width:100%;
+}
+
+.close-disposition-modal .grid2{
+  align-items:start;
+}
+
+.close-disposition-ems-note{
+  border-color:#31556f;
+  background:#102438;
+}
+
+.close-disposition-modal label{
+  margin-bottom:6px;
+}
+
+.close-disposition-modal .small.muted{
+  margin-top:5px;
+  line-height:1.35;
+}

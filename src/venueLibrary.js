@@ -2,6 +2,22 @@ import { supabase } from "./supabase.js";
 
 const esc=(v="")=>String(v).replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m]));
 
+const dateTime24=value=>{
+  if(!value)return "";
+  const d=new Date(value);
+  if(Number.isNaN(d.getTime()))return "";
+  return d.toLocaleString([],{
+    year:"numeric",
+    month:"2-digit",
+    day:"2-digit",
+    hour:"2-digit",
+    minute:"2-digit",
+    second:"2-digit",
+    hour12:false,
+    hourCycle:"h23"
+  });
+};
+
 export async function loadVenueChoices(organizationId){
   const {data,error}=await supabase.rpc("organization_venue_choices",{p_organization_id:organizationId});
   if(error)throw error;
@@ -189,12 +205,12 @@ export async function renderVenueLibrary(app,organizationId,organizationName,{on
             ${current?`
               <div class="venue-version-summary">
                 <strong>Current published version</strong><br>
-                <span class="small muted">${new Date(current.created_at).toLocaleString()}${current.notes?` · ${esc(current.notes)}`:""}</span>
+                <span class="small muted">${dateTime24(current.created_at)}${current.notes?` · ${esc(current.notes)}`:""}</span>
               </div>
               <button class="btn block" data-use-version="${current.id}">Create Event from This Venue</button>
             `:`<p class="muted">No published venue version yet.</p>`}
             ${vv.length>1?`<details><summary>Version history (${vv.length})</summary>
-              <div class="venue-version-list">${vv.map(ver=>`<div><strong>v${ver.version_number}</strong> · ${esc(ver.status)}<br><span class="small muted">${new Date(ver.created_at).toLocaleString()}${ver.notes?` · ${esc(ver.notes)}`:""}</span></div>`).join("")}</div>
+              <div class="venue-version-list">${vv.map(ver=>`<div><strong>v${ver.version_number}</strong> · ${esc(ver.status)}<br><span class="small muted">${dateTime24(ver.created_at)}${ver.notes?` · ${esc(ver.notes)}`:""}</span></div>`).join("")}</div>
             </details>`:""}
           </div>`;
         }).join("")||`<div class="card"><h3>No saved venues yet</h3><p class="muted">Open an event, build its maps, then save that setup to the Venue Library.</p></div>`}
