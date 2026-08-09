@@ -181,8 +181,8 @@ function applyDispatchLayoutToDom({invalidate=true}={}){
   grid.style.setProperty("--dispatch-units-size",`${prefs.unitsSize}px`);
   grid.style.setProperty("--dispatch-bottom-size",`${prefs.bottomSize}px`);
 
-  const label=document.querySelector("#layoutButton");
-  if(label)label.textContent=`Layout: ${dispatchLayoutModeLabel(prefs.mode)}`;
+  const label=document.querySelector("#layoutButton span");
+  if(label)label.textContent=dispatchLayoutModeLabel(prefs.mode);
 
   if(invalidate){
     requestAnimationFrame(()=>{
@@ -1056,17 +1056,14 @@ function showPoiFinder(){
   </div>
 
   <div class="poi-finder-modal stack" data-dispatch-editor="poi-search">
-    <div class="row">
-      <label>Search name, alias, category, level, or zone</label>
-      <button class="btn secondary" id="addPoiFromMap">+ Add POI from Map</button>
-    </div>
+    <label>Search name, alias, category, level, or zone</label>
     <input id="dispatcherPoiSearch" autocomplete="off" placeholder="Search POIs">
     <div id="dispatcherPoiResults" class="poi-search-results"></div>
     <div id="dispatcherPoiSelected" class="small muted">Start typing to search event POIs.</div>
+    <div class="small muted">New dispatcher POIs are created from the New Incident workflow after a map location is selected.</div>
   </div>`;
 
   document.querySelector("#closeIncidentModal").onclick=()=>closeIncidentModal();
-  document.querySelector("#addPoiFromMap").onclick=()=>startPoiPlacement();
 
   bindPoiSearch({
     inputId:"dispatcherPoiSearch",
@@ -1114,14 +1111,6 @@ function hideMapPickBanner(){
   banner.classList.remove("active");
   banner.innerHTML="";
 }
-function startPoiPlacement(){
-  const layer=activeMapLayer();
-  if(!layer?.georef_coefficients)return alert("The selected map layer must be calibrated before Dispatch can place a POI from a map click.");
-  closeIncidentModal();
-  S.mapPickMode="poi";
-  S.pendingIncidentDraft=null;
-  showMapPickBanner("Click the event map where the new POI should be placed.");
-}
 function collectNewIncidentDraft(){
   const modal=document.querySelector("[data-incident-modal-mode='new']");
   if(!modal)return null;
@@ -1130,6 +1119,9 @@ function collectNewIncidentDraft(){
     priority:document.querySelector("#priority")?.value||"Standard",
     landmark:document.querySelector("#landmark")?.value||"",
     notes:document.querySelector("#notes")?.value||"",
+    saveAsPoi:document.querySelector("#saveIncidentLocationPoi")?.dataset.enabled==="true",
+    poiCategory:document.querySelector("#incidentPoiCategory")?.value||"Other",
+    poiAliases:document.querySelector("#incidentPoiAliases")?.value||"",
     departmentIds:[...document.querySelectorAll('input[name="dept"]:checked')].map(x=>x.value),
     initialUnitIds:[...document.querySelectorAll('input[name="initialUnit"]:checked')].map(x=>x.value)
   };
@@ -1142,91 +1134,6 @@ function startIncidentMapPlacement(){
   closeIncidentModal();
   showMapPickBanner("Click the map to set the incident location. Your unfinished call form is preserved.");
 }
-async function dispatcherPoiForm(loc,{returnToFinder=false}={}){
-  if(!loc)return;
-  S.incidentModalMode="poi-create";
-  const content=openIncidentModalShell();
-  const zones=S.zones.filter(z=>!loc.map_layer_id||z.map_layer_id===loc.map_layer_id);
-
-  content.innerHTML=`<div class="incident-modal-header">
-    <div>
-      <div class="incident-modal-eyebrow">DISPATCH MAP</div>
-      <div class="incident-modal-title-row"><h2 id="incidentModalTitle">Add POI</h2></div>
-      <div class="incident-modal-nature">Save an event location without opening Event Admin.</div>
-    </div>
-    <button class="incident-modal-close" id="closeIncidentModal" aria-label="Close POI form">×</button>
-  </div>
-  <div class="dispatcher-poi-form stack">
-    <div class="grid2">
-      <div><label>POI Name</label><input id="dispatchPoiName" autofocus placeholder="POI name"></div>
-      <div><label>Category</label><select id="dispatchPoiCategory">
-        <option>Medical</option><option>Command</option><option>Security</option><option>Gate</option>
-        <option>Portal</option><option>Seating Section</option><option>Concession</option><option>Restroom</option>
-        <option>Production</option><option>Staging</option><option>Other</option>
-      </select></div>
-    </div>
-    <div><label>Zone</label><select id="dispatchPoiZone"><option value="">No zone</option>${zones.map(z=>`<option value="${z.id}">${esc(z.name)}</option>`).join("")}</select></div>
-    <div><label>Aliases</label><input id="dispatchPoiAliases" placeholder="Comma-separated aliases"></div>
-    <div><label>Operational Notes</label><textarea id="dispatchPoiNotes" rows="4" placeholder="Optional notes"></textarea></div>
-    <div class="notice">
-      <strong>${esc(layerName(loc.map_layer_id)||"Event Map")}</strong><br>
-      <span class="small mono">${Number(loc.latitude).toFixed(6)}, ${Number(loc.longitude).toFixed(6)}</span>
-    </div>
-    <div class="small muted">Dispatcher-created POIs are event-only. They do not automatically change the reusable organization Venue Library.</div>
-  </div>
-  <div class="incident-modal-footer">
-    <button class="btn secondary" id="cancelDispatchPoi">Cancel</button>
-    <button class="btn" id="saveDispatchPoi">Save POI</button>
-  </div>`;
-
-  const cancel=()=>{
-    closeIncidentModal();
-    if(returnToFinder)showPoiFinder();
-  };
-  document.querySelector("#closeIncidentModal").onclick=cancel;
-  document.querySelector("#cancelDispatchPoi").onclick=cancel;
-
-  document.querySelector("#saveDispatchPoi").onclick=async()=>{
-    const name=document.querySelector("#dispatchPoiName").value.trim();
-    if(!name)return alert("Enter a POI name.");
-    const aliases=document.querySelector("#dispatchPoiAliases").value.split(",").map(x=>x.trim()).filter(Boolean);
-    const button=document.querySelector("#saveDispatchPoi");
-    button.disabled=true;button.textContent="Saving…";
-
-    const {data,error}=await supabase.rpc("dispatcher_create_poi_v2",{
-      p_event_id:S.eventId,
-      p_name:name,
-      p_category:document.querySelector("#dispatchPoiCategory").value,
-      p_map_layer_id:loc.map_layer_id||S.activeMapLayerId||null,
-      p_zone_id:document.querySelector("#dispatchPoiZone").value||null,
-      p_latitude:loc.latitude,
-      p_longitude:loc.longitude,
-      p_map_x:loc.map_x,
-      p_map_y:loc.map_y,
-      p_notes:document.querySelector("#dispatchPoiNotes").value.trim()||null,
-      p_aliases:aliases
-    });
-    if(error){
-      button.disabled=false;button.textContent="Save POI";
-      return alert(error.message);
-    }
-
-    const {data:poi,error:fetchError}=await supabase.from("event_pois").select("*,poi_aliases(alias)").eq("id",data).single();
-    if(fetchError){
-      await loadEventOps();
-    }else{
-      const existing=S.pois.findIndex(p=>p.id===poi.id);
-      if(existing>=0)S.pois[existing]=poi;else S.pois.push(poi);
-      S.pois.sort((a,b)=>a.name.localeCompare(b.name));
-    }
-
-    closeIncidentModal();
-    await setupDispatchMap();
-    if(returnToFinder)showPoiFinder();
-  };
-}
-
-
 async function handleRealtimePoiInsert(payload){
   const id=payload?.new?.id;
   if(!id)return;
@@ -1316,23 +1223,49 @@ async function dispatchPage(){
     </div></div>`;
   document.querySelector("#topActions").innerHTML=`
     <button class="btn secondary" id="poiFinderBtn">Find POI</button>
-    <button class="btn secondary" id="addPoiBtn">Add POI</button>
     <button class="btn secondary" id="commandDisplayBtn">Command Display</button>
-    <button class="btn secondary" id="layoutButton">Layout: ${esc(dispatchLayoutModeLabel(S.dispatchLayout.mode))}</button>
-    <button class="btn secondary" id="emsOpsBtn">EMS Ops</button>
-    <button class="btn secondary" id="adminBtn">Event Admin</button>
-    <button class="btn secondary" id="reportsBtn">Reports</button>
-    <button class="btn secondary" id="eventsBtn">Events</button>
-    <button class="btn secondary" id="logoutBtn">Sign out</button>`;
+
+    <details class="topbar-menu" id="dispatchMoreMenu">
+      <summary class="btn secondary">More ▾</summary>
+      <div class="topbar-menu-panel">
+        <button class="topbar-menu-item" id="layoutButton">
+          <strong>Layout</strong>
+          <span>${esc(dispatchLayoutModeLabel(S.dispatchLayout.mode))}</span>
+        </button>
+        <button class="topbar-menu-item" id="emsOpsBtn">
+          <strong>EMS Operations</strong>
+          <span>Patient flow and treatment resources</span>
+        </button>
+        <button class="topbar-menu-item" id="adminBtn">
+          <strong>Event Admin</strong>
+          <span>Event configuration</span>
+        </button>
+        <button class="topbar-menu-item" id="reportsBtn">
+          <strong>Reports</strong>
+          <span>Event and CAD reporting</span>
+        </button>
+        <div class="topbar-menu-divider"></div>
+        <button class="topbar-menu-item" id="eventsBtn">
+          <strong>Change Event</strong>
+          <span>Return to event selection</span>
+        </button>
+        <button class="topbar-menu-item danger-item" id="logoutBtn">
+          <strong>Sign Out</strong>
+          <span>End this staff session</span>
+        </button>
+      </div>
+    </details>`;
+
+  const closeDispatchMenu=()=>document.querySelector("#dispatchMoreMenu")?.removeAttribute("open");
+
   document.querySelector("#poiFinderBtn").onclick=()=>showPoiFinder();
-  document.querySelector("#addPoiBtn").onclick=()=>startPoiPlacement();
   document.querySelector("#commandDisplayBtn").onclick=()=>commandDisplayPage();
-  document.querySelector("#layoutButton").onclick=()=>renderDispatchLayoutModal();
-  document.querySelector("#emsOpsBtn").onclick=()=>renderEmsOps(app,{eventId:S.eventId,event:S.event,header,onBack:()=>dispatchPage(),onAdmin:()=>eventAdmin("ems")});
-  document.querySelector("#adminBtn").onclick=()=>eventAdmin();
-  document.querySelector("#reportsBtn").onclick=()=>reportsPage();
-  document.querySelector("#eventsBtn").onclick=()=>{closeIncidentModal();S.eventId=null;staffFlow();};
-  document.querySelector("#logoutBtn").onclick=async()=>{closeIncidentModal();await supabase.auth.signOut();S.mode=null;reset();clearNavigationState();route();};
+  document.querySelector("#layoutButton").onclick=()=>{closeDispatchMenu();renderDispatchLayoutModal();};
+  document.querySelector("#emsOpsBtn").onclick=()=>{closeDispatchMenu();renderEmsOps(app,{eventId:S.eventId,event:S.event,header,onBack:()=>dispatchPage(),onAdmin:()=>eventAdmin("ems")});};
+  document.querySelector("#adminBtn").onclick=()=>{closeDispatchMenu();eventAdmin();};
+  document.querySelector("#reportsBtn").onclick=()=>{closeDispatchMenu();reportsPage();};
+  document.querySelector("#eventsBtn").onclick=()=>{closeDispatchMenu();closeIncidentModal();S.eventId=null;staffFlow();};
+  document.querySelector("#logoutBtn").onclick=async()=>{closeDispatchMenu();closeIncidentModal();await supabase.auth.signOut();S.mode=null;reset();clearNavigationState();route();};
   document.querySelector("#newIncident").onclick=()=>incidentForm(null);
   document.querySelector("#dispatchScopeBtn").onclick=()=>renderDispatchScopeModal();
   document.querySelector("#dispatchLayerSelect")?.addEventListener("change",e=>{S.activeMapLayerId=e.target.value;saveNavigationState();setupDispatchMap();});
@@ -2537,19 +2470,12 @@ async function setupDispatchMap(){
         incidentForm(S.currentLocation,draft);
         return;
       }
-      if(S.mapPickMode==="poi"){
-        S.mapPickMode=null;hideMapPickBanner();
-        dispatcherPoiForm(S.currentLocation);
-        return;
-      }
-
       L.popup().setLatLng(e.latlng).setContent(
         `<strong>${esc(layer.name)}</strong><br>${geo.lat.toFixed(6)}, ${geo.lon.toFixed(6)}
-        <div class="map-popup-actions"><button id="createAtPoint">Create Incident Here</button><button id="addPoiAtPoint">Add POI Here</button></div>`
+        <div class="map-popup-actions"><button id="createAtPoint">Create Incident Here</button></div>`
       ).openOn(S.map);
       setTimeout(()=>{
         document.querySelector("#createAtPoint")?.addEventListener("click",()=>incidentForm(S.currentLocation));
-        document.querySelector("#addPoiAtPoint")?.addEventListener("click",()=>dispatcherPoiForm(S.currentLocation));
       },0);
     });
   }
@@ -2601,6 +2527,36 @@ function incidentForm(loc,draft=null){
         <span id="locSummary">${loc?`${loc.map_layer_id?`${esc(layerName(loc.map_layer_id))} · `:""}${Number(loc.latitude).toFixed(6)}, ${Number(loc.longitude).toFixed(6)}`:"Search for a POI or choose Pick on Map."}</span>
       </div>
 
+      <div
+        class="incident-inline-poi ${loc&&!loc.poi_id?"":"hidden"}"
+        id="incidentInlinePoi"
+      >
+        <button
+          class="btn secondary block incident-inline-poi-toggle ${draft?.saveAsPoi?"active":""}"
+          id="saveIncidentLocationPoi"
+          type="button"
+          data-enabled="${draft?.saveAsPoi?"true":"false"}"
+        >${draft?.saveAsPoi?"✓ Add This Location as a POI":"+ Add This Location as a POI"}</button>
+
+        <div class="incident-inline-poi-details ${draft?.saveAsPoi?"":"hidden"}" id="incidentInlinePoiDetails">
+          <div class="small muted">
+            The POI name will use the Location Description entered above. The new POI is event-only.
+          </div>
+          <div class="grid2">
+            <div>
+              <label>POI Category</label>
+              <select id="incidentPoiCategory">
+                ${["Other","Medical","Command","Security","Gate","Portal","Seating Section","Concession","Restroom","Production","Staging"].map(category=>`<option ${draft?.poiCategory===category?"selected":(!draft?.poiCategory&&category==="Other"?"selected":"")}>${esc(category)}</option>`).join("")}
+              </select>
+            </div>
+            <div>
+              <label>Aliases</label>
+              <input id="incidentPoiAliases" value="${esc(draft?.poiAliases||"")}" placeholder="Comma-separated aliases">
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div><label>Dispatch Notes</label><textarea id="notes" rows="7" placeholder="Operational notes">${esc(draft?.notes||"")}</textarea></div>
     </section>
 
@@ -2633,6 +2589,37 @@ function incidentForm(loc,draft=null){
   let chosen=loc?{...loc}:null;
   let preservedUnitIds=new Set(draft?.initialUnitIds||[]);
 
+  const setInlinePoiVisibility=()=>{
+    const host=document.querySelector("#incidentInlinePoi");
+    const toggle=document.querySelector("#saveIncidentLocationPoi");
+    const details=document.querySelector("#incidentInlinePoiDetails");
+    if(!host||!toggle||!details)return;
+
+    const eligible=!!(chosen&&!chosen.poi_id);
+    host.classList.toggle("hidden",!eligible);
+
+    if(!eligible){
+      toggle.dataset.enabled="false";
+      toggle.classList.remove("active");
+      toggle.textContent="+ Add This Location as a POI";
+      details.classList.add("hidden");
+    }
+  };
+
+  document.querySelector("#saveIncidentLocationPoi")?.addEventListener("click",()=>{
+    if(!chosen||chosen.poi_id)return;
+    const toggle=document.querySelector("#saveIncidentLocationPoi");
+    const details=document.querySelector("#incidentInlinePoiDetails");
+    const enabled=toggle.dataset.enabled!=="true";
+    toggle.dataset.enabled=enabled?"true":"false";
+    toggle.classList.toggle("active",enabled);
+    toggle.textContent=enabled?"✓ Add This Location as a POI":"+ Add This Location as a POI";
+    details.classList.toggle("hidden",!enabled);
+    if(enabled)document.querySelector("#incidentPoiCategory")?.focus();
+  });
+
+  setInlinePoiVisibility();
+
   const renderUnitChoices=()=>{
     const selectedDeps=new Set([...document.querySelectorAll('input[name="dept"]:checked')].map(x=>x.value));
     document.querySelectorAll('input[name="initialUnit"]:checked').forEach(x=>preservedUnitIds.add(x.value));
@@ -2663,6 +2650,7 @@ function incidentForm(loc,draft=null){
       chosen=poiLocationObject(p);
       document.querySelector("#landmark").value=p.name;
       document.querySelector("#locSummary").textContent=`${layerName(p.map_layer_id)||"Unlayered"}${p.zone_id?` / ${zoneName(p.zone_id)}`:""} · ${Number(p.latitude).toFixed(6)}, ${Number(p.longitude).toFixed(6)}`;
+      setInlinePoiVisibility();
       focusPoiOnMap(p);
     }
   });
@@ -2676,6 +2664,20 @@ function incidentForm(loc,draft=null){
     const callType=document.querySelector("#callType").value.trim();
     if(!callType)return alert("Enter a call type / nature.");
 
+    const landmark=document.querySelector("#landmark").value.trim();
+    const saveAsPoi=!!(
+      chosen
+      &&!chosen.poi_id
+      &&document.querySelector("#saveIncidentLocationPoi")?.dataset.enabled==="true"
+    );
+    if(saveAsPoi&&!landmark){
+      return alert("Enter a Location Description before adding this map location as a POI.");
+    }
+
+    const poiAliases=saveAsPoi
+      ? document.querySelector("#incidentPoiAliases").value.split(",").map(x=>x.trim()).filter(Boolean)
+      : [];
+
     const selectedUnits=assignSelected
       ? [...document.querySelectorAll('input[name="initialUnit"]:checked')].map(x=>x.value)
       : [];
@@ -2683,7 +2685,7 @@ function incidentForm(loc,draft=null){
     const buttons=[document.querySelector("#saveIncidentOnly"),document.querySelector("#saveAndDispatch")];
     buttons.forEach(b=>{if(b)b.disabled=true;});
 
-    const {data,error}=await supabase.rpc("create_incident_v3",{
+    const {data,error}=await supabase.rpc("create_incident_v4",{
       p_event_id:S.eventId,
       p_department_ids:deps,
       p_call_type:callType,
@@ -2692,11 +2694,14 @@ function incidentForm(loc,draft=null){
       p_longitude:chosen.longitude,
       p_map_x:chosen.map_x,
       p_map_y:chosen.map_y,
-      p_landmark:document.querySelector("#landmark").value.trim(),
+      p_landmark:landmark,
       p_notes:document.querySelector("#notes").value.trim(),
       p_poi_id:chosen.poi_id||null,
       p_map_layer_id:chosen.map_layer_id||S.activeMapLayerId||null,
-      p_zone_id:chosen.zone_id||null
+      p_zone_id:chosen.zone_id||null,
+      p_create_poi:saveAsPoi,
+      p_poi_category:saveAsPoi?document.querySelector("#incidentPoiCategory").value:null,
+      p_poi_aliases:poiAliases
     });
 
     if(error){
