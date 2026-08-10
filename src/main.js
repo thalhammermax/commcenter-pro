@@ -8,6 +8,7 @@ import { renderEmsOps, renderEmsAdmin, renderTreatmentAreaFlow, loadFieldEmsStat
 import { loadVenueChoices, applyVenueVersionToEvent, saveEventToVenueLibrary, renderVenueLibrary } from "./venueLibrary.js";
 import { renderGuestLogistics, loadFieldLogisticsState, fieldLogisticsPanelHtml, bindFieldLogisticsPanel } from "./logistics.js";
 import { renderUnitStaffing } from "./staffing.js";
+import { createGoogleFieldNavigation, googleNavigationConfigured } from "./googleNavigation.js";
 
 const app=document.querySelector("#app");
 const S={
@@ -37,6 +38,9 @@ const S={
   dispatchUnitSyncInterval:null,
   dispatchUnitSyncInFlight:false,
   dispatchRealtimeStatus:null,
+  dispatchLastSyncAt:null,
+  dispatchVisibilityHandler:null,
+  dispatchFocusHandler:null,
   fieldMap:null,
   fieldMapLayer:null,
   fieldMapUnitMarker:null,
@@ -45,6 +49,7 @@ const S={
   fieldMapCallPoint:null,
   fieldMapIncident:null,
   fieldMapUnit:null,
+  fieldNavigationController:null,
   fieldLocalLocation:null,
   mapPickMode:null,
   pendingIncidentDraft:null,
@@ -2055,7 +2060,10 @@ async function dispatchPage(){
       <div class="dispatch-resizer dispatch-resizer-b" data-resize="b" aria-hidden="true"></div>
 
       <aside class="panel units-panel">
-        <div class="row"><div><div class="section-title">Units</div><div class="small muted">Select a unit to open controls.</div></div></div>
+        <div class="row">
+          <div><div class="section-title">Units</div><div class="small muted">Select a unit to open controls.</div></div>
+          <span class="dispatch-sync-indicator" id="dispatchSyncIndicator" title="Unit status synchronization">SYNCING</span>
+        </div>
         <div id="unitList">${unitList()}</div>
       </aside>
     </div></div>`;
@@ -7256,6 +7264,7 @@ async function fieldUnitPicker(){
 }
 async function fieldUnitCad(){
   clearFieldUnitMap();
+  clearFieldNavigation();
   const {data:fs,error}=await supabase.from("field_sessions")
     .select("*,events(name,field_location_enabled,venue_type,field_layout_config),operational_periods(name,incident_prefix,status),units(name,status,event_id,current_map_layer_id,current_zone_id,current_transport_destination_text,current_transport_treatment_area_id,event_departments(name,status_profile))")
     .eq("auth_user_id",S.session.user.id).eq("active",true).order("started_at",{ascending:false}).limit(1).single();
@@ -7311,7 +7320,10 @@ async function fieldUnitCad(){
       ${fieldLayer?`<div class="venue-location-line"><span class="badge layer-badge">${esc(fieldLayer.name)}</span>${fieldZone?` <span class="badge">${esc(fieldZone.name)}</span>`:""}</div>`:""}
       <p>${esc(incident.landmark||"No location description")}${incident.latitude!=null&&incident.longitude!=null?`<br><span class="small mono">${Number(incident.latitude).toFixed(6)}, ${Number(incident.longitude).toFixed(6)}</span>`:""}</p>
       <p>${esc(incident.notes||"")}</p>
-      ${fieldLayer&&incident.map_x!=null&&incident.map_y!=null?`<button class="btn secondary block" id="viewFieldMap">View Call &amp; My Location</button>`:""}
+      <div class="field-call-map-actions">
+        ${fieldLayer&&incident.map_x!=null&&incident.map_y!=null?`<button class="btn secondary" id="viewFieldMap">View Event Map</button>`:""}
+        ${(incident.latitude!=null&&incident.longitude!=null)||fieldLayer?`<button class="btn" id="navigateFieldCall">Navigate to Call${googleNavigationConfigured()?"":" · Setup Required"}</button>`:""}
+      </div>
       <div id="fieldMapHolder"></div>
     </div>`:logisticsState?.underway?`<div class="card"><strong>No CAD incident assignment</strong><p class="muted">This unit is currently committed to the Guest Logistics movement below.</p></div>`:`<div class="card"><strong>No current CAD assignment</strong><p class="muted">${logisticsState?.current?"A future Guest Logistics movement is preassigned below; the unit remains available until that movement begins.":"Remain available for dispatch."}</p></div>`,
 
@@ -7513,9 +7525,12 @@ async function fieldUnitCad(){
     const host=document.querySelector("#offlineStatus");
     if(x&&host)host.textContent=`Offline package saved ${dateTime24(x.savedAt,{seconds:true})}`;
   }).catch(()=>{});
-  document.querySelector("#changeUnit")?.addEventListener("click",async()=>{await stopFieldLocationSharing(fs.unit_id,{notifyServer:true});S.fieldLocalLocation=null;clearFieldUnitMap();await supabase.rpc("field_release_unit",{p_field_session_id:fs.id});fieldUnitPicker();});
+  document.querySelector("#changeUnit")?.addEventListener("click",async()=>{await stopFieldLocationSharing(fs.unit_id,{notifyServer:true});S.fieldLocalLocation=null;clearFieldUnitMap();clearFieldNavigation();await supabase.rpc("field_release_unit",{p_field_session_id:fs.id});fieldUnitPicker();});
   document.querySelector("#leaveEvent")?.addEventListener("click",leaveField);
-  if(incident)document.querySelector("#viewFieldMap")?.addEventListener("click",()=>showFieldMap(incident,fs));
+  if(incident){
+    document.querySelector("#viewFieldMap")?.addEventListener("click",()=>showFieldMap(incident,fs));
+    document.querySelector("#navigateFieldCall")?.addEventListener("click",()=>showFieldNavigation(incident,fs,{defaultMode:fieldIsAmbulance?"DRIVING":"WALKING"}));
+  }
   subscribeField(fs.unit_id,fs.id);
 }
 
@@ -7561,6 +7576,7 @@ async function sendFieldLocation(unitId,position){
     source:"device"
   };
   updateFieldMapUnitLocation(S.fieldLocalLocation);
+  S.fieldNavigationController?.updateLocation?.(S.fieldLocalLocation);
   const elapsed=now-(S.locationLastSentAt||0);
   const moved=S.locationLastSent
     ? distanceMeters(S.locationLastSent.lat,S.locationLastSent.lon,current.lat,current.lon)
@@ -7668,7 +7684,10 @@ async function stopFieldLocationSharing(unitId,{notifyServer=true}={}){
   }
 
   updateFieldLocationUi({message:"Location sharing is off.",sharing:false});
-  if(S.fieldLocalLocation?.unit_id===unitId)updateFieldMapUnitLocation(S.fieldLocalLocation);
+  if(S.fieldLocalLocation?.unit_id===unitId){
+    updateFieldMapUnitLocation(S.fieldLocalLocation);
+    S.fieldNavigationController?.updateLocation?.(S.fieldLocalLocation);
+  }
 }
 
 function bindFieldLocationControls(fs,mapLayers,zones){
@@ -7787,6 +7806,86 @@ async function downloadOfflineEventData(){
   }
 }
 
+
+function clearFieldNavigation(){
+  const controller=S.fieldNavigationController;
+  S.fieldNavigationController=null;
+  if(controller){
+    try{controller.destroy?.();}catch{}
+  }
+}
+
+async function showFieldNavigation(incident,fs,{defaultMode="WALKING"}={}){
+  const holder=document.querySelector("#fieldMapHolder");
+  if(!holder)return;
+
+  clearFieldUnitMap();
+  clearFieldNavigation();
+  holder.innerHTML=`<div class="field-navigation-loading">Preparing navigation…</div>`;
+
+  try{
+    let layer=null;
+    let overlay=null;
+
+    if(incident?.map_layer_id){
+      const {data,error}=await supabase.from("event_map_layers")
+        .select("*")
+        .eq("id",incident.map_layer_id)
+        .eq("event_id",S.eventId)
+        .eq("active",true)
+        .eq("status","published")
+        .maybeSingle();
+      if(error)throw error;
+      layer=data||null;
+    }
+
+    const destination=fieldMapIncidentGeo(incident,layer);
+    if(!destination)throw new Error("This call does not have a GPS/georeferenced destination yet.");
+
+    if(layer?.rendered_image_path&&layer?.georef_coefficients&&layer?.image_width&&layer?.image_height){
+      try{
+        overlay={
+          url:await storageSigned(layer.rendered_image_path,3600),
+          width:Number(layer.image_width),
+          height:Number(layer.image_height),
+          coefficients:layer.georef_coefficients,
+          opacity:.58,
+          name:layer.name
+        };
+      }catch(error){
+        console.warn("Event map overlay could not be loaded for Google navigation",error);
+      }
+    }
+
+    let starting=await getFieldMapStartingLocation(fs.unit_id);
+    if(!starting){
+      starting=await getDevicePositionOnce(fs.unit_id);
+    }
+
+    let controller=null;
+    controller=await createGoogleFieldNavigation({
+      host:holder,
+      destination:{lat:Number(destination.lat),lng:Number(destination.lon)},
+      initialLocation:starting,
+      eventOverlay:overlay,
+      incidentNumber:incident.incident_number,
+      incidentLocation:incident.landmark||layer?.name||"",
+      unitName:fs.units?.name||"Your unit",
+      defaultMode,
+      getFreshLocation:()=>getDevicePositionOnce(fs.unit_id),
+      watchDeviceLocation:S.locationWatchId==null,
+      onLocalLocation:location=>{S.fieldLocalLocation={...location,unit_id:fs.unit_id};},
+      onClose:()=>{
+        if(S.fieldNavigationController===controller)S.fieldNavigationController=null;
+        if(holder.isConnected)holder.innerHTML="";
+      }
+    });
+    S.fieldNavigationController=controller;
+  }catch(error){
+    console.error("Field navigation failed",error);
+    holder.innerHTML=`<div class="notice error field-navigation-error"><strong>Navigation unavailable</strong><br>${esc(error.message)}<div class="small" style="margin-top:6px">The Event Map remains available without Google navigation.</div></div>`;
+  }
+}
 
 function clearFieldUnitMap(){
   if(S.fieldMap){
@@ -7996,6 +8095,7 @@ async function showFieldMap(incident,fs){
   const holder=document.querySelector("#fieldMapHolder");
   if(!holder)return;
 
+  clearFieldNavigation();
   clearFieldUnitMap();
 
   holder.innerHTML=`<div class="field-map-toolbar">
@@ -8129,6 +8229,7 @@ async function showFieldMap(incident,fs){
 
 async function leaveField(){
   clearFieldUnitMap();
+  clearFieldNavigation();
   S.fieldLocalLocation=null;
   if(S.fieldSession?.unit_id)await stopFieldLocationSharing(S.fieldSession.unit_id,{notifyServer:true});
   if(S.fieldSession?.id)await supabase.rpc("field_end_session",{p_field_session_id:S.fieldSession.id});
@@ -8166,9 +8267,9 @@ function mergeDispatcherUnitRow(row){
   const unit=S.units.find(u=>u.id===row.id);
   if(!unit)return false;
 
-  let boardNeedsRefresh=false;
-
-  const transportKeys=[
+  let changed=false;
+  const stateKeys=[
+    "status",
     "current_transport_destination_text",
     "current_transport_treatment_area_id",
     "current_map_layer_id",
@@ -8176,32 +8277,39 @@ function mergeDispatcherUnitRow(row){
     "current_poi_id"
   ];
 
-  for(const key of transportKeys){
+  for(const key of stateKeys){
     if(Object.prototype.hasOwnProperty.call(row,key) && unit[key]!==row[key]){
       unit[key]=row[key];
-      boardNeedsRefresh=true;
+      changed=true;
     }
   }
 
-  if(Object.prototype.hasOwnProperty.call(row,"status") && row.status && unit.status!==row.status){
-    unit.status=row.status;
-    updateDispatcherUnitStatusUI(row.id,row.status);
-  }
+  if(row.status)updateDispatcherUnitStatusUI(row.id,row.status);
 
-  // Keep the nested unit snapshots on incident assignments synchronized too.
-  // Some incident/detail views render from incident_units.units rather than S.units.
+  // Keep nested assignment snapshots synchronized. A full unit-board render is
+  // performed whenever any snapshot value changes, so the CAD never depends on
+  // a fragile one-element DOM patch to display the current status.
   for(const incident of S.incidents){
     for(const link of incident.incident_units||[]){
       if(link.unit_id===row.id && link.units){
-        if(row.status)link.units.status=row.status;
-        for(const key of transportKeys){
+        for(const key of stateKeys){
           if(Object.prototype.hasOwnProperty.call(row,key))link.units[key]=row[key];
         }
       }
     }
   }
 
-  return boardNeedsRefresh;
+  return changed;
+}
+
+function updateDispatchSyncIndicator({ok=true,message=null}={}){
+  const el=document.querySelector("#dispatchSyncIndicator");
+  if(!el)return;
+  const realtime=S.dispatchRealtimeStatus==="SUBSCRIBED";
+  el.classList.toggle("ok",!!ok);
+  el.classList.toggle("degraded",!ok);
+  el.textContent=ok?(realtime?"LIVE":"LIVE · DB"):"SYNC DEGRADED";
+  el.title=message||`${realtime?"Realtime connected; ":""}last database sync ${S.dispatchLastSyncAt?dateTime24(S.dispatchLastSyncAt,{seconds:true}):"pending"}`;
 }
 
 async function syncDispatcherUnitStatuses(){
@@ -8209,28 +8317,29 @@ async function syncDispatcherUnitStatuses(){
   S.dispatchUnitSyncInFlight=true;
 
   try{
-    const {data,error}=await supabase.from("units")
-      .select("id,status,current_transport_destination_text,current_transport_treatment_area_id,current_map_layer_id,current_zone_id,current_poi_id")
-      .eq("event_id",S.eventId)
-      .eq("active",true);
-
+    // Use a guarded SECURITY DEFINER snapshot RPC instead of depending on a
+    // client table query/RLS path. Realtime is still the fast path; this snapshot
+    // is the authoritative heartbeat and repairs any missed websocket event.
+    const {data,error}=await supabase.rpc("dispatch_unit_status_snapshot",{p_event_id:S.eventId});
     if(error)throw error;
 
-    let boardNeedsRefresh=false;
+    let changed=false;
     for(const row of data||[]){
-      if(mergeDispatcherUnitRow(row))boardNeedsRefresh=true;
+      if(mergeDispatcherUnitRow(row))changed=true;
     }
 
-    if(boardNeedsRefresh){
+    if(changed){
       const unitHost=document.querySelector("#unitList");
-      if(unitHost){
-        unitHost.innerHTML=unitList();
-        bindIncidentClicks();
-        refreshLocationAges();
-      }
+      if(unitHost)unitHost.innerHTML=unitList();
+      bindIncidentClicks();
+      refreshLocationAges();
     }
+
+    S.dispatchLastSyncAt=new Date().toISOString();
+    updateDispatchSyncIndicator({ok:true});
   }catch(error){
-    console.warn("Dispatch unit status sync failed",error);
+    console.warn("Dispatch unit status snapshot failed",error);
+    updateDispatchSyncIndicator({ok:false,message:error.message});
   }finally{
     S.dispatchUnitSyncInFlight=false;
   }
@@ -8238,23 +8347,28 @@ async function syncDispatcherUnitStatuses(){
 
 function startDispatcherUnitStatusFallback(){
   if(S.dispatchUnitSyncInterval)clearInterval(S.dispatchUnitSyncInterval);
-  // Realtime remains the primary path. This small poll is a fail-safe so a
-  // dropped/stalled websocket cannot leave Dispatch showing stale unit states.
-  S.dispatchUnitSyncInterval=setInterval(()=>syncDispatcherUnitStatuses(),2000);
+  // One authoritative snapshot per second is deliberately small (unit state
+  // only) and makes Dispatch self-healing even if Realtime is unavailable.
+  S.dispatchUnitSyncInterval=setInterval(()=>syncDispatcherUnitStatuses(),1000);
+
+  if(S.dispatchVisibilityHandler)document.removeEventListener("visibilitychange",S.dispatchVisibilityHandler);
+  if(S.dispatchFocusHandler)window.removeEventListener("focus",S.dispatchFocusHandler);
+  S.dispatchVisibilityHandler=()=>{if(document.visibilityState==="visible")syncDispatcherUnitStatuses();};
+  S.dispatchFocusHandler=()=>syncDispatcherUnitStatuses();
+  document.addEventListener("visibilitychange",S.dispatchVisibilityHandler);
+  window.addEventListener("focus",S.dispatchFocusHandler);
 }
 
 function subscribeDispatch(){
   const ch=supabase.channel(`event-${S.eventId}-${Date.now()}`)
     // Primary live path: merge the complete unit row into local CAD state.
     .on("postgres_changes",{event:"UPDATE",schema:"public",table:"units",filter:`event_id=eq.${S.eventId}`},payload=>{
-      const boardNeedsRefresh=mergeDispatcherUnitRow(payload.new);
-      if(boardNeedsRefresh){
+      const changed=mergeDispatcherUnitRow(payload.new);
+      if(changed){
         const unitHost=document.querySelector("#unitList");
-        if(unitHost){
-          unitHost.innerHTML=unitList();
-          bindIncidentClicks();
-          refreshLocationAges();
-        }
+        if(unitHost)unitHost.innerHTML=unitList();
+        bindIncidentClicks();
+        refreshLocationAges();
       }
     })
     // Secondary realtime signal: every normal status RPC writes the status log.
@@ -8275,9 +8389,12 @@ function subscribeDispatch(){
     .subscribe(status=>{
       S.dispatchRealtimeStatus=status;
       if(status==="SUBSCRIBED"){
+        updateDispatchSyncIndicator({ok:true});
         syncDispatcherUnitStatuses();
       }else if(status==="CHANNEL_ERROR"||status==="TIMED_OUT"||status==="CLOSED"){
-        console.warn(`Dispatch realtime channel status: ${status}. Database fallback sync remains active.`);
+        console.warn(`Dispatch realtime channel status: ${status}. Authoritative database heartbeat remains active.`);
+        updateDispatchSyncIndicator({ok:true,message:`Realtime ${status}; database heartbeat is still active.`});
+        syncDispatcherUnitStatuses();
       }
     });
 
@@ -8357,8 +8474,11 @@ function cleanupRealtime(){
   if(S.commandClockInterval){clearInterval(S.commandClockInterval);S.commandClockInterval=null;}
   if(S.commandTreatmentRefreshInterval){clearInterval(S.commandTreatmentRefreshInterval);S.commandTreatmentRefreshInterval=null;}
   if(S.dispatchUnitSyncInterval){clearInterval(S.dispatchUnitSyncInterval);S.dispatchUnitSyncInterval=null;}
+  if(S.dispatchVisibilityHandler){document.removeEventListener("visibilitychange",S.dispatchVisibilityHandler);S.dispatchVisibilityHandler=null;}
+  if(S.dispatchFocusHandler){window.removeEventListener("focus",S.dispatchFocusHandler);S.dispatchFocusHandler=null;}
   S.dispatchUnitSyncInFlight=false;
   S.dispatchRealtimeStatus=null;
+  S.dispatchLastSyncAt=null;
 }
 function reset(){
   if(S.locationWatchId!=null&&navigator.geolocation){
@@ -8370,6 +8490,7 @@ function reset(){
   S.locationWriteInFlight=false;
   S.fieldLocalLocation=null;
   clearFieldUnitMap();
+  clearFieldNavigation();
   S.unitLocations=[];
   S.unitLocationMarkers.clear();
   S.emsUnitConfigs=[];
