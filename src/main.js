@@ -7,6 +7,7 @@ import { saveOfflineEvent, getOfflineEvent } from "./offlineStore.js";
 import { renderEmsOps, renderEmsAdmin, renderTreatmentAreaFlow, loadFieldEmsState, fieldEmsPanelHtml, bindFieldEmsPanel, renderDispatchIncidentTreatmentPanel } from "./ems.js";
 import { loadVenueChoices, applyVenueVersionToEvent, saveEventToVenueLibrary, renderVenueLibrary } from "./venueLibrary.js";
 import { renderGuestLogistics, loadFieldLogisticsState, fieldLogisticsPanelHtml, bindFieldLogisticsPanel } from "./logistics.js";
+import { renderUnitStaffing } from "./staffing.js";
 
 const app=document.querySelector("#app");
 const S={
@@ -1730,6 +1731,10 @@ async function dispatchPage(){
           <strong>Guest Logistics</strong>
           <span>Prescheduled transportation and driver dispatch</span>
         </button>
+        <button class="topbar-menu-item" id="unitStaffingBtn">
+          <strong>Unit Staffing</strong>
+          <span>Operational Period assignments and personnel check-in</span>
+        </button>
         <button class="topbar-menu-item" id="adminBtn">
           <strong>Event Admin</strong>
           <span>Event configuration</span>
@@ -1758,6 +1763,7 @@ async function dispatchPage(){
   document.querySelector("#operationalPeriodsBtn").onclick=()=>{closeDispatchMenu();eventAdmin("periods");};
   document.querySelector("#emsOpsBtn").onclick=()=>{closeDispatchMenu();renderEmsOps(app,{eventId:S.eventId,event:S.event,header,onBack:()=>dispatchPage(),onAdmin:()=>eventAdmin("ems")});};
   document.querySelector("#guestLogisticsBtn")?.addEventListener("click",()=>{closeDispatchMenu();guestLogisticsPage();});
+  document.querySelector("#unitStaffingBtn").onclick=()=>{closeDispatchMenu();unitStaffingPage();};
   document.querySelector("#adminBtn").onclick=()=>{closeDispatchMenu();eventAdmin();};
   document.querySelector("#reportsBtn").onclick=()=>{closeDispatchMenu();reportsPage();};
   document.querySelector("#eventsBtn").onclick=()=>{closeDispatchMenu();closeIncidentModal();S.eventId=null;staffFlow();};
@@ -1804,6 +1810,28 @@ async function guestLogisticsPage({allDepartments=false}={}){
         ?`${movement.movement_number} · ${movement.guest_name} · ${movement.origin} → ${movement.destination}${movement.flight_number?` · Flight ${movement.flight_number}`:""}`
         :""
     })
+  });
+}
+
+
+async function unitStaffingPage({allDepartments=false}={}){
+  closeIncidentModal();
+  await loadEventOps();
+
+  const staffingScope=allDepartments
+    ?S.departments.filter(d=>d.active!==false).map(d=>d.id)
+    :S.dispatchDepartmentIds;
+
+  return renderUnitStaffing(app,{
+    eventId:S.eventId,
+    event:S.event,
+    header,
+    departments:S.departments,
+    units:S.units,
+    operationalPeriods:S.operationalPeriods,
+    departmentIds:staffingScope,
+    onBack:()=>dispatchPage(),
+    onOperationalPeriods:()=>eventAdmin("periods")
   });
 }
 
@@ -4771,6 +4799,62 @@ function renderGuestLogisticsAdmin(){
   };
 }
 
+function renderUnitStaffingAdmin(){
+  const host=document.querySelector("#adminContent");
+  if(!host)return;
+
+  const activeDepartments=S.departments.filter(d=>d.active!==false);
+  const activeUnits=S.units.filter(u=>u.active!==false);
+  const activeOp=S.operationalPeriods.find(op=>op.status==="ACTIVE")||null;
+
+  host.innerHTML=`<div class="stack">
+    <div class="card">
+      <div class="section-title">UNIT STAFFING</div>
+      <h2>Personnel & Unit Assignments</h2>
+      <p class="muted">Maintain an event personnel roster, assign people to units separately for each Operational Period, and check personnel in/out from the live staffing board.</p>
+
+      <div class="ems-metrics">
+        <div class="card"><div class="metric">${activeDepartments.length}</div><div class="small muted">Departments</div></div>
+        <div class="card"><div class="metric">${activeUnits.length}</div><div class="small muted">Units</div></div>
+        <div class="card"><div class="metric">${S.operationalPeriods.filter(op=>op.status!=="CANCELLED").length}</div><div class="small muted">Operational Periods</div></div>
+      </div>
+
+      <div class="notice">
+        <strong>Assignments are Operational Period specific.</strong><br>
+        A person can be assigned to Medic 1 for one Operational Period and Medic 3, Command, a driver unit, or the reserve pool in another. Check-in/out is recorded against that specific Operational Period assignment.
+      </div>
+
+      ${activeOp?`
+        <div class="small">Active Operational Period: <strong>${esc(activeOp.name)}</strong> · ${esc(activeOp.incident_prefix)}</div>
+      `:`<div class="notice error">No Operational Period is currently active. You can still plan staffing for PLANNED Operational Periods.</div>`}
+
+      <div class="grid2">
+        <button class="btn" id="openUnitStaffingAdminBoard">Open Unit Staffing Board</button>
+        <button class="btn secondary" id="openStaffingOperationalPeriods">Operational Periods</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="section-title">BOARD WORKFLOW</div>
+      <div class="grid2">
+        <div class="notice">
+          <strong>Planning</strong><br>
+          Add names to the event roster, choose an Operational Period, then assign each person to a unit / role for that period.
+        </div>
+        <div class="notice">
+          <strong>Check-In</strong><br>
+          At report time, use the same assignments board to Check In each person or an entire unit crew. The board updates through Realtime.
+        </div>
+      </div>
+    </div>
+  </div>`;
+
+  document.querySelector("#openUnitStaffingAdminBoard").onclick=()=>unitStaffingPage({allDepartments:true});
+  document.querySelector("#openStaffingOperationalPeriods").onclick=()=>{
+    document.querySelector("#periodsTab")?.click();
+  };
+}
+
 async function eventAdmin(initialTab="setup"){
   closeIncidentModal();
   await loadEventOps();
@@ -4781,6 +4865,7 @@ async function eventAdmin(initialTab="setup"){
         <button class="${initialTab==="periods"?"active":""}" id="periodsTab">Operational Periods</button>
         <button class="${initialTab==="ems"?"active":""}" id="emsTab">EMS Setup</button>
         <button class="${initialTab==="logistics"?"active":""}" id="logisticsTab">Guest Logistics</button>
+        <button class="${initialTab==="staffing"?"active":""}" id="staffingTab">Unit Staffing</button>
         <button id="mapTab">Map Builder</button>
         <button id="backDispatch">Back to CAD</button>
       </aside>
@@ -4812,10 +4897,12 @@ async function eventAdmin(initialTab="setup"){
   document.querySelector("#periodsTab").onclick=()=>{markAdminTab("periodsTab");renderOperationalPeriodsAdmin();};
   document.querySelector("#emsTab").onclick=showEmsAdmin;
   document.querySelector("#logisticsTab").onclick=()=>{markAdminTab("logisticsTab");renderGuestLogisticsAdmin();};
+  document.querySelector("#staffingTab").onclick=()=>{markAdminTab("staffingTab");renderUnitStaffingAdmin();};
 
   if(initialTab==="ems")showEmsAdmin();
   else if(initialTab==="periods")renderOperationalPeriodsAdmin();
   else if(initialTab==="logistics")renderGuestLogisticsAdmin();
+  else if(initialTab==="staffing")renderUnitStaffingAdmin();
   else renderEventSetup();
 }
 

@@ -3571,3 +3571,524 @@ body.modal-open{
   background:#10261d;
   color:#85d9a9;
 }
+
+
+/* ============================================================
+   v0.11.0 — UNIT STAFFING / OPERATIONAL PERIOD ASSIGNMENTS
+   ============================================================ */
+
+.staffing-command-shell{
+  min-height:100vh;
+  background:#07111d;
+  color:var(--cc-text);
+}
+
+.staffing-command-header{
+  position:sticky;
+  top:0;
+  z-index:20;
+  display:grid;
+  grid-template-columns:minmax(220px,1fr) auto auto;
+  gap:18px;
+  align-items:center;
+  padding:14px 18px;
+  border-bottom:1px solid #243a52;
+  background:#0b1726;
+  box-shadow:0 8px 24px rgba(0,0,0,.22);
+}
+
+.staffing-command-event{
+  margin-top:2px;
+  color:#b9cce0;
+  font-size:14px;
+  font-weight:700;
+}
+
+.staffing-command-metrics{
+  display:flex;
+  gap:8px;
+  align-items:stretch;
+}
+
+.staffing-command-metrics>div{
+  min-width:105px;
+  padding:8px 10px;
+  border:1px solid #29415a;
+  border-radius:9px;
+  background:#0e1d2d;
+}
+
+.staffing-command-metrics span{
+  display:block;
+  color:#8fa7bf;
+  font-size:10px;
+  font-weight:800;
+  letter-spacing:.05em;
+}
+
+.staffing-command-metrics strong{
+  display:block;
+  margin-top:2px;
+  color:#f0f6ff;
+  font-size:18px;
+}
+
+.staffing-command-metrics small{
+  display:block;
+  color:#8fa7bf;
+  font-size:10px;
+}
+
+.staffing-command-actions{
+  display:flex;
+  gap:8px;
+  justify-content:flex-end;
+}
+
+.staffing-command-controls{
+  display:flex;
+  gap:14px;
+  justify-content:space-between;
+  align-items:end;
+  padding:12px 18px;
+  border-bottom:1px solid #20354a;
+  background:#0a1522;
+}
+
+.staffing-op-selector{
+  min-width:280px;
+}
+
+.staffing-board-actions{
+  justify-content:flex-end;
+  flex-wrap:wrap;
+}
+
+.staffing-board{
+  width:min(1540px,calc(100% - 24px));
+  margin:14px auto 40px;
+}
+
+.staffing-op-banner{
+  display:flex;
+  justify-content:space-between;
+  gap:14px;
+  align-items:center;
+  margin-bottom:15px;
+  padding:12px 14px;
+  border:1px solid #325370;
+  border-radius:11px;
+  background:linear-gradient(180deg,#10263b,#0c1b2a);
+}
+
+.staffing-op-banner>div{
+  display:grid;
+  gap:3px;
+}
+
+.staffing-op-banner strong{
+  color:#f3f8ff;
+  font-size:18px;
+}
+
+.staffing-op-banner span:not(.badge){
+  color:#a7bdd3;
+  font-size:12px;
+}
+
+.staffing-op-status{
+  font-size:12px;
+}
+
+.staffing-department-section{
+  margin:0 0 22px;
+}
+
+.staffing-department-heading{
+  display:flex;
+  justify-content:space-between;
+  gap:14px;
+  align-items:end;
+  margin:0 3px 9px;
+}
+
+.staffing-department-heading h2{
+  margin:1px 0 0;
+  font-size:20px;
+}
+
+.staffing-department-summary{
+  color:#8fa7bf;
+  font-size:12px;
+}
+
+.staffing-unit-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fill,minmax(360px,1fr));
+  gap:10px;
+}
+
+.staffing-unit-card{
+  display:flex;
+  min-height:170px;
+  flex-direction:column;
+  overflow:hidden;
+  border:1px solid #2a4058;
+  border-top:4px solid #476885;
+  border-radius:12px;
+  background:linear-gradient(180deg,#101f30,#0c1928);
+  box-shadow:0 8px 18px rgba(0,0,0,.13);
+}
+
+.staffing-unit-card.partially-checked-in{
+  border-top-color:#d7a83e;
+}
+
+.staffing-unit-card.fully-checked-in{
+  border-top-color:#43b77d;
+}
+
+.staffing-pool-card{
+  border-top-color:#8268c7;
+}
+
+.staffing-unit-header{
+  display:flex;
+  justify-content:space-between;
+  gap:12px;
+  align-items:center;
+  padding:11px 12px;
+  border-bottom:1px solid #26394d;
+  background:#0e1c2b;
+}
+
+.staffing-unit-header h3{
+  margin:1px 0 0;
+  color:#f3f8ff;
+  font-size:18px;
+}
+
+.staffing-unit-count{
+  display:grid;
+  justify-items:end;
+  gap:1px;
+  color:#d5e2ef;
+}
+
+.staffing-unit-count strong{
+  font-size:17px;
+}
+
+.staffing-unit-count span{
+  color:#839ab1;
+  font-size:10px;
+  text-transform:uppercase;
+}
+
+.staffing-unit-count.complete strong{
+  color:#78e5a9;
+}
+
+.staffing-unit-crew{
+  display:grid;
+  flex:1;
+}
+
+.staffing-person-row{
+  display:grid;
+  grid-template-columns:minmax(0,1fr) auto;
+  gap:10px;
+  align-items:center;
+  padding:10px 12px;
+  border-bottom:1px solid #22364a;
+  background:#0b1826;
+}
+
+.staffing-person-row:nth-child(even){
+  background:#0d1c2b;
+}
+
+.staffing-person-row:last-child{
+  border-bottom:0;
+}
+
+.staffing-person-row.checked-in{
+  background:linear-gradient(90deg,#102a21,#0c1b29 58%);
+}
+
+.staffing-person-main{
+  min-width:0;
+}
+
+.staffing-person-main strong{
+  overflow-wrap:anywhere;
+}
+
+.staffing-role-line{
+  margin-top:3px;
+  color:#b6c9da;
+}
+
+.staffing-check-time{
+  margin-top:3px;
+  color:#7fd6a3;
+}
+
+.staffing-person-actions{
+  display:flex;
+  gap:5px;
+  flex-wrap:wrap;
+  justify-content:flex-end;
+}
+
+.staffing-empty-unit{
+  display:grid;
+  place-items:center;
+  min-height:78px;
+  padding:16px;
+  color:#7189a2;
+  text-align:center;
+  font-size:12px;
+}
+
+.staffing-unit-footer{
+  display:flex;
+  gap:6px;
+  flex-wrap:wrap;
+  padding:9px 10px;
+  border-top:1px solid #26394d;
+  background:#0a1623;
+}
+
+.badge.staffing-status-planned{
+  background:#273445;
+  color:#c9d4df;
+  border-color:#46596f;
+}
+
+.badge.staffing-status-checked-in{
+  background:#123b2b;
+  color:#79e6a9;
+  border-color:#286245;
+}
+
+.badge.staffing-status-checked-out{
+  background:#26384d;
+  color:#9ab3ca;
+  border-color:#415b74;
+}
+
+.badge.staffing-status-cancelled{
+  background:#4d2025;
+  color:#ff9aa1;
+  border-color:#7a363d;
+}
+
+.staffing-not-scheduled{
+  margin-top:9px;
+  padding:10px 11px;
+  border:1px dashed #2c4258;
+  border-radius:10px;
+  background:#091521;
+}
+
+.staffing-unscheduled-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fill,minmax(180px,1fr));
+  gap:7px;
+  margin-top:7px;
+}
+
+.staffing-unscheduled-person{
+  display:grid;
+  gap:2px;
+  text-align:left;
+}
+
+.staffing-unscheduled-person span,
+.staffing-unscheduled-person small{
+  color:#839ab1;
+}
+
+/* Staffing modal */
+.staffing-modal-backdrop{
+  position:fixed;
+  inset:0;
+  z-index:1350;
+  display:none;
+  align-items:center;
+  justify-content:center;
+  padding:18px;
+  background:rgba(2,8,15,.76);
+  backdrop-filter:blur(4px);
+}
+
+.staffing-modal-backdrop.open{
+  display:flex;
+}
+
+.staffing-modal{
+  width:min(920px,100%);
+  max-height:92vh;
+  overflow:auto;
+  border:1px solid #31465f;
+  border-radius:14px;
+  background:#0d1928;
+  color:var(--cc-text);
+  box-shadow:0 28px 80px rgba(0,0,0,.58);
+}
+
+.staffing-modal-header{
+  position:sticky;
+  top:0;
+  z-index:2;
+  display:flex;
+  justify-content:space-between;
+  gap:16px;
+  align-items:flex-start;
+  padding:16px 18px;
+  border-bottom:1px solid #31465f;
+  background:#0b1727;
+}
+
+.staffing-modal-header h2{
+  margin:2px 0;
+}
+
+.staffing-modal-close{
+  width:38px;
+  height:38px;
+  border:1px solid #31465f;
+  border-radius:9px;
+  background:#122137;
+  color:#d9e7f6;
+  font-size:22px;
+  cursor:pointer;
+}
+
+.staffing-modal-body{
+  padding:18px;
+}
+
+.staffing-modal-footer{
+  position:sticky;
+  bottom:0;
+  z-index:2;
+  display:flex;
+  justify-content:flex-end;
+  gap:8px;
+  padding:13px 18px;
+  border-top:1px solid #31465f;
+  background:#0b1727;
+}
+
+.staffing-op-notice{
+  border-color:#325370;
+  background:#102438;
+}
+
+.staffing-roster-list{
+  display:grid;
+  gap:7px;
+}
+
+.staffing-roster-row{
+  display:flex;
+  justify-content:space-between;
+  gap:12px;
+  align-items:center;
+  padding:9px 10px;
+  border:1px solid #26394d;
+  border-radius:9px;
+  background:#0a1725;
+}
+
+.staffing-command-shell:fullscreen{
+  overflow:auto;
+  background:#07111d;
+}
+
+.staffing-command-shell:fullscreen .staffing-command-actions{
+  opacity:.18;
+  transition:opacity .15s ease;
+}
+
+.staffing-command-shell:fullscreen .staffing-command-actions:hover{
+  opacity:1;
+}
+
+@media(max-width:1100px){
+  .staffing-command-header{
+    grid-template-columns:1fr;
+  }
+
+  .staffing-command-metrics{
+    flex-wrap:wrap;
+  }
+
+  .staffing-command-actions{
+    justify-content:flex-start;
+  }
+
+  .staffing-command-controls{
+    align-items:stretch;
+    flex-direction:column;
+  }
+
+  .staffing-op-selector{
+    min-width:0;
+  }
+
+  .staffing-board-actions{
+    justify-content:flex-start;
+  }
+}
+
+@media(max-width:620px){
+  .staffing-board{
+    width:min(100% - 12px,1540px);
+  }
+
+  .staffing-command-header,
+  .staffing-command-controls{
+    padding-left:10px;
+    padding-right:10px;
+  }
+
+  .staffing-command-metrics{
+    display:grid;
+    grid-template-columns:repeat(2,minmax(0,1fr));
+  }
+
+  .staffing-command-metrics>div{
+    min-width:0;
+  }
+
+  .staffing-unit-grid{
+    grid-template-columns:1fr;
+  }
+
+  .staffing-person-row{
+    grid-template-columns:1fr;
+  }
+
+  .staffing-person-actions{
+    justify-content:flex-start;
+  }
+
+  .staffing-roster-row{
+    align-items:flex-start;
+    flex-direction:column;
+  }
+
+  .staffing-modal-backdrop{
+    padding:0;
+  }
+
+  .staffing-modal{
+    width:100%;
+    height:100vh;
+    max-height:100vh;
+    border-radius:0;
+  }
+}
