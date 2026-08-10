@@ -15225,3 +15225,667 @@ $$;
 
 revoke all on function public.command_treatment_center_summary(uuid) from public;
 grant execute on function public.command_treatment_center_summary(uuid) to authenticated;
+-- CommCenter Pro v0.13.5
+-- Treatment Area inbound-arrival authorization hotfix.
+--
+-- Problem:
+-- unit_arrive_treatment_area() correctly permits the destination Treatment Area
+-- Station to complete an inbound arrival, but when the incident did not yet have
+-- an EMS encounter it called ems_create_encounter() with the transporting unit as
+-- the source. ems_create_encounter() only recognized Dispatch or the Field Unit as
+-- authorized for a unit source, causing the Treatment Area UI to receive:
+--   "Not authorized for this unit"
+--
+-- Fix:
+-- 1. Permit the CURRENT destination Treatment Area Station to establish the EMS
+--    encounter for a unit that is actively TRANSPORTING that exact incident to
+--    that exact Treatment Area.
+-- 2. Preserve the audit actor as "treatment" for that path.
+-- 3. Treat an already-committed inbound transport as receivable even if the
+--    Treatment Area becomes FULL / not accepting after transport began. This
+--    does NOT allow new handoffs to select a closed/full/non-accepting center.
+
+create or replace function public.ems_create_encounter(
+  p_event_id uuid,
+  p_incident_id uuid default null,
+  p_source_unit_id uuid default null,
+  p_source_treatment_area_id uuid default null,
+  p_operational_note text default null
+) returns uuid
+language plpgsql
+security definer
+set search_path=public
+as $$
+declare
+  i public.incidents;
+  encounter_id uuid;
+  initial_status text;
+  actor_kind_value text;
+  current_area_id uuid;
+  treatment_arrival_authorized boolean:=false;
+begin
+  if p_incident_id is null then
+    raise exception 'A CAD incident is required for EMS custody';
+  end if;
+
+  if ((p_source_unit_id is not null)::int + (p_source_treatment_area_id is not null)::int) <> 1 then
+    raise exception 'Exactly one source resource is required';
+  end if;
+
+  select * into i
+  from public.incidents
+  where id=p_incident_id
+    and event_id=p_event_id
+    and status<>'CLOSED';
+
+  if i.id is null then
+    raise exception 'Active incident is not part of this event';
+  end if;
+
+  select id into encounter_id
+  from public.ems_encounters
+  where event_id=p_event_id
+    and incident_id=p_incident_id
+    and current_status<>'CLOSED'
+  order by created_at
+  limit 1;
+
+  if encounter_id is not null then
+    return encounter_id;
+  end if;
+
+  if p_source_unit_id is not null then
+    if not exists(
+      select 1 from public.units
+      where id=p_source_unit_id and event_id=p_event_id and active=true
+    ) then
+      raise exception 'Unit is not part of this event';
+    end if;
+
+    current_area_id:=private.current_treatment_area();
+
+    if current_area_id is not null then
+      select exists(
+        select 1
+        from public.units u
+        join public.incident_units iu
+          on iu.unit_id=u.id
+         and iu.incident_id=p_incident_id
+         and iu.cleared_at is null
+        where u.id=p_source_unit_id
+          and u.event_id=p_event_id
+          and u.active=true
+          and u.status='TRANSPORTING'
+          and u.current_transport_treatment_area_id=current_area_id
+      ) into treatment_arrival_authorized;
+    end if;
+
+    if not (
+      public.can_dispatch_event(p_event_id)
+      or public.field_has_unit_access(p_source_unit_id)
+      or treatment_arrival_authorized
+    ) then
+      raise exception 'Not authorized for this unit';
+    end if;
+
+    if exists(
+      select 1 from public.ems_unit_config
+      where unit_id=p_source_unit_id
+        and active=true
+        and (ems_role='ambulance' or transport_capable=true)
+    ) then
+      initial_status:='WITH_AMBULANCE';
+    else
+      initial_status:='FIELD';
+    end if;
+  else
+    if not exists(
+      select 1 from public.ems_treatment_areas
+      where id=p_source_treatment_area_id
+        and event_id=p_event_id
+        and active=true
+    ) then
+      raise exception 'Treatment area is not part of this event';
+    end if;
+
+    if not (
+      public.can_dispatch_event(p_event_id)
+      or private.current_treatment_area()=p_source_treatment_area_id
+    ) then
+      raise exception 'Not authorized for this treatment area';
+    end if;
+
+    initial_status:='IN_TREATMENT';
+  end if;
+
+  actor_kind_value:=case
+    when public.can_dispatch_event(p_event_id) then 'staff'
+    when p_source_treatment_area_id is not null then 'treatment'
+    when treatment_arrival_authorized then 'treatment'
+    else 'field'
+  end;
+
+  insert into public.ems_encounters(
+    event_id,incident_id,tracking_number,current_status,current_unit_id,
+    current_treatment_area_id,origin_unit_id,operational_note,created_by
+  ) values(
+    p_event_id,p_incident_id,i.incident_number,initial_status,p_source_unit_id,
+    p_source_treatment_area_id,
+    case when initial_status='FIELD' then p_source_unit_id else null end,
+    nullif(trim(p_operational_note),''),
+    auth.uid()
+  )
+  returning id into encounter_id;
+
+  insert into public.cad_activity(
+    event_id,incident_id,unit_id,action,detail,actor_user_id,actor_kind
+  ) values(
+    p_event_id,p_incident_id,p_source_unit_id,'EMS_FLOW_STARTED',
+    jsonb_build_object(
+      'encounter_id',encounter_id,
+      'incident_number',i.incident_number,
+      'current_status',initial_status,
+      'treatment_area_id',p_source_treatment_area_id,
+      'created_during_treatment_arrival',treatment_arrival_authorized
+    ),
+    auth.uid(),actor_kind_value
+  );
+
+  return encounter_id;
+end;
+$$;
+
+revoke all on function public.ems_create_encounter(uuid,uuid,uuid,uuid,text) from public;
+grant execute on function public.ems_create_encounter(uuid,uuid,uuid,uuid,text) to authenticated;
+
+
+create or replace function private.ems_direct_transfer(
+  p_encounter_id uuid,
+  p_to_unit_id uuid,
+  p_to_treatment_area_id uuid,
+  p_note text,
+  p_actor_kind text
+) returns text
+language plpgsql
+security definer
+set search_path=public
+as $$
+declare
+  e public.ems_encounters;
+  ta public.ems_treatment_areas;
+  old_unit uuid;
+  old_area uuid;
+  new_status text;
+  occupancy integer;
+  handoff_id uuid;
+  already_committed_inbound boolean:=false;
+begin
+  if ((p_to_unit_id is not null)::int + (p_to_treatment_area_id is not null)::int) <> 1 then
+    raise exception 'Choose exactly one handoff destination';
+  end if;
+
+  select * into e
+  from public.ems_encounters
+  where id=p_encounter_id
+    and current_status<>'CLOSED';
+
+  if e.id is null then
+    raise exception 'Active EMS custody record not found';
+  end if;
+
+  if p_to_unit_id is not null then
+    if not exists(
+      select 1 from public.units u
+      where u.id=p_to_unit_id
+        and u.event_id=e.event_id
+        and u.active=true
+    ) then
+      raise exception 'Ambulance is not part of this event';
+    end if;
+
+    if not exists(
+      select 1 from public.ems_unit_config c
+      where c.unit_id=p_to_unit_id
+        and c.active=true
+        and (c.ems_role='ambulance' or c.transport_capable=true)
+    ) then
+      raise exception 'Destination unit is not configured as an ambulance';
+    end if;
+
+    if e.current_unit_id=p_to_unit_id and e.current_status in ('WITH_AMBULANCE','TRANSPORTING') then
+      return 'ALREADY_HERE';
+    end if;
+
+    new_status:='WITH_AMBULANCE';
+  else
+    select * into ta
+    from public.ems_treatment_areas
+    where id=p_to_treatment_area_id
+      and event_id=e.event_id
+      and active=true;
+
+    if ta.id is null then
+      raise exception 'Treatment area is not part of this event';
+    end if;
+
+    if e.current_treatment_area_id=p_to_treatment_area_id and e.current_status='IN_TREATMENT' then
+      return 'ALREADY_HERE';
+    end if;
+
+    -- If the current EMS custodian is already physically committed as an
+    -- inbound transport to this exact Treatment Area, reception must remain
+    -- possible even if the center becomes FULL / not accepting after transport
+    -- began. Eligibility checks still apply to every NEW destination selection.
+    if e.current_unit_id is not null then
+      select exists(
+        select 1
+        from public.units u
+        where u.id=e.current_unit_id
+          and u.event_id=e.event_id
+          and u.active=true
+          and u.status='TRANSPORTING'
+          and u.current_transport_treatment_area_id=p_to_treatment_area_id
+          and exists(
+            select 1
+            from public.incident_units iu
+            where iu.incident_id=e.incident_id
+              and iu.unit_id=u.id
+              and iu.cleared_at is null
+          )
+      ) into already_committed_inbound;
+    end if;
+
+    if not already_committed_inbound then
+      if not ta.accepting_patients or ta.status in ('FULL','CLOSED') then
+        raise exception 'Treatment area is not accepting patients';
+      end if;
+
+      select count(*) into occupancy
+      from public.ems_encounters x
+      where x.current_treatment_area_id=ta.id
+        and x.current_status<>'CLOSED'
+        and x.id<>e.id;
+
+      if occupancy>=ta.capacity then
+        raise exception 'Treatment area is at capacity';
+      end if;
+    end if;
+
+    new_status:='IN_TREATMENT';
+  end if;
+
+  old_unit:=e.current_unit_id;
+  old_area:=e.current_treatment_area_id;
+
+  perform private.ems_sync_incident_units(
+    e.incident_id,
+    old_unit,
+    p_to_unit_id,
+    p_actor_kind
+  );
+
+  update public.ems_handoffs
+  set
+    status='CANCELLED',
+    responded_at=coalesce(responded_at,now()),
+    note=coalesce(note,'Cancelled by direct custody transfer')
+  where encounter_id=e.id
+    and status='PENDING';
+
+  if old_unit is not null or old_area is not null then
+    insert into public.ems_handoffs(
+      event_id,encounter_id,
+      from_unit_id,from_treatment_area_id,
+      to_unit_id,to_treatment_area_id,
+      status,note,
+      requested_by,requested_at,
+      responded_by,responded_at,completed_at
+    ) values(
+      e.event_id,e.id,
+      old_unit,old_area,
+      p_to_unit_id,p_to_treatment_area_id,
+      'COMPLETED',nullif(trim(p_note),''),
+      auth.uid(),now(),
+      auth.uid(),now(),now()
+    )
+    returning id into handoff_id;
+  end if;
+
+  update public.ems_encounters
+  set
+    current_unit_id=p_to_unit_id,
+    current_treatment_area_id=p_to_treatment_area_id,
+    current_status=new_status,
+    operational_note=coalesce(nullif(trim(p_note),''),operational_note)
+  where id=e.id;
+
+  insert into public.cad_activity(
+    event_id,incident_id,unit_id,action,detail,actor_user_id,actor_kind
+  ) values(
+    e.event_id,e.incident_id,old_unit,'EMS_HANDOFF_COMPLETED',
+    jsonb_build_object(
+      'encounter_id',e.id,
+      'handoff_id',handoff_id,
+      'from_unit_id',old_unit,
+      'from_treatment_area_id',old_area,
+      'to_unit_id',p_to_unit_id,
+      'to_treatment_area_id',p_to_treatment_area_id,
+      'cad_assignment_synced',true,
+      'direct',true,
+      'already_committed_inbound',already_committed_inbound,
+      'note',nullif(trim(p_note),'')
+    ),
+    auth.uid(),p_actor_kind
+  );
+
+  return 'TRANSFERRED';
+end;
+$$;
+
+revoke all on function private.ems_direct_transfer(uuid,uuid,uuid,text,text) from public;
+
+-- ============================================================
+-- MIGRATION 37: TREATMENT RELEASE CLOSES INCIDENT (v0.13.6)
+-- ============================================================
+-- CommCenter Pro v0.13.6
+-- Treatment Area patient release closes the associated CAD incident.
+--
+-- Problem:
+-- The Treatment Area UI's "Release / Close Patient" button called
+-- ems_release_encounter(). That closed EMS custody and removed the patient from
+-- Treatment Area census, but intentionally left the CAD incident OPEN. The call
+-- therefore remained on Dispatch / Command after the patient had completed care.
+--
+-- Fix:
+-- When the CURRENT Treatment Area Station is the actor releasing the patient,
+-- ems_release_encounter() now also closes the associated open CAD incident and
+-- releases any remaining unit assignments atomically. Field-unit and Dispatch
+-- uses of ems_release_encounter() retain their previous behavior.
+
+create or replace function public.ems_release_encounter(
+  p_encounter_id uuid,
+  p_disposition text
+)
+returns void
+language plpgsql
+security definer
+set search_path=public
+as $$
+declare
+  e public.ems_encounters;
+  i public.incidents;
+  unit_rec record;
+  disposition_code text;
+  general_code text;
+  actor_kind_value text;
+  released_count integer:=0;
+  other_open_ems boolean:=false;
+begin
+  select *
+  into e
+  from public.ems_encounters
+  where id=p_encounter_id
+    and current_status<>'CLOSED'
+  for update;
+
+  if e.id is null then
+    raise exception 'Active EMS encounter not found';
+  end if;
+
+  if public.can_dispatch_event(e.event_id) then
+    actor_kind_value:='staff';
+  elsif e.current_unit_id is not null
+        and e.current_unit_id=private.current_field_unit() then
+    actor_kind_value:='field';
+  elsif e.current_treatment_area_id is not null
+        and e.current_treatment_area_id=private.current_treatment_area() then
+    actor_kind_value:='treatment';
+  else
+    raise exception 'Only the current holder can close this encounter';
+  end if;
+
+  disposition_code:=upper(trim(coalesce(p_disposition,'')));
+
+  if not exists(
+    select 1
+    from public.event_dispositions d
+    where d.event_id=e.event_id
+      and d.scope='EMS'
+      and d.code=disposition_code
+      and d.active=true
+  ) then
+    raise exception 'Choose a valid EMS patient disposition';
+  end if;
+
+  -- Cancel any stale/pending handoff before final patient disposition.
+  update public.ems_handoffs
+  set
+    status='CANCELLED',
+    responded_at=coalesce(responded_at,now())
+  where encounter_id=e.id
+    and status='PENDING';
+
+  -- Close the patient-flow record and remove it from live custody/census.
+  update public.ems_encounters
+  set
+    current_status='CLOSED',
+    current_unit_id=null,
+    current_treatment_area_id=null,
+    final_disposition=disposition_code,
+    transport_completed_at=case
+      when disposition_code='TRANSPORTED'
+        and transport_started_at is not null
+        then coalesce(transport_completed_at,now())
+      else transport_completed_at
+    end,
+    closed_at=now()
+  where id=e.id;
+
+  insert into public.cad_activity(
+    event_id,incident_id,unit_id,action,detail,actor_user_id,actor_kind
+  ) values(
+    e.event_id,
+    e.incident_id,
+    e.current_unit_id,
+    'EMS_ENCOUNTER_CLOSED',
+    jsonb_build_object(
+      'encounter_id',e.id,
+      'ems_disposition',disposition_code,
+      'released_from_unit_id',e.current_unit_id,
+      'released_from_treatment_area_id',e.current_treatment_area_id
+    ),
+    auth.uid(),
+    actor_kind_value
+  );
+
+  -- A field-side EMS release remains an EMS-only workflow; Dispatch can still
+  -- decide how/when to close the CAD call. The Treatment Area button, however,
+  -- is explicitly "Release / Close Patient", and completion of care there is
+  -- the terminal event for the one-patient-per-incident treatment workflow.
+  if actor_kind_value<>'treatment' or e.incident_id is null then
+    return;
+  end if;
+
+  select *
+  into i
+  from public.incidents
+  where id=e.incident_id
+    and event_id=e.event_id
+  for update;
+
+  -- If Dispatch already closed the incident there is nothing further to do.
+  if i.id is null or i.status='CLOSED' then
+    return;
+  end if;
+
+  -- CommCenter's normal EMS model is one patient per CAD incident. Do not
+  -- silently close a call if legacy/corrupt data contains a second active EMS
+  -- encounter attached to the same incident.
+  select exists(
+    select 1
+    from public.ems_encounters x
+    where x.event_id=e.event_id
+      and x.incident_id=e.incident_id
+      and x.id<>e.id
+      and x.current_status<>'CLOSED'
+  ) into other_open_ems;
+
+  if other_open_ems then
+    insert into public.cad_activity(
+      event_id,incident_id,action,detail,actor_user_id,actor_kind
+    ) values(
+      e.event_id,e.incident_id,'EMS_TREATMENT_RELEASE_CALL_LEFT_OPEN',
+      jsonb_build_object(
+        'encounter_id',e.id,
+        'reason','ANOTHER_ACTIVE_EMS_ENCOUNTER_EXISTS'
+      ),
+      auth.uid(),'treatment'
+    );
+    return;
+  end if;
+
+  -- Prefer the standard Completed / Resolved general disposition. If an event
+  -- admin disabled it, use the first remaining active GENERAL disposition so
+  -- the incident can still close cleanly.
+  select d.code
+  into general_code
+  from public.event_dispositions d
+  where d.event_id=e.event_id
+    and d.scope='GENERAL'
+    and d.active=true
+  order by
+    case when d.code='COMPLETED' then 0 else 1 end,
+    d.sort_order,
+    d.code
+  limit 1;
+
+  general_code:=coalesce(general_code,'COMPLETED');
+
+  -- Release any unit that somehow remains committed to the call. Normally the
+  -- transporting field unit was already cleared at Treatment Area handoff, but
+  -- this keeps the terminal close path safe for multi-unit incidents.
+  for unit_rec in
+    select u.id as unit_id,u.status
+    from public.incident_units iu
+    join public.units u on u.id=iu.unit_id
+    where iu.incident_id=i.id
+      and iu.cleared_at is null
+    for update of iu,u
+  loop
+    update public.incident_units
+    set cleared_at=now()
+    where incident_id=i.id
+      and unit_id=unit_rec.unit_id
+      and cleared_at is null;
+
+    update public.units
+    set
+      status='AVAILABLE',
+      current_transport_destination_text=null,
+      current_transport_treatment_area_id=null
+    where id=unit_rec.unit_id;
+
+    if unit_rec.status is distinct from 'AVAILABLE' then
+      insert into public.unit_status_log(
+        event_id,incident_id,unit_id,old_status,new_status,
+        actor_user_id,actor_kind,
+        transport_destination_text,transport_treatment_area_id
+      ) values(
+        i.event_id,i.id,unit_rec.unit_id,
+        unit_rec.status,'AVAILABLE',
+        auth.uid(),'treatment',null,null
+      );
+    end if;
+
+    insert into public.cad_activity(
+      event_id,incident_id,unit_id,action,detail,
+      actor_user_id,actor_kind
+    ) values(
+      i.event_id,i.id,unit_rec.unit_id,'UNIT_UNASSIGNED',
+      jsonb_build_object(
+        'new_status','AVAILABLE',
+        'reason','PATIENT_RELEASED_FROM_TREATMENT',
+        'automatic',true
+      ),
+      auth.uid(),'treatment'
+    );
+
+    released_count:=released_count+1;
+  end loop;
+
+  update public.incidents
+  set
+    status='CLOSED',
+    closed_at=coalesce(closed_at,now()),
+    disposition=general_code
+  where id=i.id
+    and status<>'CLOSED';
+
+  insert into public.cad_activity(
+    event_id,incident_id,action,detail,actor_user_id,actor_kind
+  ) values(
+    i.event_id,i.id,'INCIDENT_CLOSED',
+    jsonb_build_object(
+      'disposition',general_code,
+      'general_disposition',general_code,
+      'ems_disposition',disposition_code,
+      'released_units',released_count,
+      'reason','PATIENT_RELEASED_FROM_TREATMENT',
+      'source','TREATMENT_AREA_RELEASE'
+    ),
+    auth.uid(),'treatment'
+  );
+end;
+$$;
+
+revoke all on function public.ems_release_encounter(uuid,text) from public;
+grant execute on function public.ems_release_encounter(uuid,text) to authenticated;
+
+-- ============================================================
+-- v0.13.8 DISPATCH REALTIME STATUS HARDENING
+-- ============================================================
+
+-- CommCenter Pro v0.13.8
+-- Dispatch live unit status hardening
+--
+-- Realtime remains the primary update path. This migration defensively verifies
+-- that the tables used by Dispatch status synchronization are published to
+-- Supabase Realtime and that units sends complete UPDATE row images.
+
+alter table public.units replica identity full;
+
+do $$
+begin
+  if not exists(
+    select 1
+    from pg_publication_tables
+    where pubname='supabase_realtime'
+      and schemaname='public'
+      and tablename='units'
+  ) then
+    alter publication supabase_realtime add table public.units;
+  end if;
+
+  if not exists(
+    select 1
+    from pg_publication_tables
+    where pubname='supabase_realtime'
+      and schemaname='public'
+      and tablename='unit_status_log'
+  ) then
+    alter publication supabase_realtime add table public.unit_status_log;
+  end if;
+
+  if not exists(
+    select 1
+    from pg_publication_tables
+    where pubname='supabase_realtime'
+      and schemaname='public'
+      and tablename='incident_units'
+  ) then
+    alter publication supabase_realtime add table public.incident_units;
+  end if;
+end $$;
+
+grant select on public.units, public.unit_status_log, public.incident_units to authenticated;
+

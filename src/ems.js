@@ -896,7 +896,7 @@ function fieldEncounterActions(e,state){
       <div>
         <label>EMS Patient Disposition</label>
         <select id="ems-disp-${e.id}">
-          ${dispositionOptionsHtml(state.emsDispositions,{selected:"TREATED_RELEASED"})}
+          ${dispositionOptionsHtml(state.emsDispositions)}
         </select>
       </div>
       <button class="btn secondary" data-release-encounter="${e.id}">Close EMS Flow</button>
@@ -1254,7 +1254,7 @@ async function treatmentDashboard(app,ts,{header,onExit}){
                 <div>
                   <label>EMS Patient Disposition</label>
                   <select id="ta-disp-${e.id}">
-                    ${dispositionOptionsHtml(emsDispositions,{selected:"RELEASED_FROM_TREATMENT"})}
+                    ${dispositionOptionsHtml(emsDispositions)}
                   </select>
                 </div>
                 <button class="btn secondary" data-ta-release="${e.id}">Release / Close Patient</button>

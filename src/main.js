@@ -34,6 +34,9 @@ const S={
   commandClockInterval:null,
   commandTreatmentSummaries:[],
   commandTreatmentRefreshInterval:null,
+  dispatchUnitSyncInterval:null,
+  dispatchUnitSyncInFlight:false,
+  dispatchRealtimeStatus:null,
   mapPickMode:null,
   pendingIncidentDraft:null,
   fieldReportSessionOwned:false
@@ -3081,7 +3084,7 @@ async function openCloseIncidentDispositionModal(incident,{hasEms=false}={}){
         <select id="closeGeneralDisposition">
           <option value="">Choose disposition…</option>
           ${generalOptions.map(option=>`
-            <option value="${esc(option.code)}" ${option.code==="COMPLETED"?"selected":""}>${esc(option.label)}</option>
+            <option value="${esc(option.code)}">${esc(option.label)}</option>
           `).join("")}
         </select>
         <div class="small muted">Overall operational outcome for the CAD incident.</div>
@@ -7839,14 +7842,106 @@ async function refreshDispatchStructure(){
   }
 }
 
+function mergeDispatcherUnitRow(row){
+  if(!row?.id)return false;
+  const unit=S.units.find(u=>u.id===row.id);
+  if(!unit)return false;
+
+  let boardNeedsRefresh=false;
+
+  const transportKeys=[
+    "current_transport_destination_text",
+    "current_transport_treatment_area_id",
+    "current_map_layer_id",
+    "current_zone_id",
+    "current_poi_id"
+  ];
+
+  for(const key of transportKeys){
+    if(Object.prototype.hasOwnProperty.call(row,key) && unit[key]!==row[key]){
+      unit[key]=row[key];
+      boardNeedsRefresh=true;
+    }
+  }
+
+  if(Object.prototype.hasOwnProperty.call(row,"status") && row.status && unit.status!==row.status){
+    unit.status=row.status;
+    updateDispatcherUnitStatusUI(row.id,row.status);
+  }
+
+  // Keep the nested unit snapshots on incident assignments synchronized too.
+  // Some incident/detail views render from incident_units.units rather than S.units.
+  for(const incident of S.incidents){
+    for(const link of incident.incident_units||[]){
+      if(link.unit_id===row.id && link.units){
+        if(row.status)link.units.status=row.status;
+        for(const key of transportKeys){
+          if(Object.prototype.hasOwnProperty.call(row,key))link.units[key]=row[key];
+        }
+      }
+    }
+  }
+
+  return boardNeedsRefresh;
+}
+
+async function syncDispatcherUnitStatuses(){
+  if(S.dispatchUnitSyncInFlight || !S.eventId || !document.querySelector("#dispatchWorkspace"))return;
+  S.dispatchUnitSyncInFlight=true;
+
+  try{
+    const {data,error}=await supabase.from("units")
+      .select("id,status,current_transport_destination_text,current_transport_treatment_area_id,current_map_layer_id,current_zone_id,current_poi_id")
+      .eq("event_id",S.eventId)
+      .eq("active",true);
+
+    if(error)throw error;
+
+    let boardNeedsRefresh=false;
+    for(const row of data||[]){
+      if(mergeDispatcherUnitRow(row))boardNeedsRefresh=true;
+    }
+
+    if(boardNeedsRefresh){
+      const unitHost=document.querySelector("#unitList");
+      if(unitHost){
+        unitHost.innerHTML=unitList();
+        bindIncidentClicks();
+        refreshLocationAges();
+      }
+    }
+  }catch(error){
+    console.warn("Dispatch unit status sync failed",error);
+  }finally{
+    S.dispatchUnitSyncInFlight=false;
+  }
+}
+
+function startDispatcherUnitStatusFallback(){
+  if(S.dispatchUnitSyncInterval)clearInterval(S.dispatchUnitSyncInterval);
+  // Realtime remains the primary path. This small poll is a fail-safe so a
+  // dropped/stalled websocket cannot leave Dispatch showing stale unit states.
+  S.dispatchUnitSyncInterval=setInterval(()=>syncDispatcherUnitStatuses(),2000);
+}
+
 function subscribeDispatch(){
   const ch=supabase.channel(`event-${S.eventId}-${Date.now()}`)
-    // Unit status changes are extremely frequent. Update only the matching unit
-    // controls; never rebuild the CAD/map or destroy a form in progress.
+    // Primary live path: merge the complete unit row into local CAD state.
     .on("postgres_changes",{event:"UPDATE",schema:"public",table:"units",filter:`event_id=eq.${S.eventId}`},payload=>{
-      if(payload.new?.id&&payload.new?.status){
-        updateDispatcherUnitStatusUI(payload.new.id,payload.new.status);
+      const boardNeedsRefresh=mergeDispatcherUnitRow(payload.new);
+      if(boardNeedsRefresh){
+        const unitHost=document.querySelector("#unitList");
+        if(unitHost){
+          unitHost.innerHTML=unitList();
+          bindIncidentClicks();
+          refreshLocationAges();
+        }
       }
+    })
+    // Secondary realtime signal: every normal status RPC writes the status log.
+    // If the units-table event is delayed/missed, immediately reconcile from DB.
+    .on("postgres_changes",{event:"INSERT",schema:"public",table:"unit_status_log",filter:`event_id=eq.${S.eventId}`},()=>{
+      syncDispatcherUnitStatuses();
     })
     // Structural changes refresh the call/unit boards while preserving an open
     // incident modal. If the call editor has unsaved changes, the refresh is
@@ -7858,8 +7953,17 @@ function subscribeDispatch(){
     // GPS changes update only the unit's map marker/readout.
     .on("postgres_changes",{event:"*",schema:"public",table:"unit_locations"},payload=>updateDispatcherUnitLocation(payload))
     .on("postgres_changes",{event:"INSERT",schema:"public",table:"event_pois",filter:`event_id=eq.${S.eventId}`},payload=>handleRealtimePoiInsert(payload))
-    .subscribe();
+    .subscribe(status=>{
+      S.dispatchRealtimeStatus=status;
+      if(status==="SUBSCRIBED"){
+        syncDispatcherUnitStatuses();
+      }else if(status==="CHANNEL_ERROR"||status==="TIMED_OUT"||status==="CLOSED"){
+        console.warn(`Dispatch realtime channel status: ${status}. Database fallback sync remains active.`);
+      }
+    });
+
   S.realtime.push(ch);
+  startDispatcherUnitStatusFallback();
 }
 async function handleFieldSessionLifecycleUpdate(payload){
   const row=payload?.new;
@@ -7932,6 +8036,9 @@ function cleanupRealtime(){
   if(S.commandRefreshTimer){clearTimeout(S.commandRefreshTimer);S.commandRefreshTimer=null;}
   if(S.commandClockInterval){clearInterval(S.commandClockInterval);S.commandClockInterval=null;}
   if(S.commandTreatmentRefreshInterval){clearInterval(S.commandTreatmentRefreshInterval);S.commandTreatmentRefreshInterval=null;}
+  if(S.dispatchUnitSyncInterval){clearInterval(S.dispatchUnitSyncInterval);S.dispatchUnitSyncInterval=null;}
+  S.dispatchUnitSyncInFlight=false;
+  S.dispatchRealtimeStatus=null;
 }
 function reset(){
   if(S.locationWatchId!=null&&navigator.geolocation){
