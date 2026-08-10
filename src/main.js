@@ -4,7 +4,7 @@ import { supabase } from "./supabase.js";
 import { renderMapBuilder } from "./mapBuilder.js";
 import { pixelToGeo, pixelToLeaflet, leafletToPixel, geoToPixel, distanceMeters } from "./georef.js";
 import { saveOfflineEvent, getOfflineEvent } from "./offlineStore.js";
-import { renderEmsOps, renderEmsAdmin, renderTreatmentAreaFlow, loadFieldEmsState, fieldEmsPanelHtml, bindFieldEmsPanel, renderDispatchIncidentTreatmentPanel } from "./ems.js";
+import { renderEmsOps, renderEmsAdmin, renderTreatmentAreaFlow, loadFieldEmsState, fieldEmsPanelHtml, bindFieldEmsPanel, renderDispatchIncidentTreatmentPanel, TREATMENT_LAYOUT_BLOCKS, defaultTreatmentLayoutConfig, normalizeTreatmentLayoutConfig } from "./ems.js";
 import { loadVenueChoices, applyVenueVersionToEvent, saveEventToVenueLibrary, renderVenueLibrary } from "./venueLibrary.js";
 import { renderGuestLogistics, loadFieldLogisticsState, fieldLogisticsPanelHtml, bindFieldLogisticsPanel } from "./logistics.js";
 import { renderUnitStaffing } from "./staffing.js";
@@ -2264,6 +2264,7 @@ function activityTitle(action){
     EMS_TRANSPORT_REFUSAL:"Transport ended with refusal",
     EMS_ENCOUNTER_CLOSED:"EMS patient flow closed",
     EMS_TREATMENT_CLEARED_BY_DISPATCH:"Patient cleared from treatment by Dispatch",
+    TREATMENT_LAYOUT_UPDATED:"Treatment Area layout updated",
     INCIDENT_CLOSED:"Incident closed"
   };
   return labels[action]||String(action||"Activity").replaceAll("_"," ").toLowerCase().replace(/^\w/,c=>c.toUpperCase());
@@ -5109,6 +5110,206 @@ function renderFieldLayoutAdmin(){
   render();
 }
 
+function treatmentLayoutBlockMeta(id){
+  return TREATMENT_LAYOUT_BLOCKS.find(block=>block.id===id)||null;
+}
+
+function renderTreatmentLayoutAdmin(){
+  const host=document.querySelector("#adminContent");
+  if(!host)return;
+
+  let draft=normalizeTreatmentLayoutConfig(S.event?.treatment_layout_config);
+  let draggingId=null;
+
+  const render=()=>{
+    const enabledCount=draft.blocks.filter(block=>block.enabled).length;
+
+    host.innerHTML=`<div class="stack treatment-layout-admin">
+      <div class="card">
+        <div class="row">
+          <div>
+            <div class="section-title">EVENT-WIDE TREATMENT AREA VIEW</div>
+            <h2>Treatment Layout Builder</h2>
+            <p class="muted">Drag blocks into the order Treatment Area Stations should see them. This layout applies globally to every Treatment Area in this event.</p>
+          </div>
+          <span class="badge">${enabledCount} Visible Blocks</span>
+        </div>
+
+        <div class="notice">
+          <strong>Inbound and census remain operationally distinct.</strong><br>
+          Patients being transported to a Treatment Area appear in the required Inbound block. They move into Current Census only after Treatment, Dispatch, or the transporting Field unit records the handoff / arrival.
+        </div>
+      </div>
+
+      <div class="field-layout-builder-grid treatment-layout-builder-grid">
+        <section class="card">
+          <div class="row">
+            <div>
+              <div class="section-title">DRAG & DROP</div>
+              <h3>Treatment Area Blocks</h3>
+            </div>
+            <div class="nav">
+              <button class="btn secondary compact" id="resetTreatmentLayout">Reset Default</button>
+              <button class="btn" id="saveTreatmentLayout">Save Layout</button>
+            </div>
+          </div>
+
+          <div id="treatmentLayoutSortList" class="field-layout-sort-list">
+            ${draft.blocks.map((block,index)=>{
+              const meta=treatmentLayoutBlockMeta(block.id);
+              if(!meta)return "";
+              return `<article class="field-layout-sort-card ${block.enabled?"":"disabled"}" draggable="true" data-treatment-layout-block="${block.id}">
+                <div class="field-layout-drag-handle" title="Drag to reorder" aria-hidden="true">☰</div>
+                <div class="field-layout-sort-copy">
+                  <div class="row start">
+                    <strong>${esc(meta.label)}</strong>
+                    ${meta.required?`<span class="badge field-layout-required-badge">REQUIRED</span>`:""}
+                  </div>
+                  <div class="small muted">${esc(meta.description)}</div>
+                </div>
+                <div class="field-layout-sort-actions">
+                  ${meta.required
+                    ?`<span class="small muted">Always visible</span>`
+                    :`<label class="field-layout-visible-toggle"><input type="checkbox" data-treatment-layout-enabled="${block.id}" ${block.enabled?"checked":""}> Visible</label>`}
+                  <div class="nav">
+                    <button class="btn secondary compact" data-treatment-layout-up="${block.id}" ${index===0?"disabled":""} aria-label="Move ${esc(meta.label)} up">↑</button>
+                    <button class="btn secondary compact" data-treatment-layout-down="${block.id}" ${index===draft.blocks.length-1?"disabled":""} aria-label="Move ${esc(meta.label)} down">↓</button>
+                  </div>
+                </div>
+              </article>`;
+            }).join("")}
+          </div>
+          <div id="treatmentLayoutMessage" class="small muted"></div>
+        </section>
+
+        <section class="card field-layout-preview-card treatment-layout-preview-card">
+          <div class="section-title">LIVE ORDER PREVIEW</div>
+          <h3>Treatment Area Station</h3>
+          <div class="field-layout-phone-preview treatment-layout-station-preview">
+            <div class="field-layout-preview-topbar">CommCenter Pro <span>Treatment Area</span></div>
+            <div class="field-layout-preview-body">
+              ${draft.blocks.filter(block=>block.enabled).map((block,index)=>{
+                const meta=treatmentLayoutBlockMeta(block.id);
+                return `<div class="field-layout-preview-block ${meta?.required?"required":""}">
+                  <span>${index+1}</span>
+                  <strong>${esc(meta?.label||block.id)}</strong>
+                </div>`;
+              }).join("")}
+            </div>
+          </div>
+          <div class="small muted">Station Summary, Inbound Patients, Current Census, and Session Controls are required. Station Status, Walk-In, manual Receive Existing Patient, and the Field Report QR can be hidden when an event does not use them.</div>
+        </section>
+      </div>
+    </div>`;
+
+    const moveBlock=(id,delta)=>{
+      const index=draft.blocks.findIndex(block=>block.id===id);
+      const target=index+delta;
+      if(index<0||target<0||target>=draft.blocks.length)return;
+      const next=[...draft.blocks];
+      const [item]=next.splice(index,1);
+      next.splice(target,0,item);
+      draft={...draft,blocks:next};
+      render();
+    };
+
+    document.querySelectorAll("[data-treatment-layout-up]").forEach(button=>{
+      button.onclick=()=>moveBlock(button.dataset.treatmentLayoutUp,-1);
+    });
+    document.querySelectorAll("[data-treatment-layout-down]").forEach(button=>{
+      button.onclick=()=>moveBlock(button.dataset.treatmentLayoutDown,1);
+    });
+
+    document.querySelectorAll("[data-treatment-layout-enabled]").forEach(input=>{
+      input.onchange=()=>{
+        draft={
+          ...draft,
+          blocks:draft.blocks.map(block=>block.id===input.dataset.treatmentLayoutEnabled?{...block,enabled:input.checked}:block)
+        };
+        render();
+      };
+    });
+
+    document.querySelectorAll("[data-treatment-layout-block]").forEach(card=>{
+      card.addEventListener("dragstart",event=>{
+        draggingId=card.dataset.treatmentLayoutBlock;
+        card.classList.add("dragging");
+        event.dataTransfer.effectAllowed="move";
+        event.dataTransfer.setData("text/plain",draggingId);
+      });
+
+      card.addEventListener("dragend",()=>{
+        draggingId=null;
+        card.classList.remove("dragging");
+        document.querySelectorAll(".field-layout-sort-card.drag-over").forEach(item=>item.classList.remove("drag-over"));
+      });
+
+      card.addEventListener("dragover",event=>{
+        event.preventDefault();
+        if(!draggingId||draggingId===card.dataset.treatmentLayoutBlock)return;
+        card.classList.add("drag-over");
+        event.dataTransfer.dropEffect="move";
+      });
+
+      card.addEventListener("dragleave",()=>card.classList.remove("drag-over"));
+
+      card.addEventListener("drop",event=>{
+        event.preventDefault();
+        card.classList.remove("drag-over");
+        const sourceId=draggingId||event.dataTransfer.getData("text/plain");
+        const targetId=card.dataset.treatmentLayoutBlock;
+        if(!sourceId||sourceId===targetId)return;
+
+        const sourceIndex=draft.blocks.findIndex(block=>block.id===sourceId);
+        const targetIndex=draft.blocks.findIndex(block=>block.id===targetId);
+        if(sourceIndex<0||targetIndex<0)return;
+
+        const next=[...draft.blocks];
+        const [item]=next.splice(sourceIndex,1);
+        next.splice(targetIndex,0,item);
+        draft={...draft,blocks:next};
+        render();
+      });
+    });
+
+    document.querySelector("#resetTreatmentLayout").onclick=()=>{
+      if(!confirm("Reset this event's Treatment Area layout to the CommCenter default order and visibility?"))return;
+      draft=defaultTreatmentLayoutConfig();
+      render();
+    };
+
+    document.querySelector("#saveTreatmentLayout").onclick=async()=>{
+      const button=document.querySelector("#saveTreatmentLayout");
+      const message=document.querySelector("#treatmentLayoutMessage");
+      button.disabled=true;
+      button.textContent="Saving…";
+      message.textContent="";
+
+      const {data,error}=await supabase.rpc("admin_save_treatment_layout",{
+        p_event_id:S.eventId,
+        p_layout:draft
+      });
+
+      if(error){
+        button.disabled=false;
+        button.textContent="Save Layout";
+        message.textContent=error.message;
+        message.classList.add("error");
+        return;
+      }
+
+      draft=normalizeTreatmentLayoutConfig(data);
+      S.event.treatment_layout_config=data;
+      button.disabled=false;
+      button.textContent="Save Layout";
+      message.classList.remove("error");
+      message.textContent="Treatment Area layout saved. Connected Treatment Area Stations will receive the new layout automatically.";
+    };
+  };
+
+  render();
+}
+
 async function eventAdmin(initialTab="setup"){
   closeIncidentModal();
   await loadEventOps();
@@ -5117,6 +5318,7 @@ async function eventAdmin(initialTab="setup"){
       <aside class="admin-menu">
         <button class="${initialTab==="setup"?"active":""}" id="setupTab">Setup</button>
         <button class="${initialTab==="field-layout"?"active":""}" id="fieldLayoutTab">Field Layout</button>
+        <button class="${initialTab==="treatment-layout"?"active":""}" id="treatmentLayoutTab">Treatment Layout</button>
         <button class="${initialTab==="periods"?"active":""}" id="periodsTab">Operational Periods</button>
         <button class="${initialTab==="ems"?"active":""}" id="emsTab">EMS Setup</button>
         <button class="${initialTab==="logistics"?"active":""}" id="logisticsTab">Guest Logistics</button>
@@ -5150,6 +5352,7 @@ async function eventAdmin(initialTab="setup"){
   document.querySelector("#mapTab").onclick=()=>renderMapBuilder(app,S.eventId,()=>eventAdmin());
   document.querySelector("#setupTab").onclick=()=>{markAdminTab("setupTab");renderEventSetup();};
   document.querySelector("#fieldLayoutTab").onclick=()=>{markAdminTab("fieldLayoutTab");renderFieldLayoutAdmin();};
+  document.querySelector("#treatmentLayoutTab").onclick=()=>{markAdminTab("treatmentLayoutTab");renderTreatmentLayoutAdmin();};
   document.querySelector("#periodsTab").onclick=()=>{markAdminTab("periodsTab");renderOperationalPeriodsAdmin();};
   document.querySelector("#emsTab").onclick=showEmsAdmin;
   document.querySelector("#logisticsTab").onclick=()=>{markAdminTab("logisticsTab");renderGuestLogisticsAdmin();};
@@ -5157,6 +5360,7 @@ async function eventAdmin(initialTab="setup"){
 
   if(initialTab==="ems")showEmsAdmin();
   else if(initialTab==="field-layout")renderFieldLayoutAdmin();
+  else if(initialTab==="treatment-layout")renderTreatmentLayoutAdmin();
   else if(initialTab==="periods")renderOperationalPeriodsAdmin();
   else if(initialTab==="logistics")renderGuestLogisticsAdmin();
   else if(initialTab==="staffing")renderUnitStaffingAdmin();
@@ -5178,6 +5382,7 @@ function renderEventSetup(){
         <button class="btn" id="savePin">Save Field Access</button>
         <button class="btn secondary" id="configureFieldLayout">Configure Field Unit View</button>
       </div>
+      <button class="btn secondary block" id="configureTreatmentLayout" style="margin-top:8px">Configure Treatment Area View</button>
       <div id="pinMsg" class="small muted"></div>
     </div>
 
@@ -5271,6 +5476,7 @@ function renderEventSetup(){
   </div>`;
 
   document.querySelector("#configureFieldLayout").onclick=()=>eventAdmin("field-layout");
+  document.querySelector("#configureTreatmentLayout").onclick=()=>eventAdmin("treatment-layout");
 
   document.querySelector("#savePin").onclick=async()=>{
     const pin=document.querySelector("#newPin").value.trim();

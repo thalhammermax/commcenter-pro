@@ -4295,3 +4295,135 @@ body.modal-open{
     padding-left:40px;
   }
 }
+
+/* ============================================================
+   v0.13.0 — TREATMENT AREA INBOUND + LAYOUT BUILDER
+   ============================================================ */
+
+.treatment-header.treatment-summary-card{
+  grid-template-columns:minmax(220px,1.2fr) minmax(180px,.8fr) minmax(120px,.45fr) minmax(160px,.65fr);
+}
+
+.treatment-inbound-summary{
+  display:grid;
+  justify-items:center;
+  gap:2px;
+  padding:10px 12px;
+  border:1px solid #654b1e;
+  border-radius:10px;
+  background:#251b0b;
+}
+
+.treatment-inbound-summary .metric{
+  color:#ffd27c;
+}
+
+.treatment-inbound-section{
+  border-color:#765728;
+  background:linear-gradient(180deg,#20190d,#111925);
+}
+
+.treatment-inbound-count,
+.treatment-inbound-badge{
+  background:#4b3411;
+  color:#ffd27c;
+  border-color:#7a5a22;
+}
+
+.treatment-inbound-grid{
+  display:grid;
+  grid-template-columns:repeat(2,minmax(0,1fr));
+  gap:10px;
+  margin-top:12px;
+}
+
+.treatment-inbound-patient-card{
+  display:grid;
+  gap:10px;
+  padding:12px;
+  border:1px solid #765728;
+  border-left:4px solid #d9a441;
+  border-radius:11px;
+  background:#111a25;
+}
+
+.treatment-inbound-unit{
+  display:grid;
+  gap:2px;
+  padding:9px 10px;
+  border:1px solid #4b3d25;
+  border-radius:8px;
+  background:#17150f;
+}
+
+.treatment-inbound-unit span{
+  color:#b9a77f;
+  font-size:10px;
+  font-weight:800;
+  letter-spacing:.04em;
+  text-transform:uppercase;
+}
+
+.treatment-inbound-unit strong{
+  color:#fff2c8;
+  font-size:16px;
+}
+
+.treatment-inbound-unit small{
+  color:#c2b38f;
+}
+
+.treatment-empty-inbound{
+  grid-column:1/-1;
+  display:grid;
+  gap:4px;
+  min-height:90px;
+  place-content:center;
+  text-align:center;
+  border:1px dashed #584a2e;
+  border-radius:10px;
+  background:#101722;
+}
+
+.treatment-census-section{
+  border-color:#2c4d66;
+}
+
+.treatment-station-status-card,
+.treatment-walkin-card{
+  min-width:0;
+}
+
+.treatment-session-controls{
+  justify-content:flex-end;
+}
+
+.treatment-layout-station-preview{
+  width:min(100%,420px);
+}
+
+.treatment-layout-preview-card .field-layout-preview-block.required{
+  border-color:#5c6f35;
+}
+
+@media(max-width:1100px){
+  .treatment-header.treatment-summary-card{
+    grid-template-columns:repeat(2,minmax(0,1fr));
+  }
+}
+
+@media(max-width:760px){
+  .treatment-inbound-grid{
+    grid-template-columns:1fr;
+  }
+}
+
+@media(max-width:620px){
+  .treatment-header.treatment-summary-card{
+    grid-template-columns:1fr;
+  }
+
+  .treatment-inbound-summary{
+    justify-items:start;
+  }
+}

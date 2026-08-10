@@ -22,6 +22,55 @@ function dispositionOptionsHtml(options,{placeholder="Choose EMS disposition…"
   `).join("")}`;
 }
 
+export const TREATMENT_LAYOUT_BLOCKS=[
+  {id:"station_summary",label:"Station Summary",description:"Treatment Area name, current census/capacity, inbound count, and station state.",required:true},
+  {id:"inbound_patients",label:"Inbound Patients",description:"Patients currently being transported to this Treatment Area with arrival/handoff controls.",required:true},
+  {id:"census",label:"Current Census",description:"Patients physically received into this Treatment Area and current patient-flow controls.",required:true},
+  {id:"station_status",label:"Station Status Controls",description:"OPEN / LIMITED / FULL / CLOSED and accepting-patients controls."},
+  {id:"walkin",label:"Walk-In Patient",description:"Create a new CAD incident directly into this Treatment Area."},
+  {id:"receive_existing",label:"Receive Existing Patient",description:"Search any open incident and manually mark the patient received here."},
+  {id:"report_qr",label:"Field Report Times QR",description:"QR shortcut for field crews to retrieve CAD timestamps for reports."},
+  {id:"session_controls",label:"Station Session Controls",description:"Refresh, Change Treatment Area, and Leave Event controls.",required:true}
+];
+
+export function defaultTreatmentLayoutConfig(){
+  return {
+    version:1,
+    blocks:[
+      {id:"station_summary",enabled:true},
+      {id:"inbound_patients",enabled:true},
+      {id:"census",enabled:true},
+      {id:"station_status",enabled:true},
+      {id:"walkin",enabled:true},
+      {id:"receive_existing",enabled:true},
+      {id:"report_qr",enabled:true},
+      {id:"session_controls",enabled:true}
+    ]
+  };
+}
+
+export function normalizeTreatmentLayoutConfig(raw){
+  const defaults=defaultTreatmentLayoutConfig();
+  const allowed=new Map(TREATMENT_LAYOUT_BLOCKS.map(block=>[block.id,block]));
+  const source=raw&&typeof raw==="object"&&Array.isArray(raw.blocks)?raw.blocks:defaults.blocks;
+  const seen=new Set();
+  const blocks=[];
+
+  for(const item of source){
+    const id=String(item?.id||"");
+    if(!allowed.has(id)||seen.has(id))continue;
+    seen.add(id);
+    const meta=allowed.get(id);
+    blocks.push({id,enabled:meta.required?true:item?.enabled!==false});
+  }
+
+  for(const item of defaults.blocks){
+    if(!seen.has(item.id))blocks.push({...item});
+  }
+
+  return {version:1,blocks};
+}
+
 let treatmentChannel=null;
 let treatmentChannelKey=null;
 let treatmentRefreshTimer=null;
@@ -85,7 +134,10 @@ async function ensureTreatmentRealtime(app,ts,area,ctx){
   const channel=supabase.channel(`treatment-${ts.event_id}-${area.id}-${Date.now()}`)
     .on("postgres_changes",{event:"*",schema:"public",table:"ems_encounters",filter:`event_id=eq.${ts.event_id}`},refresh)
     .on("postgres_changes",{event:"*",schema:"public",table:"ems_handoffs",filter:`event_id=eq.${ts.event_id}`},refresh)
-    .on("postgres_changes",{event:"*",schema:"public",table:"ems_treatment_areas",filter:`event_id=eq.${ts.event_id}`},refresh);
+    .on("postgres_changes",{event:"*",schema:"public",table:"ems_treatment_areas",filter:`event_id=eq.${ts.event_id}`},refresh)
+    .on("postgres_changes",{event:"UPDATE",schema:"public",table:"units",filter:`event_id=eq.${ts.event_id}`},refresh)
+    .on("postgres_changes",{event:"*",schema:"public",table:"incidents",filter:`event_id=eq.${ts.event_id}`},refresh)
+    .on("postgres_changes",{event:"UPDATE",schema:"public",table:"events",filter:`id=eq.${ts.event_id}`},refresh);
 
   treatmentChannel=channel;
   channel.subscribe(status=>{
@@ -828,24 +880,32 @@ async function treatmentPicker(app,ts,{header,onExit}){
 
 async function treatmentDashboard(app,ts,{header,onExit}){
   try{
-    const [eventRes,areaRes,encRes,dispRes,units]=await Promise.all([
-      supabase.from("events").select("id,name,event_code").eq("id",ts.event_id).single(),
+    const [eventRes,areaRes,encRes,inboundRes,dispRes,units]=await Promise.all([
+      supabase.from("events").select("id,name,event_code,treatment_layout_config").eq("id",ts.event_id).single(),
       supabase.from("ems_treatment_areas").select("*").eq("id",ts.treatment_area_id).single(),
       supabase.from("ems_encounters").select("*").eq("current_treatment_area_id",ts.treatment_area_id).neq("current_status","CLOSED").order("created_at"),
+      supabase.rpc("treatment_inbound_patients",{p_treatment_area_id:ts.treatment_area_id}),
       supabase.from("event_dispositions").select("code,label,sort_order").eq("event_id",ts.event_id).eq("scope","EMS").eq("active",true).order("sort_order").order("label"),
       getUnitsAndConfigs(ts.event_id)
     ]);
 
-    for(const r of [eventRes,areaRes,encRes,dispRes])if(r.error)throw r.error;
+    for(const r of [eventRes,areaRes,encRes,inboundRes,dispRes])if(r.error)throw r.error;
 
     const event=eventRes.data;
     const area=areaRes.data;
     const encounters=encRes.data||[];
+    const inbound=inboundRes.data||[];
     const emsDispositions=dispRes.data||[];
     const ambulances=units.filter(u=>u.ems_config?.active&&(u.ems_config.ems_role==="ambulance"||u.ems_config.transport_capable));
-    const incidentMap=await getIncidentMap(encounters.map(e=>e.incident_id));
+    const incidentIds=[...new Set([
+      ...encounters.map(e=>e.incident_id),
+      ...inbound.map(row=>row.incident_id)
+    ].filter(Boolean))];
+    const incidentMap=await getIncidentMap(incidentIds);
     const occupancy=encounters.length;
     const pct=Math.min(100,Math.round(occupancy/area.capacity*100));
+    const treatmentLayout=normalizeTreatmentLayoutConfig(event.treatment_layout_config);
+    const reportQrVisible=treatmentLayout.blocks.find(block=>block.id==="report_qr")?.enabled!==false;
 
     const fieldReportUrl=(()=>{
       try{
@@ -861,151 +921,202 @@ async function treatmentDashboard(app,ts,{header,onExit}){
     })();
 
     let fieldReportQrDataUrl="";
-    try{
-      fieldReportQrDataUrl=await QRCode.toDataURL(fieldReportUrl,{
-        width:260,
-        margin:2,
-        errorCorrectionLevel:"M",
-        color:{
-          dark:"#000000",
-          light:"#ffffff"
-        }
-      });
-    }catch(error){
-      console.warn("Field report QR generation failed",error);
+    if(reportQrVisible){
+      try{
+        fieldReportQrDataUrl=await QRCode.toDataURL(fieldReportUrl,{
+          width:260,
+          margin:2,
+          errorCorrectionLevel:"M",
+          color:{dark:"#000000",light:"#ffffff"}
+        });
+      }catch(error){
+        console.warn("Field report QR generation failed",error);
+      }
     }
 
-    app.innerHTML=`<div class="shell">${header(`${esc(event.name)} · ${esc(area.name)}`)}
-      <div class="treatment-shell stack">
-        <div class="treatment-header card">
-          <div><div class="small muted">Treatment Area Station</div><div class="big">${esc(area.name)}</div></div>
-          <div class="treatment-capacity">
-            <div class="metric">${occupancy} / ${area.capacity}</div>
-            <div class="small muted">Current occupancy</div>
-            <div class="progress"><div style="width:${pct}%"></div></div>
-          </div>
-          <div><span class="badge ta-${esc(area.status)}">${esc(area.status)}</span><div class="small muted">${area.accepting_patients?"Accepting patients":"Not accepting patients"}</div></div>
+    const treatmentBlocks={
+      station_summary:`<div class="treatment-header card treatment-summary-card">
+        <div><div class="small muted">Treatment Area Station</div><div class="big">${esc(area.name)}</div></div>
+        <div class="treatment-capacity">
+          <div class="metric">${occupancy} / ${area.capacity}</div>
+          <div class="small muted">Current census</div>
+          <div class="progress"><div style="width:${pct}%"></div></div>
         </div>
-
-        <div class="grid2 treatment-top-grid">
-          <div class="card">
-            <h3>Station Status</h3>
-            <div class="grid2">
-              <select id="taStatus">
-                <option ${area.status==="OPEN"?"selected":""}>OPEN</option>
-                <option ${area.status==="LIMITED"?"selected":""}>LIMITED</option>
-                <option ${area.status==="FULL"?"selected":""}>FULL</option>
-                <option ${area.status==="CLOSED"?"selected":""}>CLOSED</option>
-              </select>
-              <label style="font-weight:500"><input type="checkbox" id="taAccepting" ${area.accepting_patients?"checked":""}> Accepting patients</label>
-            </div>
-            <button class="btn secondary" id="saveTaStatus">Update Status</button>
-          </div>
-
-          <div class="card">
-            <h3>Walk-In Patient</h3>
-            <p class="small muted">Creates a CAD incident and places the patient in this treatment area.</p>
-            <input id="walkinNature" value="Walk-In Medical" placeholder="Call type / nature">
-            <input id="walkinNote" placeholder="Optional note" style="margin-top:7px">
-            <button class="btn" id="createWalkin">+ Create Walk-In Incident</button>
-          </div>
+        <div class="treatment-inbound-summary">
+          <div class="metric">${inbound.length}</div>
+          <div class="small muted">Inbound</div>
         </div>
+        <div><span class="badge ta-${esc(area.status)}">${esc(area.status)}</span><div class="small muted">${area.accepting_patients?"Accepting patients":"Not accepting patients"}</div></div>
+      </div>`,
 
-        <section class="card treatment-report-qr-card">
-          <div class="treatment-report-qr-copy">
-            <div class="section-title">Field Report Times</div>
-            <h3>Scan for CAD timestamps</h3>
-            <p class="muted">Field crews can scan this code to look up their unit's call times for report completion. The Event ID is preloaded; the 4-digit field access code is still required.</p>
-            <div class="small">
-              Event ID: <strong class="mono">${esc(event.event_code)}</strong>
-            </div>
-            <div class="small muted">Scan with the crew's field device or phone. Keep the Treatment Area Station in this view.</div>
-          </div>
-
-          <div class="treatment-report-qr">
-            ${fieldReportQrDataUrl
-              ?`<img src="${fieldReportQrDataUrl}" alt="QR code for ${esc(event.name)} field report times lookup">`
-              :`<div class="notice error">QR code could not be generated on this device. Report lookup address: <span class="mono">${esc(fieldReportUrl)}</span></div>`}
-            <div class="small muted">No PIN is stored in the QR code.</div>
-          </div>
-        </section>
-
-        <section class="card receive-existing-card">
-          <div class="row">
-            <div>
-              <h3>Receive Existing Patient</h3>
-              <div class="small muted">Search an active incident and mark the patient as physically received here.</div>
-            </div>
-            <span class="badge">INCIDENT #</span>
-          </div>
-          <div class="grid2">
-            <input id="treatmentIncidentSearch" autocomplete="off" placeholder="Search incident, call type, or location">
-            <button class="btn secondary" id="treatmentSearchBtn">Search Incidents</button>
-          </div>
-          <div id="treatmentIncidentResults" class="treatment-incident-results">
-            <div class="small muted">Search for an active incident to receive a patient.</div>
-          </div>
-        </section>
-
-        <section class="card">
-          <div class="row"><h2>Patients in Treatment</h2><span class="badge">${encounters.length}</span></div>
-          <div class="treatment-patient-grid">
-            ${encounters.map(e=>{
-              const inc=incidentMap[e.incident_id];
-              return `<div class="treatment-patient-card">
-                <div class="row">
-                  <div>
-                    <div class="big">${esc(inc?.incident_number||"EMS Incident")}</div>
-                    <div class="small muted">${esc(inc?.call_type||"Medical")} · ${ageMinutes(e.created_at)} min in treatment</div>
-                  </div>
-                  <span class="badge">IN TREATMENT</span>
-                </div>
-                ${inc?.landmark?`<div class="small">Origin: ${esc(inc.landmark)}</div>`:""}
-                ${e.operational_note?`<p>${esc(e.operational_note)}</p>`:""}
-                <div class="stack">
-                  <div>
-                    <label>Hand off to ambulance</label>
-                    <div class="grid2">
-                      <select id="ta-amb-${e.id}">
-                        <option value="">Choose ambulance</option>
-                        ${ambulances.map(a=>`<option value="${a.id}">${esc(a.name)} · ${esc(pretty(a.status))}</option>`).join("")}
-                      </select>
-                      <button class="btn" data-ta-transfer-amb="${e.id}">Hand Off</button>
-                    </div>
-                  </div>
-                  <div>
-                    <label>EMS Patient Disposition</label>
-                    <select id="ta-disp-${e.id}">
-                      ${dispositionOptionsHtml(emsDispositions,{selected:"RELEASED_FROM_TREATMENT"})}
-                    </select>
-                  </div>
-                  <button class="btn secondary" data-ta-release="${e.id}">Release / Close Patient</button>
-                </div>
-              </div>`;
-            }).join("")||`<div class="muted">No patients currently in this treatment area.</div>`}
-          </div>
-        </section>
-
+      inbound_patients:`<section class="card treatment-inbound-section">
         <div class="row">
-          <div class="nav">
-            <button class="btn secondary" id="taRefresh">Refresh</button>
-            <button class="btn secondary" id="taChange">Change Treatment Area</button>
-            <button class="btn secondary" id="taLeave">Leave Event</button>
+          <div>
+            <div class="section-title">INBOUND</div>
+            <h2>Patients En Route</h2>
+            <div class="small muted">A patient appears here when a Field unit is TRANSPORTING to ${esc(area.name)}. The patient is not counted in census until the handoff is completed.</div>
           </div>
+          <span class="badge treatment-inbound-count">${inbound.length}</span>
         </div>
-      </div>
+
+        <div class="treatment-inbound-grid">
+          ${inbound.map(row=>{
+            const inc=incidentMap[row.incident_id]||row;
+            const elapsed=row.transport_started_at?ageMinutes(row.transport_started_at):null;
+            return `<article class="treatment-inbound-patient-card">
+              <div class="row">
+                <div>
+                  <div class="big">${esc(row.incident_number||inc?.incident_number||"EMS Incident")}</div>
+                  <div class="small muted">${esc(row.call_type||inc?.call_type||"Medical")} · ${esc(row.priority||inc?.priority||"")}</div>
+                </div>
+                <span class="badge treatment-inbound-badge">INBOUND</span>
+              </div>
+
+              <div class="treatment-inbound-unit">
+                <span>Transporting Unit</span>
+                <strong>${esc(row.unit_name||"Field Unit")}</strong>
+                ${elapsed!==null?`<small>En route ${elapsed} min</small>`:""}
+              </div>
+
+              ${(row.landmark||inc?.landmark)?`<div class="small">Origin: ${esc(row.landmark||inc?.landmark||"")}</div>`:""}
+              ${row.operational_note?`<p>${esc(row.operational_note)}</p>`:""}
+
+              <button class="btn good block" data-ta-receive-inbound="${row.incident_id}" data-ta-inbound-unit="${row.unit_id}">Patient Arrived / Accept Handoff</button>
+              <div class="small muted">Dispatch or the transporting Field unit can also complete the handoff. Once any side records arrival, this patient moves automatically to Current Census.</div>
+            </article>`;
+          }).join("")||`<div class="treatment-empty-inbound"><strong>No inbound patients</strong><span class="muted">Patients being transported to this Treatment Area will appear here automatically.</span></div>`}
+        </div>
+      </section>`,
+
+      station_status:`<section class="card treatment-station-status-card">
+        <h3>Station Status</h3>
+        <div class="grid2">
+          <select id="taStatus">
+            <option ${area.status==="OPEN"?"selected":""}>OPEN</option>
+            <option ${area.status==="LIMITED"?"selected":""}>LIMITED</option>
+            <option ${area.status==="FULL"?"selected":""}>FULL</option>
+            <option ${area.status==="CLOSED"?"selected":""}>CLOSED</option>
+          </select>
+          <label style="font-weight:500"><input type="checkbox" id="taAccepting" ${area.accepting_patients?"checked":""}> Accepting patients</label>
+        </div>
+        <button class="btn secondary" id="saveTaStatus">Update Status</button>
+      </section>`,
+
+      walkin:`<section class="card treatment-walkin-card">
+        <h3>Walk-In Patient</h3>
+        <p class="small muted">Creates a CAD incident and places the patient directly into this Treatment Area census.</p>
+        <input id="walkinNature" value="Walk-In Medical" placeholder="Call type / nature">
+        <input id="walkinNote" placeholder="Optional note" style="margin-top:7px">
+        <button class="btn" id="createWalkin">+ Create Walk-In Incident</button>
+      </section>`,
+
+      receive_existing:`<section class="card receive-existing-card">
+        <div class="row">
+          <div>
+            <h3>Receive Existing Patient</h3>
+            <div class="small muted">Fallback / exception workflow: search any active incident and mark the patient physically received here.</div>
+          </div>
+          <span class="badge">INCIDENT #</span>
+        </div>
+        <div class="grid2">
+          <input id="treatmentIncidentSearch" autocomplete="off" placeholder="Search incident, call type, or location">
+          <button class="btn secondary" id="treatmentSearchBtn">Search Incidents</button>
+        </div>
+        <div id="treatmentIncidentResults" class="treatment-incident-results">
+          <div class="small muted">Search for an active incident to receive a patient.</div>
+        </div>
+      </section>`,
+
+      report_qr:`<section class="card treatment-report-qr-card">
+        <div class="treatment-report-qr-copy">
+          <div class="section-title">Field Report Times</div>
+          <h3>Scan for CAD timestamps</h3>
+          <p class="muted">Field crews can scan this code to look up their unit's call times for report completion. The Event ID is preloaded; the 4-digit field access code is still required.</p>
+          <div class="small">Event ID: <strong class="mono">${esc(event.event_code)}</strong></div>
+          <div class="small muted">Scan with the crew's field device or phone. Keep the Treatment Area Station in this view.</div>
+        </div>
+
+        <div class="treatment-report-qr">
+          ${fieldReportQrDataUrl
+            ?`<img src="${fieldReportQrDataUrl}" alt="QR code for ${esc(event.name)} field report times lookup">`
+            :`<div class="notice error">QR code could not be generated on this device. Report lookup address: <span class="mono">${esc(fieldReportUrl)}</span></div>`}
+          <div class="small muted">No PIN is stored in the QR code.</div>
+        </div>
+      </section>`,
+
+      census:`<section class="card treatment-census-section">
+        <div class="row">
+          <div>
+            <div class="section-title">CURRENT CENSUS</div>
+            <h2>Patients in Treatment</h2>
+          </div>
+          <span class="badge">${encounters.length}</span>
+        </div>
+        <div class="treatment-patient-grid">
+          ${encounters.map(e=>{
+            const inc=incidentMap[e.incident_id];
+            return `<div class="treatment-patient-card">
+              <div class="row">
+                <div>
+                  <div class="big">${esc(inc?.incident_number||"EMS Incident")}</div>
+                  <div class="small muted">${esc(inc?.call_type||"Medical")} · ${ageMinutes(e.created_at)} min in treatment</div>
+                </div>
+                <span class="badge">IN TREATMENT</span>
+              </div>
+              ${inc?.landmark?`<div class="small">Origin: ${esc(inc.landmark)}</div>`:""}
+              ${e.operational_note?`<p>${esc(e.operational_note)}</p>`:""}
+              <div class="stack">
+                <div>
+                  <label>Hand off to ambulance</label>
+                  <div class="grid2">
+                    <select id="ta-amb-${e.id}">
+                      <option value="">Choose ambulance</option>
+                      ${ambulances.map(a=>`<option value="${a.id}">${esc(a.name)} · ${esc(pretty(a.status))}</option>`).join("")}
+                    </select>
+                    <button class="btn" data-ta-transfer-amb="${e.id}">Hand Off</button>
+                  </div>
+                </div>
+                <div>
+                  <label>EMS Patient Disposition</label>
+                  <select id="ta-disp-${e.id}">
+                    ${dispositionOptionsHtml(emsDispositions,{selected:"RELEASED_FROM_TREATMENT"})}
+                  </select>
+                </div>
+                <button class="btn secondary" data-ta-release="${e.id}">Release / Close Patient</button>
+              </div>
+            </div>`;
+          }).join("")||`<div class="muted">No patients currently in this Treatment Area census.</div>`}
+        </div>
+      </section>`,
+
+      session_controls:`<div class="row treatment-session-controls">
+        <div class="nav">
+          <button class="btn secondary" id="taRefresh">Refresh</button>
+          <button class="btn secondary" id="taChange">Change Treatment Area</button>
+          <button class="btn secondary" id="taLeave">Leave Event</button>
+        </div>
+      </div>`
+    };
+
+    const treatmentLayoutHtml=treatmentLayout.blocks
+      .filter(block=>block.enabled)
+      .map(block=>treatmentBlocks[block.id]||"")
+      .join("");
+
+    app.innerHTML=`<div class="shell">${header(`${esc(event.name)} · ${esc(area.name)}`)}
+      <div class="treatment-shell stack">${treatmentLayoutHtml}</div>
     </div>`;
 
-    document.querySelector("#saveTaStatus").onclick=async()=>{
+    document.querySelector("#saveTaStatus")?.addEventListener("click",async()=>{
       const {error}=await supabase.rpc("treatment_set_status",{
         p_treatment_area_id:area.id,
         p_status:document.querySelector("#taStatus").value,
         p_accepting:document.querySelector("#taAccepting").checked
       });
       if(error)alert(error.message);else treatmentDashboard(app,ts,{header,onExit});
-    };
+    });
 
-    document.querySelector("#createWalkin").onclick=async()=>{
+    document.querySelector("#createWalkin")?.addEventListener("click",async()=>{
       const nature=document.querySelector("#walkinNature").value.trim()||"Walk-In Medical";
       const note=document.querySelector("#walkinNote").value.trim();
       const {data,error}=await supabase.rpc("treatment_create_walkin_incident",{
@@ -1017,11 +1128,41 @@ async function treatmentDashboard(app,ts,{header,onExit}){
       if(error)return alert(error.message);
       alert(`Created ${data}.`);
       treatmentDashboard(app,ts,{header,onExit});
-    };
+    });
+
+    document.querySelectorAll("[data-ta-receive-inbound]").forEach(button=>{
+      button.onclick=async()=>{
+        const row=inbound.find(item=>
+          item.incident_id===button.dataset.taReceiveInbound
+          &&item.unit_id===button.dataset.taInboundUnit
+        );
+        if(!row)return;
+        if(!confirm(`Confirm ${row.incident_number} has arrived at ${area.name} and patient handoff is complete?`))return;
+
+        button.disabled=true;
+        button.textContent="Receiving…";
+
+        const {error}=await supabase.rpc("unit_arrive_treatment_area",{
+          p_unit_id:row.unit_id,
+          p_incident_id:row.incident_id
+        });
+
+        if(error){
+          button.disabled=false;
+          button.textContent="Patient Arrived / Accept Handoff";
+          alert(error.message);
+          return;
+        }
+
+        treatmentDashboard(app,ts,{header,onExit});
+      };
+    });
 
     const searchTreatmentIncidents=async()=>{
-      const query=document.querySelector("#treatmentIncidentSearch").value.trim();
+      const input=document.querySelector("#treatmentIncidentSearch");
       const host=document.querySelector("#treatmentIncidentResults");
+      if(!input||!host)return;
+      const query=input.value.trim();
       host.innerHTML=`<div class="small muted">Searching…</div>`;
 
       const {data,error}=await supabase.rpc("treatment_search_open_incidents",{
@@ -1036,12 +1177,13 @@ async function treatmentDashboard(app,ts,{header,onExit}){
       const rows=data||[];
       host.innerHTML=rows.map(row=>{
         const alreadyHere=row.current_treatment_area_id===area.id&&row.current_ems_status==="IN_TREATMENT";
+        const isInbound=inbound.some(item=>item.incident_id===row.incident_id);
         return `<div class="treatment-search-result">
           <div>
             <strong>${esc(row.incident_number)}</strong> · ${esc(row.call_type)}
-            <div class="small muted">${esc(row.priority||"")}${row.landmark?` · ${esc(row.landmark)}`:""}${row.current_ems_status?` · EMS: ${esc(pretty(row.current_ems_status))}`:""}</div>
+            <div class="small muted">${esc(row.priority||"")}${row.landmark?` · ${esc(row.landmark)}`:""}${row.current_ems_status?` · EMS: ${esc(pretty(row.current_ems_status))}`:""}${isInbound?` · INBOUND`:""}</div>
           </div>
-          <button class="btn ${alreadyHere?"secondary":"good"}" data-treatment-receive="${row.incident_id}" ${alreadyHere?"disabled":""}>${alreadyHere?"Already Here":"Mark Received Here"}</button>
+          <button class="btn ${alreadyHere?"secondary":"good"}" data-treatment-receive="${row.incident_id}" ${alreadyHere?"disabled":""}>${alreadyHere?"Already Here":isInbound?"Receive Inbound":"Mark Received Here"}</button>
         </div>`;
       }).join("")||`<div class="small muted">No open incidents matched that search.</div>`;
 
@@ -1049,26 +1191,37 @@ async function treatmentDashboard(app,ts,{header,onExit}){
         const row=rows.find(r=>r.incident_id===btn.dataset.treatmentReceive);
         if(!row)return;
         if(!confirm(`Mark ${row.incident_number} as received at ${area.name}?`))return;
-        const note=prompt("Optional note:","")||"";
-        const {data:result,error:receiveError}=await supabase.rpc("treatment_receive_incident",{
-          p_treatment_area_id:area.id,
-          p_incident_id:row.incident_id,
-          p_note:note||null
-        });
-        if(receiveError)return alert(receiveError.message);
-        if(result==="ALREADY_HERE")alert(`${row.incident_number} is already recorded at ${area.name}.`);
+
+        const inboundRow=inbound.find(item=>item.incident_id===row.incident_id);
+        if(inboundRow){
+          const {error:arrivalError}=await supabase.rpc("unit_arrive_treatment_area",{
+            p_unit_id:inboundRow.unit_id,
+            p_incident_id:row.incident_id
+          });
+          if(arrivalError)return alert(arrivalError.message);
+        }else{
+          const note=prompt("Optional note:","")||"";
+          const {data:result,error:receiveError}=await supabase.rpc("treatment_receive_incident",{
+            p_treatment_area_id:area.id,
+            p_incident_id:row.incident_id,
+            p_note:note||null
+          });
+          if(receiveError)return alert(receiveError.message);
+          if(result==="ALREADY_HERE")alert(`${row.incident_number} is already recorded at ${area.name}.`);
+        }
+
         treatmentDashboard(app,ts,{header,onExit});
       });
     };
 
-    document.querySelector("#treatmentSearchBtn").onclick=searchTreatmentIncidents;
-    document.querySelector("#treatmentIncidentSearch").addEventListener("keydown",e=>{
-      if(e.key==="Enter")searchTreatmentIncidents();
+    document.querySelector("#treatmentSearchBtn")?.addEventListener("click",searchTreatmentIncidents);
+    document.querySelector("#treatmentIncidentSearch")?.addEventListener("keydown",event=>{
+      if(event.key==="Enter")searchTreatmentIncidents();
     });
 
-    document.querySelectorAll("[data-ta-transfer-amb]").forEach(b=>b.onclick=async()=>{
-      const id=b.dataset.taTransferAmb;
-      const amb=document.querySelector(`#ta-amb-${id}`).value;
+    document.querySelectorAll("[data-ta-transfer-amb]").forEach(button=>button.onclick=async()=>{
+      const id=button.dataset.taTransferAmb;
+      const amb=document.querySelector(`#ta-amb-${id}`)?.value||"";
       if(!amb)return alert("Choose an ambulance.");
       if(!confirm("Confirm patient handoff to the selected ambulance?"))return;
 
@@ -1081,41 +1234,41 @@ async function treatmentDashboard(app,ts,{header,onExit}){
       if(error)alert(error.message);else treatmentDashboard(app,ts,{header,onExit});
     });
 
-    document.querySelectorAll("[data-ta-release]").forEach(b=>b.onclick=async()=>{
-      const encounterId=b.dataset.taRelease;
-      const disp=document.querySelector(`#ta-disp-${encounterId}`)?.value||"";
-      if(!disp)return alert("Choose an EMS Patient Disposition.");
+    document.querySelectorAll("[data-ta-release]").forEach(button=>button.onclick=async()=>{
+      const encounterId=button.dataset.taRelease;
+      const disposition=document.querySelector(`#ta-disp-${encounterId}`)?.value||"";
+      if(!disposition)return alert("Choose an EMS Patient Disposition.");
 
-      b.disabled=true;
-      const original=b.textContent;
-      b.textContent="Closing…";
+      button.disabled=true;
+      const original=button.textContent;
+      button.textContent="Closing…";
 
       const {error}=await supabase.rpc("ems_release_encounter",{
         p_encounter_id:encounterId,
-        p_disposition:disp
+        p_disposition:disposition
       });
 
       if(error){
-        b.disabled=false;
-        b.textContent=original;
+        button.disabled=false;
+        button.textContent=original;
         return alert(error.message);
       }
 
       treatmentDashboard(app,ts,{header,onExit});
     });
 
-    document.querySelector("#taRefresh").onclick=()=>treatmentDashboard(app,ts,{header,onExit});
-    document.querySelector("#taChange").onclick=async()=>{
+    document.querySelector("#taRefresh")?.addEventListener("click",()=>treatmentDashboard(app,ts,{header,onExit}));
+    document.querySelector("#taChange")?.addEventListener("click",async()=>{
       await clearTreatmentRealtime();
       await supabase.rpc("treatment_release_area",{p_treatment_session_id:ts.id});
       renderTreatmentAreaFlow(app,{header,onExit});
-    };
-    document.querySelector("#taLeave").onclick=async()=>{
+    });
+    document.querySelector("#taLeave")?.addEventListener("click",async()=>{
       await clearTreatmentRealtime();
       await supabase.rpc("treatment_end_session",{p_treatment_session_id:ts.id});
       await supabase.auth.signOut();
       onExit();
-    };
+    });
 
     await ensureTreatmentRealtime(app,ts,area,{header,onExit});
   }catch(err){
