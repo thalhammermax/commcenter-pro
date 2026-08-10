@@ -83,6 +83,64 @@ function time24(value,{seconds=false}={}){
 
 const header=(sub="")=>`<div class="topbar"><div class="brand">CommCenter Pro<small>${esc(sub)}</small></div><div class="nav" id="topActions"></div></div>`;
 
+const FIELD_LAYOUT_BLOCKS=[
+  {id:"unit_identity",label:"Unit Identity",description:"Unit name, current status badge, and Operational Period identity.",required:true},
+  {id:"status_controls",label:"Status Options",description:"Department-configured unit status buttons.",required:true},
+  {id:"run_times",label:"Run Times / Call Times",description:"Quick access to current and recent CAD timestamps for reports."},
+  {id:"current_call",label:"Current Call Information",description:"Current CAD assignment, location, notes, timer, and event-map access.",required:true},
+  {id:"guest_logistics",label:"Guest Logistics Movement",description:"Assigned special-guest transportation movement and driver controls.",required:true},
+  {id:"ems_patient_flow",label:"EMS Patient Flow",description:"EMS custody, handoff, and patient-flow controls when applicable.",required:true},
+  {id:"live_location",label:"Live Location / Venue Position",description:"GPS sharing plus venue level / zone controls when enabled."},
+  {id:"transport_destination",label:"Transport Destination",description:"Ambulance facility or treatment-area destination controls while transporting.",required:true},
+  {id:"connectivity_offline",label:"Connectivity & Offline Map",description:"Online/offline state and offline event-map download."},
+  {id:"session_controls",label:"Session Controls",description:"Change Unit and Leave Event controls.",required:true}
+];
+
+function defaultFieldLayoutConfig(){
+  return {
+    version:1,
+    blocks:[
+      {id:"unit_identity",enabled:true},
+      {id:"current_call",enabled:true},
+      {id:"guest_logistics",enabled:true},
+      {id:"ems_patient_flow",enabled:true},
+      {id:"status_controls",enabled:true},
+      {id:"transport_destination",enabled:true},
+      {id:"run_times",enabled:true},
+      {id:"live_location",enabled:true},
+      {id:"connectivity_offline",enabled:true},
+      {id:"session_controls",enabled:true}
+    ]
+  };
+}
+
+function normalizeFieldLayoutConfig(raw){
+  const defaults=defaultFieldLayoutConfig();
+  const allowed=new Map(FIELD_LAYOUT_BLOCKS.map(block=>[block.id,block]));
+  const source=raw&&typeof raw==="object"&&Array.isArray(raw.blocks)?raw.blocks:defaults.blocks;
+  const seen=new Set();
+  const blocks=[];
+
+  for(const item of source){
+    const id=String(item?.id||"");
+    if(!allowed.has(id)||seen.has(id))continue;
+    seen.add(id);
+    const meta=allowed.get(id);
+    blocks.push({id,enabled:meta.required?true:item?.enabled!==false});
+  }
+
+  for(const item of defaults.blocks){
+    if(!seen.has(item.id))blocks.push({...item});
+  }
+
+  return {version:1,blocks};
+}
+
+function fieldLayoutBlockMeta(id){
+  return FIELD_LAYOUT_BLOCKS.find(block=>block.id===id)||null;
+}
+
+
 function formatElapsed(startIso){
   const start=new Date(startIso).getTime();
   if(!Number.isFinite(start))return "--:--";
@@ -4402,8 +4460,8 @@ function openOperationalPeriodTransitionConfirmation({
 
   const title=activating?"Activate Operational Period":"Complete Operational Period";
   const warning=activating
-    ? `New incidents will immediately begin using ${period.incident_prefix}-###. Existing open incidents remain assigned to the Operational Period in which they were created.`
-    : "Completing the active Operational Period stops NEW incident creation until another Operational Period is activated. Existing open incidents remain open and can still be worked and closed.";
+    ? `${current?`Activating this period will complete ${current.name} and immediately sign out every Field Unit session from that Operational Period. Field crews must re-enter the Event ID / PIN and select their unit again. `:""}New incidents will immediately begin using ${period.incident_prefix}-###. Existing open incidents remain assigned to the Operational Period in which they were created.`
+    : "Completing the active Operational Period immediately signs out every Field Unit session from this period and stops NEW incident creation until another Operational Period is activated. Existing open incidents remain open and can still be worked and closed after crews sign in to the next Operational Period.";
 
   content.innerHTML=`<div class="incident-modal-header">
     <div>
@@ -4438,8 +4496,8 @@ function openOperationalPeriodTransitionConfirmation({
     <label class="destructive-ack operational-period-ack">
       <input type="checkbox" id="opTransitionAcknowledge">
       <span>${activating
-        ?"I understand that all NEW incidents will use this Operational Period and its incident prefix."
-        :"I understand that no NEW incidents can be created until another Operational Period is activated."}</span>
+        ?`I understand that all NEW incidents will use this Operational Period and its incident prefix${current?", and all Field Unit sessions from the current period will be ended":""}.`
+        :"I understand that no NEW incidents can be created until another Operational Period is activated, and all current Field Unit sessions will be ended."}</span>
     </label>
 
     <div>
@@ -4574,7 +4632,7 @@ function renderOperationalPeriodsAdmin(editId=null){
         </div>
       `}
 
-      <div class="small muted">Start/end timestamps are planning information only. CommCenter does not automatically change Operational Periods based on the clock; activation is always deliberate.</div>
+      <div class="small muted">Start/end timestamps are planning information only. CommCenter does not automatically change Operational Periods based on the clock; activation is always deliberate. When an ACTIVE Operational Period ends, all Field Unit sessions tied to that period are ended and crews must sign in again for the next period.</div>
     </div>
 
     <div class="operational-period-admin-list">
@@ -4855,6 +4913,202 @@ function renderUnitStaffingAdmin(){
   };
 }
 
+function renderFieldLayoutAdmin(){
+  const host=document.querySelector("#adminContent");
+  if(!host)return;
+
+  let draft=normalizeFieldLayoutConfig(S.event?.field_layout_config);
+  let draggingId=null;
+
+  const render=()=>{
+    const enabledCount=draft.blocks.filter(block=>block.enabled).length;
+
+    host.innerHTML=`<div class="stack field-layout-admin">
+      <div class="card">
+        <div class="row">
+          <div>
+            <div class="section-title">EVENT-WIDE FIELD UNIT VIEW</div>
+            <h2>Field Layout Builder</h2>
+            <p class="muted">Drag blocks into the order field crews should see them. This layout applies globally to every Field Unit in this event.</p>
+          </div>
+          <span class="badge">${enabledCount} Visible Blocks</span>
+        </div>
+
+        <div class="notice">
+          <strong>One event, one Field layout.</strong><br>
+          Department status choices and module availability still control what content exists; this tool controls the order and visibility of the Field Unit interface. Required safety blocks cannot be hidden.
+        </div>
+      </div>
+
+      <div class="field-layout-builder-grid">
+        <section class="card">
+          <div class="row">
+            <div>
+              <div class="section-title">DRAG & DROP</div>
+              <h3>Field Blocks</h3>
+            </div>
+            <div class="nav">
+              <button class="btn secondary compact" id="resetFieldLayout">Reset Default</button>
+              <button class="btn" id="saveFieldLayout">Save Layout</button>
+            </div>
+          </div>
+
+          <div id="fieldLayoutSortList" class="field-layout-sort-list">
+            ${draft.blocks.map((block,index)=>{
+              const meta=fieldLayoutBlockMeta(block.id);
+              if(!meta)return "";
+              return `<article class="field-layout-sort-card ${block.enabled?"":"disabled"}" draggable="true" data-field-layout-block="${block.id}">
+                <div class="field-layout-drag-handle" title="Drag to reorder" aria-hidden="true">☰</div>
+                <div class="field-layout-sort-copy">
+                  <div class="row start">
+                    <strong>${esc(meta.label)}</strong>
+                    ${meta.required?`<span class="badge field-layout-required-badge">REQUIRED</span>`:""}
+                  </div>
+                  <div class="small muted">${esc(meta.description)}</div>
+                </div>
+                <div class="field-layout-sort-actions">
+                  ${meta.required
+                    ?`<span class="small muted">Always visible</span>`
+                    :`<label class="field-layout-visible-toggle"><input type="checkbox" data-field-layout-enabled="${block.id}" ${block.enabled?"checked":""}> Visible</label>`}
+                  <div class="nav">
+                    <button class="btn secondary compact" data-field-layout-up="${block.id}" ${index===0?"disabled":""} aria-label="Move ${esc(meta.label)} up">↑</button>
+                    <button class="btn secondary compact" data-field-layout-down="${block.id}" ${index===draft.blocks.length-1?"disabled":""} aria-label="Move ${esc(meta.label)} down">↓</button>
+                  </div>
+                </div>
+              </article>`;
+            }).join("")}
+          </div>
+          <div id="fieldLayoutMessage" class="small muted"></div>
+        </section>
+
+        <section class="card field-layout-preview-card">
+          <div class="section-title">LIVE ORDER PREVIEW</div>
+          <h3>Field Unit</h3>
+          <div class="field-layout-phone-preview">
+            <div class="field-layout-preview-topbar">CommCenter Pro <span>Field Unit</span></div>
+            <div class="field-layout-preview-body">
+              ${draft.blocks.filter(block=>block.enabled).map((block,index)=>{
+                const meta=fieldLayoutBlockMeta(block.id);
+                return `<div class="field-layout-preview-block ${meta?.required?"required":""}">
+                  <span>${index+1}</span>
+                  <strong>${esc(meta?.label||block.id)}</strong>
+                </div>`;
+              }).join("")}
+            </div>
+          </div>
+          <div class="small muted">The actual Field screen continues to hide context-specific blocks when they do not apply. For example, EMS Patient Flow is empty on a non-EMS unit and Transport Destination appears only when relevant.</div>
+        </section>
+      </div>
+    </div>`;
+
+    const moveBlock=(id,delta)=>{
+      const index=draft.blocks.findIndex(block=>block.id===id);
+      const target=index+delta;
+      if(index<0||target<0||target>=draft.blocks.length)return;
+      const next=[...draft.blocks];
+      const [item]=next.splice(index,1);
+      next.splice(target,0,item);
+      draft={...draft,blocks:next};
+      render();
+    };
+
+    document.querySelectorAll("[data-field-layout-up]").forEach(button=>{
+      button.onclick=()=>moveBlock(button.dataset.fieldLayoutUp,-1);
+    });
+    document.querySelectorAll("[data-field-layout-down]").forEach(button=>{
+      button.onclick=()=>moveBlock(button.dataset.fieldLayoutDown,1);
+    });
+
+    document.querySelectorAll("[data-field-layout-enabled]").forEach(input=>{
+      input.onchange=()=>{
+        draft={
+          ...draft,
+          blocks:draft.blocks.map(block=>block.id===input.dataset.fieldLayoutEnabled?{...block,enabled:input.checked}:block)
+        };
+        render();
+      };
+    });
+
+    document.querySelectorAll("[data-field-layout-block]").forEach(card=>{
+      card.addEventListener("dragstart",event=>{
+        draggingId=card.dataset.fieldLayoutBlock;
+        card.classList.add("dragging");
+        event.dataTransfer.effectAllowed="move";
+        event.dataTransfer.setData("text/plain",draggingId);
+      });
+
+      card.addEventListener("dragend",()=>{
+        draggingId=null;
+        card.classList.remove("dragging");
+        document.querySelectorAll(".field-layout-sort-card.drag-over").forEach(item=>item.classList.remove("drag-over"));
+      });
+
+      card.addEventListener("dragover",event=>{
+        event.preventDefault();
+        if(!draggingId||draggingId===card.dataset.fieldLayoutBlock)return;
+        card.classList.add("drag-over");
+        event.dataTransfer.dropEffect="move";
+      });
+
+      card.addEventListener("dragleave",()=>card.classList.remove("drag-over"));
+
+      card.addEventListener("drop",event=>{
+        event.preventDefault();
+        card.classList.remove("drag-over");
+        const sourceId=draggingId||event.dataTransfer.getData("text/plain");
+        const targetId=card.dataset.fieldLayoutBlock;
+        if(!sourceId||sourceId===targetId)return;
+
+        const sourceIndex=draft.blocks.findIndex(block=>block.id===sourceId);
+        const targetIndex=draft.blocks.findIndex(block=>block.id===targetId);
+        if(sourceIndex<0||targetIndex<0)return;
+
+        const next=[...draft.blocks];
+        const [item]=next.splice(sourceIndex,1);
+        next.splice(targetIndex,0,item);
+        draft={...draft,blocks:next};
+        render();
+      });
+    });
+
+    document.querySelector("#resetFieldLayout").onclick=()=>{
+      if(!confirm("Reset this event's Field Unit layout to the CommCenter default order and visibility?"))return;
+      draft=defaultFieldLayoutConfig();
+      render();
+    };
+
+    document.querySelector("#saveFieldLayout").onclick=async()=>{
+      const button=document.querySelector("#saveFieldLayout");
+      const message=document.querySelector("#fieldLayoutMessage");
+      button.disabled=true;
+      button.textContent="Saving…";
+      message.textContent="";
+
+      const {data,error}=await supabase.rpc("admin_save_field_layout",{
+        p_event_id:S.eventId,
+        p_layout:draft
+      });
+
+      if(error){
+        button.disabled=false;
+        button.textContent="Save Layout";
+        message.textContent=error.message;
+        message.classList.add("error");
+        return;
+      }
+
+      draft=normalizeFieldLayoutConfig(data);
+      S.event.field_layout_config=data;
+      button.disabled=false;
+      button.textContent="Save Layout";
+      message.classList.remove("error");
+      message.textContent="Field layout saved. Connected Field units will receive the new layout automatically.";
+    };
+  };
+
+  render();
+}
+
 async function eventAdmin(initialTab="setup"){
   closeIncidentModal();
   await loadEventOps();
@@ -4862,6 +5116,7 @@ async function eventAdmin(initialTab="setup"){
     <div class="admin-layout">
       <aside class="admin-menu">
         <button class="${initialTab==="setup"?"active":""}" id="setupTab">Setup</button>
+        <button class="${initialTab==="field-layout"?"active":""}" id="fieldLayoutTab">Field Layout</button>
         <button class="${initialTab==="periods"?"active":""}" id="periodsTab">Operational Periods</button>
         <button class="${initialTab==="ems"?"active":""}" id="emsTab">EMS Setup</button>
         <button class="${initialTab==="logistics"?"active":""}" id="logisticsTab">Guest Logistics</button>
@@ -4894,12 +5149,14 @@ async function eventAdmin(initialTab="setup"){
   };
   document.querySelector("#mapTab").onclick=()=>renderMapBuilder(app,S.eventId,()=>eventAdmin());
   document.querySelector("#setupTab").onclick=()=>{markAdminTab("setupTab");renderEventSetup();};
+  document.querySelector("#fieldLayoutTab").onclick=()=>{markAdminTab("fieldLayoutTab");renderFieldLayoutAdmin();};
   document.querySelector("#periodsTab").onclick=()=>{markAdminTab("periodsTab");renderOperationalPeriodsAdmin();};
   document.querySelector("#emsTab").onclick=showEmsAdmin;
   document.querySelector("#logisticsTab").onclick=()=>{markAdminTab("logisticsTab");renderGuestLogisticsAdmin();};
   document.querySelector("#staffingTab").onclick=()=>{markAdminTab("staffingTab");renderUnitStaffingAdmin();};
 
   if(initialTab==="ems")showEmsAdmin();
+  else if(initialTab==="field-layout")renderFieldLayoutAdmin();
   else if(initialTab==="periods")renderOperationalPeriodsAdmin();
   else if(initialTab==="logistics")renderGuestLogisticsAdmin();
   else if(initialTab==="staffing")renderUnitStaffingAdmin();
@@ -4917,7 +5174,10 @@ function renderEventSetup(){
       <label style="margin-top:10px"><input id="accessEnabled" type="checkbox" ${S.event.field_access_enabled?"checked":""}> Field access enabled</label>
       <label style="margin-top:8px"><input id="locationEnabled" type="checkbox" ${S.event.field_location_enabled?"checked":""}> Allow field units to share live GPS location with Dispatch</label>
       <div class="small muted" style="margin-top:5px">Location is opt-in on each field device. This version stores only the latest location, not a route history.</div>
-      <button class="btn" id="savePin">Save Field Access</button>
+      <div class="grid2" style="margin-top:10px">
+        <button class="btn" id="savePin">Save Field Access</button>
+        <button class="btn secondary" id="configureFieldLayout">Configure Field Unit View</button>
+      </div>
       <div id="pinMsg" class="small muted"></div>
     </div>
 
@@ -5009,6 +5269,8 @@ function renderEventSetup(){
       <div id="venueSavePanel"></div>
     </div>
   </div>`;
+
+  document.querySelector("#configureFieldLayout").onclick=()=>eventAdmin("field-layout");
 
   document.querySelector("#savePin").onclick=async()=>{
     const pin=document.querySelector("#newPin").value.trim();
@@ -6249,9 +6511,11 @@ function fieldError(message){
   app.innerHTML=`<div class="center"><div class="card stack"><h2>Field Access Error</h2><div class="notice error">${esc(message)}</div><button class="btn" id="home">Back</button></div></div>`;
   document.querySelector("#home").onclick=()=>{S.mode=null;route();};
 }
-function fieldJoin(){
+function fieldJoin({message=""}={}){
   app.innerHTML=`<div class="shell">${header("Field Unit Access")}<div class="center"><div class="card stack">
     <h2>Join Event</h2>
+    ${message?`<div class="notice">${esc(message)}</div>`:""}
+    <div class="small muted">Field Unit sessions are valid only for the event's currently ACTIVE Operational Period. When that period ends, every Field Unit is signed out and must re-enter for the next period.</div>
     <div><label>Event ID</label><input id="fieldEventCode" placeholder="Event code"></div>
     <div><label>4-digit access code</label><input id="fieldPin" inputmode="numeric" maxlength="4" placeholder="••••"></div>
     <div><label>Operator name (optional)</label><input id="operatorName" placeholder="Operator name"></div>
@@ -6265,16 +6529,20 @@ function fieldJoin(){
       p_operator_name:document.querySelector("#operatorName").value.trim()
     });
     if(error)return document.querySelector("#fieldErr").textContent=error.message;
-    S.fieldSession=data;S.eventId=data.event_id;fieldUnitPicker();
+    S.fieldSession=data;
+    S.eventId=data.event_id;
+    fieldUnitPicker();
   };
 }
 async function fieldUnitPicker(){
-  const [{data:event},{data:deps},{data:units}]=await Promise.all([
+  const [{data:event},{data:deps},{data:units},{data:op}]=await Promise.all([
     supabase.from("events").select("name").eq("id",S.eventId).single(),
     supabase.from("event_departments").select("*").eq("event_id",S.eventId).eq("active",true).order("sort_order"),
-    supabase.from("units").select("*,event_departments(name,short_name)").eq("event_id",S.eventId).eq("active",true).order("name")
+    supabase.from("units").select("*,event_departments(name,short_name)").eq("event_id",S.eventId).eq("active",true).order("name"),
+    supabase.from("operational_periods").select("id,name,incident_prefix,status").eq("id",S.fieldSession?.operational_period_id).maybeSingle()
   ]);
   app.innerHTML=`<div class="shell">${header(`${esc(event?.name||"Event")} · Select Unit`)}<div class="wrap">
+    <div class="notice"><strong>Operational Period:</strong> ${esc(op?.name||"Active Operational Period")}${op?.incident_prefix?` · <span class="mono">${esc(op.incident_prefix)}</span>`:""}</div>
     ${(deps||[]).map(d=>`<div class="section-title">${esc(d.name)}</div><div class="grid2">
       ${(units||[]).filter(u=>u.department_id===d.id).map(u=>`<button class="choice" data-unit="${u.id}"><strong>${esc(u.name)}</strong><br><span class="badge status-${esc(u.status)}" data-dispatch-unit-status="${u.id}">${esc(u.status.replaceAll("_"," "))}</span></button>`).join("")}
     </div>`).join("")}
@@ -6285,12 +6553,16 @@ async function fieldUnitPicker(){
     if(error)alert(error.message);else fieldUnitCad();
   });
   document.querySelector("#leaveEvent").onclick=leaveField;
+  subscribeFieldSessionLifecycle(S.fieldSession?.id);
 }
 async function fieldUnitCad(){
   const {data:fs,error}=await supabase.from("field_sessions")
-    .select("*,events(name,field_location_enabled,venue_type),units(name,status,event_id,current_map_layer_id,current_zone_id,current_transport_destination_text,current_transport_treatment_area_id,event_departments(name,status_profile))")
+    .select("*,events(name,field_location_enabled,venue_type,field_layout_config),operational_periods(name,incident_prefix,status),units(name,status,event_id,current_map_layer_id,current_zone_id,current_transport_destination_text,current_transport_treatment_area_id,event_departments(name,status_profile))")
     .eq("auth_user_id",S.session.user.id).eq("active",true).order("started_at",{ascending:false}).limit(1).single();
-  if(error)return fieldJoin();
+  if(error){
+    S.fieldSession=null;
+    return fieldJoin({message:"Your previous Field Unit session is no longer active. Re-enter the event for the current Operational Period."});
+  }
   S.fieldSession=fs;S.eventId=fs.event_id;
   const {data:a}=await supabase.from("incident_units").select("*,incidents(*)")
     .eq("unit_id",fs.unit_id).is("cleared_at",null).order("assigned_at",{ascending:false}).limit(1).maybeSingle();
@@ -6315,87 +6587,128 @@ async function fieldUnitCad(){
 
   const fieldIsAmbulance=!!(emsState?.config?.active&&(emsState.config.ems_role==="ambulance"||emsState.config.transport_capable));
 
-  app.innerHTML=`<div class="shell">${header(`${esc(fs.events?.name||"")} · ${esc(fs.units?.event_departments?.name||"")}`)}
-    <div class="field-shell stack">
-      <div class="card"><div class="small muted">Your unit</div><div class="big">${esc(fs.units?.name)}</div><span class="badge status-${esc(fs.units?.status)}" data-field-unit-status>${esc(fs.units?.status?.replaceAll("_"," "))}</span></div>
-      ${incident?`<div class="card assignment"><div class="row"><strong>${esc(incident.incident_number)}</strong><span class="incident-head-meta"><span class="call-timer field-call-timer" title="Elapsed call time" data-call-start="${esc(incident.created_at)}">00:00</span><span class="badge">${esc(incident.priority)}</span></span></div>
-        <h2>${esc(incident.call_type)}</h2>${fieldLayer?`<div class="venue-location-line"><span class="badge layer-badge">${esc(fieldLayer.name)}</span>${fieldZone?` <span class="badge">${esc(fieldZone.name)}</span>`:""}</div>`:""}<p>${esc(incident.landmark||"No location description")}
-        ${incident.latitude!=null&&incident.longitude!=null?`<br><span class="small mono">${Number(incident.latitude).toFixed(6)}, ${Number(incident.longitude).toFixed(6)}</span>`:""}</p><p>${esc(incident.notes||"")}</p>
-        ${fieldLayer&&incident.map_x!=null&&incident.map_y!=null?`<button class="btn secondary block" id="viewFieldMap">View on Event Map</button>`:""}
-        <div id="fieldMapHolder"></div>
-      </div>`:logisticsState?.underway?`<div class="card"><strong>No CAD incident assignment</strong><p class="muted">This unit is currently committed to the Guest Logistics movement below.</p></div>`:`<div class="card"><strong>No current CAD assignment</strong><p class="muted">${logisticsState?.current?"A future Guest Logistics movement is preassigned below; the unit remains available until that movement begins.":"Remain available for dispatch."}</p></div>`}
-      ${fieldLogisticsPanelHtml(logisticsState)}
-      ${fs.events?.field_location_enabled?`<div class="card field-location-card">
-        <div class="row">
-          <div>
-            <div class="section-title">Live Unit Location</div>
-            <strong>Share this device's GPS with Dispatch</strong>
-          </div>
-          <span class="badge ${S.locationWatchId!=null?"gps-sharing-badge":""}" id="fieldLocationBadge">${S.locationWatchId!=null?"SHARING":"OFF"}</span>
+  const fieldLayout=normalizeFieldLayoutConfig(fs.events?.field_layout_config);
+  const liveLocationVisible=fieldLayout.blocks.find(block=>block.id==="live_location")?.enabled!==false;
+  if((!liveLocationVisible||!fs.events?.field_location_enabled)&&S.locationWatchId!=null){
+    await stopFieldLocationSharing(fs.unit_id,{notifyServer:true});
+  }
+
+  const fieldBlocks={
+    unit_identity:`<div class="card field-unit-identity-card">
+      <div class="row">
+        <div>
+          <div class="small muted">Your unit</div>
+          <div class="big">${esc(fs.units?.name)}</div>
         </div>
-        <p class="small muted">Your browser will ask for location permission. CommCenter Pro stores only the unit's current location in this version; it does not save a breadcrumb history.</p>
-        ${(fieldMapLayers||[]).length>1?`<div class="grid2">
-          <div><label>Current Venue Level</label><select id="fieldVenueLayer">
-            <option value="">Default / level unknown</option>
-            ${(fieldMapLayers||[]).map(l=>`<option value="${l.id}" ${fs.units?.current_map_layer_id===l.id?"selected":""}>${esc(l.name)}</option>`).join("")}
-          </select></div>
-          <div><label>Current Zone</label><select id="fieldVenueZone">
-            <option value="">No zone</option>
-            ${(fieldZones||[]).filter(z=>!fs.units?.current_map_layer_id||z.map_layer_id===fs.units.current_map_layer_id).map(z=>`<option value="${z.id}" ${fs.units?.current_zone_id===z.id?"selected":""}>${esc(z.name)}</option>`).join("")}
-          </select></div>
-        </div><button class="btn secondary block" id="saveFieldVenueLocation">Update Venue Level / Zone</button>`:""}
-        <div id="fieldLocationStatus" class="location-status ${S.locationWatchId!=null?"ok":""}">${S.locationWatchId!=null?"Location sharing is active while this page remains visible.":"Location is not being shared."}</div>
-        <div class="grid2">
-          <button class="btn" id="startLocationSharing" ${S.locationWatchId!=null?"disabled":""}>Start Sharing Location</button>
-          <button class="btn secondary" id="stopLocationSharing" ${S.locationWatchId==null?"disabled":""}>Stop Sharing</button>
-        </div>
-      </div>`:""}
-      ${fieldEmsPanelHtml(emsState,incident)}
-      ${logisticsState?.underway?"":`<div class="status-buttons">${statuses.map(status=>`<button class="btn field-status-button ${fieldStatusColorClass(status)} ${status===fs.units?.status?"field-status-active":""}" data-status="${esc(status)}" aria-pressed="${status===fs.units?.status?"true":"false"}">${esc(status.replaceAll("_"," "))}</button>`).join("")}</div>`}
-      ${logisticsState?.underway?"":`<div class="card transport-destination-editor ${fs.units?.status==="TRANSPORTING"?"":"hidden"}" id="fieldTransportDestinationPanel">
-        <div class="section-title">Transport Destination</div>
-        ${emsState?.config?.active&&(emsState.config.ems_role==="ambulance"||emsState.config.transport_capable)?`
-          <label>Destination facility</label>
-          <input id="fieldTransportFacility" value="${esc(fs.units?.current_transport_destination_text||"")}" placeholder="Destination facility">
-        `:`
-          <label>Treatment area destination</label>
-          <select id="fieldTransportTreatmentArea">
-            <option value="">Choose treatment area</option>
-            ${(fieldTreatmentAreas||[]).filter(a=>a.status!=="CLOSED").map(a=>`
-              <option value="${a.id}" ${fs.units?.current_transport_treatment_area_id===a.id?"selected":""}>${esc(a.name)} · ${esc(a.status)}</option>
-            `).join("")}
-          </select>
-        `}
-        <div class="grid2">
-          <button class="btn" id="confirmFieldTransport">${fs.units?.status==="TRANSPORTING"?"Update Destination":"Set Transporting"}</button>
-          <button class="btn secondary" id="cancelFieldTransport">Cancel</button>
-        </div>
-        ${!fieldIsAmbulance&&fs.units?.status==="TRANSPORTING"&&fs.units?.current_transport_treatment_area_id&&incident?`
-          <div class="treatment-arrival-action field-treatment-arrival">
-            <div>
-              <div class="section-title">Treatment Area Arrival</div>
-              <strong>${esc((fieldTreatmentAreas||[]).find(a=>a.id===fs.units.current_transport_treatment_area_id)?.name||"Treatment Area")}</strong>
-              <div class="small muted">Use this when the unit and patient have physically arrived.</div>
-            </div>
-            <button class="btn good block" id="fieldArriveTreatmentArea">Arrived at Treatment Area</button>
-          </div>
-        `:""}
-      </div>`}
-      <div class="card field-report-reference-card">
-        <div class="row">
-          <div>
-            <div class="section-title">Report Reference</div>
-            <strong>Need your CAD times?</strong>
-            <div class="small muted">View this unit's current and recent call timestamps for your report.</div>
-          </div>
-          <button class="btn secondary" id="fieldCallTimes">Call Times</button>
-        </div>
+        <span class="badge status-${esc(fs.units?.status)}" data-field-unit-status>${esc(fs.units?.status?.replaceAll("_"," "))}</span>
       </div>
+      <div class="small field-operational-period-line">Operational Period: <strong>${esc(fs.operational_periods?.name||"Active")}</strong>${fs.operational_periods?.incident_prefix?` · <span class="mono">${esc(fs.operational_periods.incident_prefix)}</span>`:""}</div>
+    </div>`,
+
+    current_call:incident?`<div class="card assignment">
+      <div class="row"><strong>${esc(incident.incident_number)}</strong><span class="incident-head-meta"><span class="call-timer field-call-timer" title="Elapsed call time" data-call-start="${esc(incident.created_at)}">00:00</span><span class="badge">${esc(incident.priority)}</span></span></div>
+      <h2>${esc(incident.call_type)}</h2>
+      ${fieldLayer?`<div class="venue-location-line"><span class="badge layer-badge">${esc(fieldLayer.name)}</span>${fieldZone?` <span class="badge">${esc(fieldZone.name)}</span>`:""}</div>`:""}
+      <p>${esc(incident.landmark||"No location description")}${incident.latitude!=null&&incident.longitude!=null?`<br><span class="small mono">${Number(incident.latitude).toFixed(6)}, ${Number(incident.longitude).toFixed(6)}</span>`:""}</p>
+      <p>${esc(incident.notes||"")}</p>
+      ${fieldLayer&&incident.map_x!=null&&incident.map_y!=null?`<button class="btn secondary block" id="viewFieldMap">View on Event Map</button>`:""}
+      <div id="fieldMapHolder"></div>
+    </div>`:logisticsState?.underway?`<div class="card"><strong>No CAD incident assignment</strong><p class="muted">This unit is currently committed to the Guest Logistics movement below.</p></div>`:`<div class="card"><strong>No current CAD assignment</strong><p class="muted">${logisticsState?.current?"A future Guest Logistics movement is preassigned below; the unit remains available until that movement begins.":"Remain available for dispatch."}</p></div>`,
+
+    guest_logistics:fieldLogisticsPanelHtml(logisticsState),
+
+    live_location:fs.events?.field_location_enabled?`<div class="card field-location-card">
+      <div class="row">
+        <div>
+          <div class="section-title">Live Unit Location</div>
+          <strong>Share this device's GPS with Dispatch</strong>
+        </div>
+        <span class="badge ${S.locationWatchId!=null?"gps-sharing-badge":""}" id="fieldLocationBadge">${S.locationWatchId!=null?"SHARING":"OFF"}</span>
+      </div>
+      <p class="small muted">Your browser will ask for location permission. CommCenter Pro stores only the unit's current location in this version; it does not save a breadcrumb history.</p>
+      ${(fieldMapLayers||[]).length>1?`<div class="grid2">
+        <div><label>Current Venue Level</label><select id="fieldVenueLayer">
+          <option value="">Default / level unknown</option>
+          ${(fieldMapLayers||[]).map(l=>`<option value="${l.id}" ${fs.units?.current_map_layer_id===l.id?"selected":""}>${esc(l.name)}</option>`).join("")}
+        </select></div>
+        <div><label>Current Zone</label><select id="fieldVenueZone">
+          <option value="">No zone</option>
+          ${(fieldZones||[]).filter(z=>!fs.units?.current_map_layer_id||z.map_layer_id===fs.units.current_map_layer_id).map(z=>`<option value="${z.id}" ${fs.units?.current_zone_id===z.id?"selected":""}>${esc(z.name)}</option>`).join("")}
+        </select></div>
+      </div><button class="btn secondary block" id="saveFieldVenueLocation">Update Venue Level / Zone</button>`:""}
+      <div id="fieldLocationStatus" class="location-status ${S.locationWatchId!=null?"ok":""}">${S.locationWatchId!=null?"Location sharing is active while this page remains visible.":"Location is not being shared."}</div>
+      <div class="grid2">
+        <button class="btn" id="startLocationSharing" ${S.locationWatchId!=null?"disabled":""}>Start Sharing Location</button>
+        <button class="btn secondary" id="stopLocationSharing" ${S.locationWatchId==null?"disabled":""}>Stop Sharing</button>
+      </div>
+    </div>`:"",
+
+    ems_patient_flow:fieldEmsPanelHtml(emsState,incident),
+
+    status_controls:logisticsState?.underway?"":`<div class="field-status-layout-block">
+      <div class="section-title">Unit Status</div>
+      <div class="status-buttons">${statuses.map(status=>`<button class="btn field-status-button ${fieldStatusColorClass(status)} ${status===fs.units?.status?"field-status-active":""}" data-status="${esc(status)}" aria-pressed="${status===fs.units?.status?"true":"false"}">${esc(status.replaceAll("_"," "))}</button>`).join("")}</div>
+    </div>`,
+
+    transport_destination:logisticsState?.underway?"":`<div class="card transport-destination-editor ${fs.units?.status==="TRANSPORTING"?"":"hidden"}" id="fieldTransportDestinationPanel">
+      <div class="section-title">Transport Destination</div>
+      ${emsState?.config?.active&&(emsState.config.ems_role==="ambulance"||emsState.config.transport_capable)?`
+        <label>Destination facility</label>
+        <input id="fieldTransportFacility" value="${esc(fs.units?.current_transport_destination_text||"")}" placeholder="Destination facility">
+      `:`
+        <label>Treatment area destination</label>
+        <select id="fieldTransportTreatmentArea">
+          <option value="">Choose treatment area</option>
+          ${(fieldTreatmentAreas||[]).filter(a=>a.status!=="CLOSED").map(a=>`<option value="${a.id}" ${fs.units?.current_transport_treatment_area_id===a.id?"selected":""}>${esc(a.name)} · ${esc(a.status)}</option>`).join("")}
+        </select>
+      `}
+      <div class="grid2">
+        <button class="btn" id="confirmFieldTransport">${fs.units?.status==="TRANSPORTING"?"Update Destination":"Set Transporting"}</button>
+        <button class="btn secondary" id="cancelFieldTransport">Cancel</button>
+      </div>
+      ${!fieldIsAmbulance&&fs.units?.status==="TRANSPORTING"&&fs.units?.current_transport_treatment_area_id&&incident?`
+        <div class="treatment-arrival-action field-treatment-arrival">
+          <div>
+            <div class="section-title">Treatment Area Arrival</div>
+            <strong>${esc((fieldTreatmentAreas||[]).find(a=>a.id===fs.units.current_transport_treatment_area_id)?.name||"Treatment Area")}</strong>
+            <div class="small muted">Use this when the unit and patient have physically arrived.</div>
+          </div>
+          <button class="btn good block" id="fieldArriveTreatmentArea">Arrived at Treatment Area</button>
+        </div>
+      `:""}
+    </div>`,
+
+    run_times:`<div class="card field-report-reference-card">
+      <div class="row">
+        <div>
+          <div class="section-title">Run Times / Report Reference</div>
+          <strong>Need your CAD times?</strong>
+          <div class="small muted">View this unit's current and recent call timestamps for your report.</div>
+        </div>
+        <button class="btn secondary" id="fieldCallTimes">Run Times</button>
+      </div>
+    </div>`,
+
+    connectivity_offline:`<div class="field-connectivity-layout-block stack">
       <div class="notice ${navigator.onLine?"ok":""}">${navigator.onLine?"Connected":"Offline — CAD changes cannot reach dispatch until connectivity returns."}</div>
       <button class="btn secondary" id="downloadOffline">Download Event Map for Offline Use</button>
       <div id="offlineStatus" class="small muted"></div>
-      <button class="btn secondary" id="changeUnit">Change Unit</button><button class="btn secondary" id="leaveEvent">Leave Event</button>
-    </div></div>`;
+    </div>`,
+
+    session_controls:`<div class="field-session-controls grid2">
+      <button class="btn secondary" id="changeUnit">Change Unit</button>
+      <button class="btn secondary" id="leaveEvent">Leave Event</button>
+    </div>`
+  };
+
+  const fieldLayoutHtml=fieldLayout.blocks
+    .filter(block=>block.enabled)
+    .map(block=>fieldBlocks[block.id]||"")
+    .join("");
+
+  app.innerHTML=`<div class="shell">${header(`${esc(fs.events?.name||"")} · ${esc(fs.units?.event_departments?.name||"")}`)}
+    <div class="field-shell stack">${fieldLayoutHtml}</div>
+  </div>`;
   ensureCallTimerTicker();
 
   const setFieldStatus=async(requested,{destinationText=null,treatmentAreaId=null}={})=>{
@@ -6495,12 +6808,15 @@ async function fieldUnitCad(){
     unitId:fs.unit_id,
     standalone:false
   }));
-  document.querySelector("#downloadOffline").onclick=()=>downloadOfflineEventData();
-  getOfflineEvent(S.eventId).then(x=>{if(x)document.querySelector("#offlineStatus").textContent=`Offline package saved ${dateTime24(x.savedAt,{seconds:true})}`;}).catch(()=>{});
-  document.querySelector("#changeUnit").onclick=async()=>{await stopFieldLocationSharing(fs.unit_id,{notifyServer:true});await supabase.rpc("field_release_unit",{p_field_session_id:fs.id});fieldUnitPicker();};
-  document.querySelector("#leaveEvent").onclick=leaveField;
+  document.querySelector("#downloadOffline")?.addEventListener("click",()=>downloadOfflineEventData());
+  getOfflineEvent(S.eventId).then(x=>{
+    const host=document.querySelector("#offlineStatus");
+    if(x&&host)host.textContent=`Offline package saved ${dateTime24(x.savedAt,{seconds:true})}`;
+  }).catch(()=>{});
+  document.querySelector("#changeUnit")?.addEventListener("click",async()=>{await stopFieldLocationSharing(fs.unit_id,{notifyServer:true});await supabase.rpc("field_release_unit",{p_field_session_id:fs.id});fieldUnitPicker();});
+  document.querySelector("#leaveEvent")?.addEventListener("click",leaveField);
   if(incident)document.querySelector("#viewFieldMap")?.addEventListener("click",()=>showFieldMap(incident));
-  subscribeField(fs.unit_id);
+  subscribeField(fs.unit_id,fs.id);
 }
 
 function fieldLocationPreferenceKey(eventId,unitId){
@@ -6858,7 +7174,46 @@ function subscribeDispatch(){
     .subscribe();
   S.realtime.push(ch);
 }
-function subscribeField(unitId){
+async function handleFieldSessionLifecycleUpdate(payload){
+  const row=payload?.new;
+  if(!row||!S.fieldSession?.id||row.id!==S.fieldSession.id||row.active!==false)return;
+
+  const unitId=S.fieldSession?.unit_id||null;
+  const reason=row.end_reason||"FIELD_SESSION_ENDED";
+
+  if(unitId){
+    await stopFieldLocationSharing(unitId,{notifyServer:false});
+  }
+
+  cleanupRealtime();
+  S.fieldSession=null;
+
+  const message=reason==="OPERATIONAL_PERIOD_ENDED"
+    ?"The Operational Period ended. Your Field Unit session was closed automatically. Re-enter the Event ID and PIN after the next Operational Period is activated, then select your unit again."
+    :"Your Field Unit session ended. Re-enter the event to continue.";
+
+  fieldJoin({message});
+}
+
+function subscribeFieldSessionLifecycle(sessionId){
+  if(!sessionId)return;
+
+  S.realtime.forEach(ch=>supabase.removeChannel(ch));
+  S.realtime=[];
+
+  const ch=supabase.channel(`field-session-${sessionId}-${Date.now()}`)
+    .on("postgres_changes",{
+      event:"UPDATE",
+      schema:"public",
+      table:"field_sessions",
+      filter:`id=eq.${sessionId}`
+    },payload=>handleFieldSessionLifecycleUpdate(payload))
+    .subscribe();
+
+  S.realtime.push(ch);
+}
+
+function subscribeField(unitId,sessionId){
   // A field CAD screen should stay visually stable while a crew changes status.
   // Replace any previous field subscriptions, then update only the status badge
   // for unit row changes. Assignment/unassignment still performs a full refresh.
@@ -6866,6 +7221,8 @@ function subscribeField(unitId){
   S.realtime=[];
 
   const ch=supabase.channel(`unit-${unitId}-${Date.now()}`)
+    .on("postgres_changes",{event:"UPDATE",schema:"public",table:"field_sessions",filter:`id=eq.${sessionId}`},payload=>handleFieldSessionLifecycleUpdate(payload))
+    .on("postgres_changes",{event:"UPDATE",schema:"public",table:"events",filter:`id=eq.${S.eventId}`},()=>fieldUnitCad())
     .on("postgres_changes",{event:"UPDATE",schema:"public",table:"units",filter:`id=eq.${unitId}`},payload=>{
       const status=payload.new?.status;
       if(status){
