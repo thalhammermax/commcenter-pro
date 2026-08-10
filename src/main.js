@@ -17,7 +17,7 @@ const S={
   dispositions:[],
   guestLogisticsMovements:[],
   emsUnitConfigs:[],treatmentAreas:[],activeMapLayerId:null,map:null,realtime:[],
-  fieldSession:null,currentLocation:null,isPlatformAdmin:false,callTimerInterval:null,
+  fieldSession:null,commandSession:null,currentLocation:null,isPlatformAdmin:false,callTimerInterval:null,
   unitLocations:[],unitLocationMarkers:new Map(),locationAgeInterval:null,
   locationWatchId:null,locationLastSentAt:0,locationLastSent:null,locationWriteInFlight:false,
   openIncidentId:null,openUnitId:null,incidentModalMode:null,
@@ -521,7 +521,8 @@ function dispatchScopeKey(){
   return `commcenter-dispatch-scope:${S.session?.user?.id||"staff"}:${S.eventId||"event"}`;
 }
 function commandDisplayKey(){
-  return `commcenter-command-display:${S.session?.user?.id||"staff"}:${S.eventId||"event"}`;
+  const identity=S.mode==="command"?"standalone":(S.session?.user?.id||"staff");
+  return `commcenter-command-display:${identity}:${S.eventId||"event"}`;
 }
 function normalizeDepartmentSelection(ids){
   const valid=new Set(S.departments.map(d=>d.id));
@@ -665,6 +666,10 @@ function commandViewRequested(){
   try{return new URLSearchParams(window.location.search).get("view")==="command";}catch{return false;}
 }
 
+function commandPrefillEventCode(){
+  try{return (new URLSearchParams(window.location.search).get("event")||"").trim().toUpperCase();}catch{return "";}
+}
+
 function fieldReportViewRequested(){
   try{return new URLSearchParams(window.location.search).get("view")==="field-reports";}catch{return false;}
 }
@@ -687,11 +692,16 @@ function setFieldReportViewUrl(active,eventCode=null){
   }catch{}
 }
 
-function setCommandViewUrl(active){
+function setCommandViewUrl(active,eventCode=null){
   try{
     const url=new URL(window.location.href);
-    if(active)url.searchParams.set("view","command");
-    else url.searchParams.delete("view");
+    if(active){
+      url.searchParams.set("view","command");
+      if(eventCode)url.searchParams.set("event",String(eventCode).trim().toUpperCase());
+    }else{
+      url.searchParams.delete("view");
+      url.searchParams.delete("event");
+    }
     history.replaceState(null,"",url);
   }catch{}
 }
@@ -800,6 +810,12 @@ async function route(){
     return fieldReportAccessFlow();
   }
 
+  if(commandViewRequested()&&!(S.mode==="staff"&&S.session&&!S.session.user?.is_anonymous)){
+    S.mode="command";
+    saveNavigationState();
+    return commandAccessFlow();
+  }
+
   saveNavigationState();
   if(!S.mode)return landing();
   if(S.mode==="staff"){
@@ -807,6 +823,7 @@ async function route(){
     return staffFlow();
   }
   if(S.mode==="field")return fieldFlow();
+  if(S.mode==="command")return commandAccessFlow();
   if(S.mode==="treatment")return renderTreatmentAreaFlow(app,{
     header,
     onExit:()=>{S.mode=null;reset();clearNavigationState();route();}
@@ -820,11 +837,154 @@ function landing(){
       <p class="muted">Multi-department event command, dispatch, mapping, field CAD and reporting.</p>
       <button class="btn block" id="fieldAccess">Field Unit Access</button>
       <button class="btn block" id="treatmentAccess">Treatment Area Station</button>
+      <button class="btn block" id="commandBoardAccess">Command Board Display</button>
       <button class="btn secondary block" id="staffAccess">Dispatcher / Admin Login</button>
     </div></div></div>`;
   document.querySelector("#fieldAccess").onclick=()=>{S.mode="field";route();};
   document.querySelector("#treatmentAccess").onclick=()=>{S.mode="treatment";route();};
+  document.querySelector("#commandBoardAccess").onclick=()=>{S.mode="command";setCommandViewUrl(true);route();};
   document.querySelector("#staffAccess").onclick=()=>{S.mode="staff";route();};
+}
+
+
+async function commandAccessFlow(){
+  let {data:{session}}=await supabase.auth.getSession();
+
+  // Standalone specialty access uses an anonymous Supabase identity. Named
+  // staff who open Command Display from Dispatch bypass this flow.
+  if(!session||!session.user?.is_anonymous){
+    if(session)await supabase.auth.signOut();
+    const result=await supabase.auth.signInAnonymously();
+    if(result.error)return commandAccessError(result.error.message);
+    session=result.data.session;
+  }
+
+  S.session=session;
+  S.mode="command";
+
+  const {data:cs,error}=await supabase.from("command_display_sessions")
+    .select("*")
+    .eq("auth_user_id",session.user.id)
+    .eq("active",true)
+    .order("started_at",{ascending:false})
+    .limit(1)
+    .maybeSingle();
+
+  if(error)return commandAccessError(error.message);
+  if(!cs)return commandJoin();
+
+  S.commandSession=cs;
+  S.eventId=cs.event_id;
+  return commandDisplayPage({publicAccess:true});
+}
+
+function commandAccessError(message){
+  app.innerHTML=`<div class="shell">${header("Command Board Access Error")}
+    <div class="center"><div class="card stack">
+      <h2>Command Board Access Error</h2>
+      <div class="notice error">${esc(message)}</div>
+      <button class="btn secondary" id="commandAccessErrorBack">Back</button>
+    </div></div>
+  </div>`;
+
+  document.querySelector("#commandAccessErrorBack").onclick=()=>{
+    if(S.commandSession?.id)return exitStandaloneCommandBoard();
+    setCommandViewUrl(false);
+    S.mode=null;
+    S.commandSession=null;
+    reset();
+    clearNavigationState();
+    route();
+  };
+}
+
+function commandJoin({message=""}={}){
+  const prefill=commandPrefillEventCode();
+
+  app.innerHTML=`<div class="shell">${header("Command Board Access")}
+    <div class="center">
+      <form class="card stack" id="commandBoardLoginForm">
+        <h2>Command Board Display</h2>
+        ${message?`<div class="notice">${esc(message)}</div>`:""}
+        <p class="muted">Use the event's specialty-access Event ID and 4-digit PIN. This interface is read-only and is intended for a command-center monitor, display computer, or other situational-awareness screen.</p>
+        <div><label for="commandEventCode">Event ID</label><input id="commandEventCode" value="${esc(prefill)}" placeholder="Event code" autocomplete="off" required></div>
+        <div><label for="commandPin">4-digit access code</label><input id="commandPin" maxlength="4" inputmode="numeric" placeholder="••••" autocomplete="off" required></div>
+        <div><label for="commandOperator">Display name (optional)</label><input id="commandOperator" placeholder="Command Center TV / Operations Room"></div>
+        <button class="btn" id="commandBoardLogin" type="submit">Open Command Board</button>
+        <button class="btn secondary" id="commandBoardBack" type="button">Back</button>
+        <div id="commandBoardLoginError" class="small muted" role="alert" aria-live="polite"></div>
+      </form>
+    </div>
+  </div>`;
+
+  document.querySelector("#commandBoardBack").onclick=()=>{
+    setCommandViewUrl(false);
+    S.mode=null;
+    S.commandSession=null;
+    reset();
+    clearNavigationState();
+    route();
+  };
+
+  document.querySelector("#commandBoardLoginForm").addEventListener("submit",async event=>{
+    event.preventDefault();
+
+    const eventCode=document.querySelector("#commandEventCode").value.trim().toUpperCase();
+    const pin=document.querySelector("#commandPin").value.trim();
+    const operatorName=document.querySelector("#commandOperator").value.trim();
+    const button=document.querySelector("#commandBoardLogin");
+    const errorHost=document.querySelector("#commandBoardLoginError");
+
+    errorHost.textContent="";
+    if(!eventCode)return errorHost.textContent="Enter the Event ID.";
+    if(!/^\d{4}$/.test(pin))return errorHost.textContent="Enter the 4-digit event access code.";
+
+    button.disabled=true;
+    button.textContent="Opening…";
+
+    const {data,error}=await supabase.rpc("command_enter_event",{
+      p_event_code:eventCode,
+      p_pin:pin,
+      p_operator_name:operatorName||null
+    });
+
+    if(error){
+      button.disabled=false;
+      button.textContent="Open Command Board";
+      errorHost.textContent=error.message;
+      return;
+    }
+
+    S.commandSession=data;
+    S.eventId=data.event_id;
+    setCommandViewUrl(true,eventCode);
+    saveNavigationState();
+    commandDisplayPage({publicAccess:true});
+  });
+
+  setTimeout(()=>document.querySelector(prefill?"#commandPin":"#commandEventCode")?.focus(),0);
+}
+
+async function exitStandaloneCommandBoard(){
+  const sessionId=S.commandSession?.id;
+  if(sessionId){
+    try{
+      await supabase.rpc("command_end_session",{
+        p_command_session_id:sessionId
+      });
+    }catch{}
+  }
+
+  cleanupRealtime();
+  S.commandSession=null;
+  S.mode=null;
+  S.eventId=null;
+  setCommandViewUrl(false);
+  clearNavigationState();
+
+  try{await supabase.auth.signOut();}catch{}
+  reset();
+  route();
 }
 
 
@@ -1137,6 +1297,125 @@ async function newEventForm(preselectedVersionId=null){
 
     await eventAdmin();
   };
+}
+
+async function loadCommandDisplayOps(){
+  const [
+    eventRes,
+    depsRes,
+    unitsRes,
+    incidentsRes,
+    mapLayersRes,
+    zonesRes,
+    unitLocationsRes,
+    operationalPeriodsRes,
+    treatmentAreasRes
+  ]=await Promise.all([
+    supabase.from("events")
+      .select("id,name,event_code,active")
+      .eq("id",S.eventId)
+      .single(),
+    supabase.from("event_departments")
+      .select("id,event_id,name,short_name,sort_order,active")
+      .eq("event_id",S.eventId)
+      .eq("active",true)
+      .order("sort_order"),
+    supabase.from("units")
+      .select("id,event_id,department_id,name,status,active,current_map_layer_id,current_zone_id,current_transport_destination_text,current_transport_treatment_area_id")
+      .eq("event_id",S.eventId)
+      .eq("active",true)
+      .order("name"),
+    supabase.from("incidents")
+      .select("id,event_id,incident_number,call_type,priority,status,created_at,landmark,map_layer_id,zone_id,map_x,map_y")
+      .eq("event_id",S.eventId)
+      .neq("status","CLOSED")
+      .order("created_at",{ascending:false}),
+    supabase.from("event_map_layers")
+      .select("id,event_id,name,level_code,status,active,is_default,sort_order,rendered_image_path,image_width,image_height,georef_coefficients")
+      .eq("event_id",S.eventId)
+      .eq("active",true)
+      .eq("status","published")
+      .order("sort_order"),
+    supabase.from("event_zones")
+      .select("id,event_id,map_layer_id,name,active,sort_order")
+      .eq("event_id",S.eventId)
+      .eq("active",true)
+      .order("sort_order"),
+    supabase.from("unit_locations")
+      .select("*")
+      .eq("event_id",S.eventId),
+    supabase.from("operational_periods")
+      .select("id,event_id,name,incident_prefix,status,starts_at,ends_at,created_at")
+      .eq("event_id",S.eventId)
+      .order("created_at"),
+    supabase.from("ems_treatment_areas")
+      .select("id,event_id,name,status,active")
+      .eq("event_id",S.eventId)
+      .eq("active",true)
+      .order("name")
+  ]);
+
+  const baseResults={
+    event:eventRes,
+    departments:depsRes,
+    units:unitsRes,
+    incidents:incidentsRes,
+    mapLayers:mapLayersRes,
+    zones:zonesRes,
+    unitLocations:unitLocationsRes,
+    operationalPeriods:operationalPeriodsRes,
+    treatmentAreas:treatmentAreasRes
+  };
+
+  const failed=Object.entries(baseResults).filter(([,result])=>result.error);
+  if(failed.length){
+    for(const [name,result] of failed)console.error(`Command Board load error: ${name}`,result.error);
+    throw new Error(
+      "Command Board could not load event data: "+
+      failed.map(([name,result])=>`${name}: ${result.error.message}`).join(" | ")
+    );
+  }
+
+  let incidents=incidentsRes.data||[];
+  const incidentIds=incidents.map(row=>row.id);
+
+  if(incidentIds.length){
+    const [deptLinksRes,unitLinksRes]=await Promise.all([
+      supabase.from("incident_departments")
+        .select("incident_id,department_id,event_departments(name,short_name)")
+        .in("incident_id",incidentIds),
+      supabase.from("incident_units")
+        .select("incident_id,unit_id,cleared_at,units(name)")
+        .in("incident_id",incidentIds)
+    ]);
+
+    if(deptLinksRes.error)throw deptLinksRes.error;
+    if(unitLinksRes.error)throw unitLinksRes.error;
+
+    const deptLinks=deptLinksRes.data||[];
+    const unitLinks=unitLinksRes.data||[];
+
+    incidents=incidents.map(incident=>({
+      ...incident,
+      incident_departments:deptLinks.filter(link=>link.incident_id===incident.id),
+      incident_units:unitLinks.filter(link=>link.incident_id===incident.id)
+    }));
+  }
+
+  S.event=eventRes.data;
+  S.departments=depsRes.data||[];
+  S.units=unitsRes.data||[];
+  S.incidents=incidents;
+  S.mapLayers=mapLayersRes.data||[];
+  S.zones=zonesRes.data||[];
+  S.unitLocations=unitLocationsRes.data||[];
+  S.operationalPeriods=operationalPeriodsRes.data||[];
+  S.activeOperationalPeriod=S.operationalPeriods.find(op=>op.status==="ACTIVE")||null;
+  S.treatmentAreas=treatmentAreasRes.data||[];
+
+  const preferred=S.mapLayers.find(layer=>layer.id===S.commandActiveMapLayerId);
+  const fallback=S.mapLayers.find(layer=>layer.is_default)||S.mapLayers[0]||null;
+  S.activeMapLayerId=(preferred||fallback)?.id||null;
 }
 
 async function loadEventOps(){
@@ -4155,9 +4434,11 @@ async function refreshCommandDisplayStructure(){
   const previousLayer=S.commandActiveMapLayerId;
 
   try{
-    await loadEventOps();
+    if(S.mode==="command")await loadCommandDisplayOps();
+    else await loadEventOps();
   }catch(error){
     console.warn("Command Display refresh failed",error);
+    if(S.mode==="command")return commandAccessError(error.message);
     return;
   }
 
@@ -4209,8 +4490,26 @@ function subscribeCommandDisplay(){
       renderCommandCallPanel();
       renderCommandUnitMarkers();
     })
-    .on("postgres_changes",{event:"*",schema:"public",table:"unit_locations"},payload=>updateCommandDisplayUnitLocation(payload))
-    .subscribe();
+    .on("postgres_changes",{event:"*",schema:"public",table:"unit_locations"},payload=>updateCommandDisplayUnitLocation(payload));
+
+  if(S.mode==="command"&&S.commandSession?.id){
+    ch.on("postgres_changes",{
+      event:"UPDATE",
+      schema:"public",
+      table:"command_display_sessions",
+      filter:`id=eq.${S.commandSession.id}`
+    },payload=>{
+      if(payload.new?.active===false){
+        setTimeout(()=>{
+          cleanupRealtime();
+          S.commandSession=null;
+          commandJoin({message:"This Command Board session ended. Re-enter the Event ID and PIN to continue."});
+        },0);
+      }
+    });
+  }
+
+  ch.subscribe();
   S.realtime.push(ch);
 }
 function bindCommandDisplayControls(){
@@ -4238,20 +4537,23 @@ function bindCommandDisplayControls(){
     };
   });
 }
-async function commandDisplayPage(){
+async function commandDisplayPage({publicAccess=S.mode==="command"}={}){
   closeIncidentModal();
-  setCommandViewUrl(true);
+  setCommandViewUrl(true,publicAccess?(commandPrefillEventCode()||S.event?.event_code||null):null);
   cleanupRealtime();
   clearCommandMap();
 
   try{
-    await loadEventOps();
+    if(publicAccess)await loadCommandDisplayOps();
+    else await loadEventOps();
   }catch(error){
+    if(publicAccess)return commandAccessError(error.message);
     alert(error.message);
     setCommandViewUrl(false);
     return dispatchPage();
   }
 
+  if(publicAccess&&S.event?.event_code)setCommandViewUrl(true,S.event.event_code);
   loadCommandDisplayPreferences();
 
   app.innerHTML=`<div class="command-display-shell" id="commandDisplayShell">
@@ -4267,7 +4569,7 @@ async function commandDisplayPage(){
       </div>
       <div class="command-display-actions">
         <button class="btn secondary" id="commandFullscreen">Full Screen</button>
-        <button class="btn secondary" id="commandBack">Back to Dispatch</button>
+        <button class="btn secondary" id="commandBack">${publicAccess?"Exit Command Board":"Back to Dispatch"}</button>
       </div>
     </header>
 
@@ -4293,7 +4595,11 @@ async function commandDisplayPage(){
     <main id="commandDisplayContent"></main>
   </div>`;
 
-  document.querySelector("#commandBack").onclick=()=>{setCommandViewUrl(false);dispatchPage();};
+  document.querySelector("#commandBack").onclick=()=>{
+    if(publicAccess)return exitStandaloneCommandBoard();
+    setCommandViewUrl(false);
+    dispatchPage();
+  };
   document.querySelector("#commandFullscreen").onclick=async()=>{
     const shell=document.querySelector("#commandDisplayShell");
     try{
@@ -7469,6 +7775,7 @@ function reset(){
   S.guestLogisticsMovements=[];
   S.dispatchLayout=null;
   S.fieldReportSessionOwned=false;
+  S.commandSession=null;
   S.dispatchDepartmentIds=[];
   S.commandDepartmentIds=[];
   S.commandDisplayMode="calls";
