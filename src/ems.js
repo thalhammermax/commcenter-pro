@@ -428,14 +428,17 @@ export async function renderDispatchIncidentTreatmentPanel(container,{eventId,in
    ============================================================ */
 
 export async function renderEmsAdmin(container,ctx,onRefresh){
-  const {eventId,event,units,pois,departments,confirmDestructive}=ctx;
-  const [areasRes,configRes]=await Promise.all([
+  const {eventId,event,units,pois,departments,confirmDestructive,onTreatmentLayout}=ctx;
+  const [areasRes,archivedAreasRes,configRes]=await Promise.all([
     supabase.from("ems_treatment_areas").select("*").eq("event_id",eventId).eq("active",true).order("name"),
+    supabase.from("ems_treatment_areas").select("*").eq("event_id",eventId).eq("active",false).order("name"),
     supabase.from("ems_unit_config").select("*")
   ]);
   if(areasRes.error)return container.innerHTML=`<div class="notice error">${esc(areasRes.error.message)}</div>`;
+  if(archivedAreasRes.error)return container.innerHTML=`<div class="notice error">${esc(archivedAreasRes.error.message)}</div>`;
   if(configRes.error)return container.innerHTML=`<div class="notice error">${esc(configRes.error.message)}</div>`;
   const areas=areasRes.data||[];
+  const archivedAreas=archivedAreasRes.data||[];
   const configs=configRes.data||[];
 
   container.innerHTML=`<div class="stack">
@@ -445,8 +448,16 @@ export async function renderEmsAdmin(container,ctx,onRefresh){
     </div>
 
     <div class="card">
-      <h2>EMS Treatment Areas</h2>
-      <p class="muted">Treatment areas are stationary EMS receiving locations. Their tablets use the event ID/PIN and then select a treatment area.</p>
+      <div class="row">
+        <div>
+          <h2>EMS Treatment Areas</h2>
+          <p class="muted">Treatment areas are stationary EMS receiving locations. Their tablets use the event ID/PIN and then select a treatment area.</p>
+        </div>
+        <div class="nav">
+          ${onTreatmentLayout?`<button class="btn secondary compact" id="openTreatmentAreaLayout">Treatment Area Layout</button>`:""}
+          <span class="badge">${archivedAreas.length} Archived</span>
+        </div>
+      </div>
       ${areas.map(a=>{
         const dep=departments.find(d=>d.id===a.department_id);
         return `<div class="ems-admin-row">
@@ -474,6 +485,29 @@ export async function renderEmsAdmin(container,ctx,onRefresh){
     </div>
 
     <div class="card">
+      <div class="row">
+        <div>
+          <div class="section-title">ARCHIVED EMS RESOURCES</div>
+          <h2>Archived Treatment Areas</h2>
+          <p class="muted">Restore a previously removed Treatment Area without losing its historical patient-flow records.</p>
+        </div>
+        <span class="badge">${archivedAreas.length}</span>
+      </div>
+
+      ${archivedAreas.map(area=>{
+        const dep=departments.find(d=>d.id===area.department_id);
+        return `<div class="ems-admin-row archived-treatment-area-row">
+          <div>
+            <strong>${esc(area.name)}</strong>
+            <div class="small muted">${esc(area.status||"ARCHIVED")}${dep?` · ${esc(dep.name)}`:area.department_id?` · Linked department may also be archived`:""}</div>
+            ${area.notes?`<div class="small muted">${esc(area.notes)}</div>`:""}
+          </div>
+          <button class="btn secondary compact" data-restore-area="${area.id}">Restore</button>
+        </div>`;
+      }).join("")||`<div class="small muted">No archived treatment areas.</div>`}
+    </div>
+
+    <div class="card">
       <h2>EMS Unit Roles</h2>
       <p class="muted">Classify existing CAD units as field teams, ambulances, or EMS command. Only transport-capable units appear as ambulance handoff destinations.</p>
       <div class="table-wrap"><table><thead><tr><th>Unit</th><th>EMS Role</th><th>Transport</th><th>Level</th><th></th></tr></thead><tbody>
@@ -494,6 +528,29 @@ export async function renderEmsAdmin(container,ctx,onRefresh){
       <div class="notice ok"><strong>CommCenter Pro → Treatment Area Station</strong><br>Event ID: <span class="mono">${esc(event?.event_code||"")}</span><br>Use the same 4-digit field PIN configured for the event, then select the treatment area.</div>
     </div>
   </div>`;
+
+  document.querySelector("#openTreatmentAreaLayout")?.addEventListener("click",()=>onTreatmentLayout?.());
+
+  document.querySelectorAll("[data-restore-area]").forEach(button=>button.onclick=async()=>{
+    const area=archivedAreas.find(item=>item.id===button.dataset.restoreArea);
+    if(!area)return;
+
+    button.disabled=true;
+    const original=button.textContent;
+    button.textContent="Restoring…";
+
+    const {error}=await supabase.rpc("admin_restore_treatment_area",{
+      p_treatment_area_id:area.id
+    });
+
+    if(error){
+      button.disabled=false;
+      button.textContent=original;
+      return alert(error.message);
+    }
+
+    await onRefresh();
+  });
 
   const renderTreatmentAreaEditor=areaId=>{
     const host=document.querySelector("#treatmentAreaEditor");

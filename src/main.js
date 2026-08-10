@@ -5318,14 +5318,14 @@ function renderFieldLayoutAdmin(){
         <div class="row">
           <div>
             <div class="section-title">EVENT-WIDE FIELD UNIT VIEW</div>
-            <h2>Field Layout Builder</h2>
+            <h2>Field Unit Layout Builder</h2>
             <p class="muted">Drag blocks into the order field crews should see them. This layout applies globally to every Field Unit in this event.</p>
           </div>
           <span class="badge">${enabledCount} Visible Blocks</span>
         </div>
 
         <div class="notice">
-          <strong>One event, one Field layout.</strong><br>
+          <strong>One event, one Field Unit layout.</strong><br>
           Department status choices and module availability still control what content exists; this tool controls the order and visibility of the Field Unit interface. Required safety blocks cannot be hidden.
         </div>
       </div>
@@ -5492,7 +5492,7 @@ function renderFieldLayoutAdmin(){
       button.disabled=false;
       button.textContent="Save Layout";
       message.classList.remove("error");
-      message.textContent="Field layout saved. Connected Field units will receive the new layout automatically.";
+      message.textContent="Field Unit layout saved. Connected Field Units will receive the new layout automatically.";
     };
   };
 
@@ -5517,11 +5517,14 @@ function renderTreatmentLayoutAdmin(){
       <div class="card">
         <div class="row">
           <div>
-            <div class="section-title">EVENT-WIDE TREATMENT AREA VIEW</div>
-            <h2>Treatment Layout Builder</h2>
+            <div class="section-title">EMS SETUP · EVENT-WIDE TREATMENT AREA VIEW</div>
+            <h2>Treatment Area Layout Builder</h2>
             <p class="muted">Drag blocks into the order Treatment Area Stations should see them. This layout applies globally to every Treatment Area in this event.</p>
           </div>
-          <span class="badge">${enabledCount} Visible Blocks</span>
+          <div class="nav">
+            <span class="badge">${enabledCount} Visible Blocks</span>
+            <button class="btn secondary compact" id="backTreatmentLayoutToEms">Back to EMS Setup</button>
+          </div>
         </div>
 
         <div class="notice">
@@ -5590,6 +5593,8 @@ function renderTreatmentLayoutAdmin(){
         </section>
       </div>
     </div>`;
+
+    document.querySelector("#backTreatmentLayoutToEms")?.addEventListener("click",()=>eventAdmin("ems"));
 
     const moveBlock=(id,delta)=>{
       const index=draft.blocks.findIndex(block=>block.id===id);
@@ -5706,8 +5711,7 @@ async function eventAdmin(initialTab="setup"){
     <div class="admin-layout">
       <aside class="admin-menu">
         <button class="${initialTab==="setup"?"active":""}" id="setupTab">Setup</button>
-        <button class="${initialTab==="field-layout"?"active":""}" id="fieldLayoutTab">Field Layout</button>
-        <button class="${initialTab==="treatment-layout"?"active":""}" id="treatmentLayoutTab">Treatment Layout</button>
+        <button class="${initialTab==="field-layout"?"active":""}" id="fieldLayoutTab">Field Unit Layout</button>
         <button class="${initialTab==="periods"?"active":""}" id="periodsTab">Operational Periods</button>
         <button class="${initialTab==="ems"?"active":""}" id="emsTab">EMS Setup</button>
         <button class="${initialTab==="logistics"?"active":""}" id="logisticsTab">Guest Logistics</button>
@@ -5733,7 +5737,8 @@ async function eventAdmin(initialTab="setup"){
         units:S.units,
         pois:S.pois,
         departments:S.departments,
-        confirmDestructive:openDestructiveConfirmation
+        confirmDestructive:openDestructiveConfirmation,
+        onTreatmentLayout:()=>renderTreatmentLayoutAdmin()
       },
       showEmsAdmin
     );
@@ -5741,7 +5746,6 @@ async function eventAdmin(initialTab="setup"){
   document.querySelector("#mapTab").onclick=()=>renderMapBuilder(app,S.eventId,()=>eventAdmin());
   document.querySelector("#setupTab").onclick=()=>{markAdminTab("setupTab");renderEventSetup();};
   document.querySelector("#fieldLayoutTab").onclick=()=>{markAdminTab("fieldLayoutTab");renderFieldLayoutAdmin();};
-  document.querySelector("#treatmentLayoutTab").onclick=()=>{markAdminTab("treatmentLayoutTab");renderTreatmentLayoutAdmin();};
   document.querySelector("#periodsTab").onclick=()=>{markAdminTab("periodsTab");renderOperationalPeriodsAdmin();};
   document.querySelector("#emsTab").onclick=showEmsAdmin;
   document.querySelector("#logisticsTab").onclick=()=>{markAdminTab("logisticsTab");renderGuestLogisticsAdmin();};
@@ -5749,7 +5753,7 @@ async function eventAdmin(initialTab="setup"){
 
   if(initialTab==="ems")showEmsAdmin();
   else if(initialTab==="field-layout")renderFieldLayoutAdmin();
-  else if(initialTab==="treatment-layout")renderTreatmentLayoutAdmin();
+  else if(initialTab==="treatment-layout"){markAdminTab("emsTab");renderTreatmentLayoutAdmin();}
   else if(initialTab==="periods")renderOperationalPeriodsAdmin();
   else if(initialTab==="logistics")renderGuestLogisticsAdmin();
   else if(initialTab==="staffing")renderUnitStaffingAdmin();
@@ -5769,9 +5773,8 @@ function renderEventSetup(){
       <div class="small muted" style="margin-top:5px">Location is opt-in on each field device. This version stores only the latest location, not a route history.</div>
       <div class="grid2" style="margin-top:10px">
         <button class="btn" id="savePin">Save Field Access</button>
-        <button class="btn secondary" id="configureFieldLayout">Configure Field Unit View</button>
+        <button class="btn secondary" id="configureFieldLayout">Configure Field Unit Layout</button>
       </div>
-      <button class="btn secondary block" id="configureTreatmentLayout" style="margin-top:8px">Configure Treatment Area View</button>
       <div id="pinMsg" class="small muted"></div>
     </div>
 
@@ -5867,7 +5870,6 @@ function renderEventSetup(){
   </div>`;
 
   document.querySelector("#configureFieldLayout").onclick=()=>eventAdmin("field-layout");
-  document.querySelector("#configureTreatmentLayout").onclick=()=>eventAdmin("treatment-layout");
 
   document.querySelector("#savePin").onclick=async()=>{
     const pin=document.querySelector("#newPin").value.trim();
