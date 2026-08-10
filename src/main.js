@@ -37,6 +37,15 @@ const S={
   dispatchUnitSyncInterval:null,
   dispatchUnitSyncInFlight:false,
   dispatchRealtimeStatus:null,
+  fieldMap:null,
+  fieldMapLayer:null,
+  fieldMapUnitMarker:null,
+  fieldMapCallMarker:null,
+  fieldMapRelationLine:null,
+  fieldMapCallPoint:null,
+  fieldMapIncident:null,
+  fieldMapUnit:null,
+  fieldLocalLocation:null,
   mapPickMode:null,
   pendingIncidentDraft:null,
   fieldReportSessionOwned:false
@@ -7246,6 +7255,7 @@ async function fieldUnitPicker(){
   subscribeFieldSessionLifecycle(S.fieldSession?.id);
 }
 async function fieldUnitCad(){
+  clearFieldUnitMap();
   const {data:fs,error}=await supabase.from("field_sessions")
     .select("*,events(name,field_location_enabled,venue_type,field_layout_config),operational_periods(name,incident_prefix,status),units(name,status,event_id,current_map_layer_id,current_zone_id,current_transport_destination_text,current_transport_treatment_area_id,event_departments(name,status_profile))")
     .eq("auth_user_id",S.session.user.id).eq("active",true).order("started_at",{ascending:false}).limit(1).single();
@@ -7301,7 +7311,7 @@ async function fieldUnitCad(){
       ${fieldLayer?`<div class="venue-location-line"><span class="badge layer-badge">${esc(fieldLayer.name)}</span>${fieldZone?` <span class="badge">${esc(fieldZone.name)}</span>`:""}</div>`:""}
       <p>${esc(incident.landmark||"No location description")}${incident.latitude!=null&&incident.longitude!=null?`<br><span class="small mono">${Number(incident.latitude).toFixed(6)}, ${Number(incident.longitude).toFixed(6)}</span>`:""}</p>
       <p>${esc(incident.notes||"")}</p>
-      ${fieldLayer&&incident.map_x!=null&&incident.map_y!=null?`<button class="btn secondary block" id="viewFieldMap">View on Event Map</button>`:""}
+      ${fieldLayer&&incident.map_x!=null&&incident.map_y!=null?`<button class="btn secondary block" id="viewFieldMap">View Call &amp; My Location</button>`:""}
       <div id="fieldMapHolder"></div>
     </div>`:logisticsState?.underway?`<div class="card"><strong>No CAD incident assignment</strong><p class="muted">This unit is currently committed to the Guest Logistics movement below.</p></div>`:`<div class="card"><strong>No current CAD assignment</strong><p class="muted">${logisticsState?.current?"A future Guest Logistics movement is preassigned below; the unit remains available until that movement begins.":"Remain available for dispatch."}</p></div>`,
 
@@ -7503,9 +7513,9 @@ async function fieldUnitCad(){
     const host=document.querySelector("#offlineStatus");
     if(x&&host)host.textContent=`Offline package saved ${dateTime24(x.savedAt,{seconds:true})}`;
   }).catch(()=>{});
-  document.querySelector("#changeUnit")?.addEventListener("click",async()=>{await stopFieldLocationSharing(fs.unit_id,{notifyServer:true});await supabase.rpc("field_release_unit",{p_field_session_id:fs.id});fieldUnitPicker();});
+  document.querySelector("#changeUnit")?.addEventListener("click",async()=>{await stopFieldLocationSharing(fs.unit_id,{notifyServer:true});S.fieldLocalLocation=null;clearFieldUnitMap();await supabase.rpc("field_release_unit",{p_field_session_id:fs.id});fieldUnitPicker();});
   document.querySelector("#leaveEvent")?.addEventListener("click",leaveField);
-  if(incident)document.querySelector("#viewFieldMap")?.addEventListener("click",()=>showFieldMap(incident));
+  if(incident)document.querySelector("#viewFieldMap")?.addEventListener("click",()=>showFieldMap(incident,fs));
   subscribeField(fs.unit_id,fs.id);
 }
 
@@ -7538,6 +7548,19 @@ async function sendFieldLocation(unitId,position){
   const now=Date.now();
   const coords=position.coords;
   const current={lat:Number(coords.latitude),lon:Number(coords.longitude)};
+  S.fieldLocalLocation={
+    unit_id:unitId,
+    latitude:current.lat,
+    longitude:current.lon,
+    accuracy_m:Number.isFinite(coords.accuracy)?Number(coords.accuracy):null,
+    altitude_m:Number.isFinite(coords.altitude)?Number(coords.altitude):null,
+    heading_deg:Number.isFinite(coords.heading)?Number(coords.heading):null,
+    speed_mps:Number.isFinite(coords.speed)?Number(coords.speed):null,
+    client_time:new Date(position.timestamp||Date.now()).toISOString(),
+    updated_at:new Date().toISOString(),
+    source:"device"
+  };
+  updateFieldMapUnitLocation(S.fieldLocalLocation);
   const elapsed=now-(S.locationLastSentAt||0);
   const moved=S.locationLastSent
     ? distanceMeters(S.locationLastSent.lat,S.locationLastSent.lon,current.lat,current.lon)
@@ -7645,6 +7668,7 @@ async function stopFieldLocationSharing(unitId,{notifyServer=true}={}){
   }
 
   updateFieldLocationUi({message:"Location sharing is off.",sharing:false});
+  if(S.fieldLocalLocation?.unit_id===unitId)updateFieldMapUnitLocation(S.fieldLocalLocation);
 }
 
 function bindFieldLocationControls(fs,mapLayers,zones){
@@ -7672,6 +7696,10 @@ function bindFieldLocationControls(fs,mapLayers,zones){
 
       fs.units.current_map_layer_id=layerId;
       fs.units.current_zone_id=zoneId;
+      if(S.fieldMapUnit&&S.fieldMapUnit.id===fs.unit_id){
+        S.fieldMapUnit.current_map_layer_id=layerId;
+        if(S.fieldLocalLocation?.unit_id===fs.unit_id)updateFieldMapUnitLocation(S.fieldLocalLocation);
+      }
       updateFieldLocationUi({
         message:layerId?`Venue level updated to ${mapLayers.find(l=>l.id===layerId)?.name||"selected level"}.`:"Venue level set to default / unknown.",
         sharing:S.locationWatchId!=null
@@ -7760,9 +7788,233 @@ async function downloadOfflineEventData(){
 }
 
 
-async function showFieldMap(incident){
+function clearFieldUnitMap(){
+  if(S.fieldMap){
+    try{S.fieldMap.remove();}catch{}
+  }
+  S.fieldMap=null;
+  S.fieldMapLayer=null;
+  S.fieldMapUnitMarker=null;
+  S.fieldMapCallMarker=null;
+  S.fieldMapRelationLine=null;
+  S.fieldMapCallPoint=null;
+  S.fieldMapIncident=null;
+  S.fieldMapUnit=null;
+}
+
+function fieldMapDistanceLabel(meters){
+  if(!Number.isFinite(meters))return "";
+  const feet=meters*3.28084;
+  if(meters<1000)return `${Math.round(meters)} m · ${Math.round(feet)} ft straight-line`;
+  const miles=meters/1609.344;
+  return `${(meters/1000).toFixed(2)} km · ${miles.toFixed(2)} mi straight-line`;
+}
+
+function fieldMapIncidentGeo(incident,layer){
+  if(
+    incident?.latitude!=null
+    &&incident?.longitude!=null
+    &&Number.isFinite(Number(incident.latitude))
+    &&Number.isFinite(Number(incident.longitude))
+  ){
+    return {lat:Number(incident.latitude),lon:Number(incident.longitude)};
+  }
+  if(
+    layer?.georef_coefficients
+    &&incident?.map_x!=null
+    &&incident?.map_y!=null
+    &&Number.isFinite(Number(incident.map_x))
+    &&Number.isFinite(Number(incident.map_y))
+  ){
+    try{
+      return pixelToGeo(Number(incident.map_x),Number(incident.map_y),layer.georef_coefficients);
+    }catch{}
+  }
+  return null;
+}
+
+function setFieldMapMessage(message,{error=false}={}){
+  const el=document.querySelector("#fieldMapRelation");
+  if(!el)return;
+  el.textContent=message||"";
+  el.classList.toggle("error",!!error);
+}
+
+function fitFieldMapToCallAndUnit(){
+  if(!S.fieldMap)return;
+  const points=[];
+  if(S.fieldMapCallPoint)points.push(S.fieldMapCallPoint);
+  if(S.fieldMapUnitMarker)points.push(S.fieldMapUnitMarker.getLatLng());
+
+  if(points.length>=2){
+    S.fieldMap.fitBounds(L.latLngBounds(points),{padding:[54,54],maxZoom:2});
+  }else if(points.length===1){
+    S.fieldMap.setView(points[0],0);
+  }
+}
+
+function updateFieldMapUnitLocation(location,{fit=false}={}){
+  if(!S.fieldMap||!S.fieldMapLayer||!location)return;
+
+  const layer=S.fieldMapLayer;
+  if(!layer.georef_coefficients){
+    setFieldMapMessage("This map layer is not georeferenced, so device GPS cannot be plotted on it.",{error:true});
+    return;
+  }
+
+  let pixel;
+  try{
+    pixel=geoToPixel(
+      Number(location.latitude),
+      Number(location.longitude),
+      layer.georef_coefficients
+    );
+  }catch{
+    setFieldMapMessage("Your GPS fix could not be projected onto this event map.",{error:true});
+    return;
+  }
+
+  if(
+    pixel.x < -100 || pixel.y < -100
+    || pixel.x > Number(layer.image_width)+100
+    || pixel.y > Number(layer.image_height)+100
+  ){
+    setFieldMapMessage("Your current GPS fix is outside the mapped venue area.",{error:true});
+    return;
+  }
+
+  const point=pixelToLeaflet(pixel.x,pixel.y,layer.image_height);
+  const accuracy=location.accuracy_m!=null?` · accuracy ±${Math.round(Number(location.accuracy_m))}m`:"";
+  const live=S.locationWatchId!=null;
+  const unitLayerId=S.fieldMapUnit?.current_map_layer_id||null;
+  const differentLevel=!!(unitLayerId&&S.fieldMapIncident?.map_layer_id&&unitLayerId!==S.fieldMapIncident.map_layer_id);
+
+  if(!S.fieldMapUnitMarker){
+    S.fieldMapUnitMarker=L.circleMarker(point,{
+      radius:10,
+      weight:3,
+      fillOpacity:.92,
+      opacity:1,
+      className:`unit-gps-marker field-map-unit-marker${differentLevel?" field-map-unit-different-level":""}`
+    }).addTo(S.fieldMap);
+  }else{
+    S.fieldMapUnitMarker.setLatLng(point);
+    const el=S.fieldMapUnitMarker.getElement?.();
+    if(el)el.classList.toggle("field-map-unit-different-level",differentLevel);
+  }
+
+  S.fieldMapUnitMarker.bindTooltip(
+    `<strong>${esc(S.fieldMapUnit?.name||"Your unit")}</strong><br>${live?"Live GPS":"Current device GPS"}${accuracy}`,
+    {direction:"top",offset:[0,-8]}
+  );
+
+  if(S.fieldMapCallPoint){
+    if(!S.fieldMapRelationLine){
+      S.fieldMapRelationLine=L.polyline([point,S.fieldMapCallPoint],{
+        weight:3,
+        opacity:.72,
+        dashArray:"8 7",
+        className:"field-map-relation-line"
+      }).addTo(S.fieldMap);
+    }else{
+      S.fieldMapRelationLine.setLatLngs([point,S.fieldMapCallPoint]);
+    }
+  }
+
+  const incidentGeo=fieldMapIncidentGeo(S.fieldMapIncident,layer);
+  let distanceText="";
+  if(incidentGeo){
+    const meters=distanceMeters(
+      Number(location.latitude),
+      Number(location.longitude),
+      Number(incidentGeo.lat),
+      Number(incidentGeo.lon)
+    );
+    distanceText=fieldMapDistanceLabel(meters);
+  }
+
+  const levelNote=differentLevel
+    ?` · Different venue level: your unit is on ${layerName(unitLayerId)||"another level"}; call is on ${layerName(S.fieldMapIncident?.map_layer_id)||layer.name}. GPS is shown for horizontal reference.`
+    :"";
+
+  setFieldMapMessage(
+    `${live?"Live GPS":"Device GPS"}${accuracy}${distanceText?` · ${distanceText}`:""}${levelNote}`
+  );
+
+  if(fit)fitFieldMapToCallAndUnit();
+}
+
+function getDevicePositionOnce(unitId){
+  return new Promise((resolve,reject)=>{
+    if(!window.isSecureContext)return reject(new Error("Device location requires HTTPS."));
+    if(!navigator.geolocation)return reject(new Error("This browser does not provide device location."));
+
+    navigator.geolocation.getCurrentPosition(position=>{
+      const coords=position.coords;
+      const location={
+        unit_id:unitId,
+        latitude:Number(coords.latitude),
+        longitude:Number(coords.longitude),
+        accuracy_m:Number.isFinite(coords.accuracy)?Number(coords.accuracy):null,
+        altitude_m:Number.isFinite(coords.altitude)?Number(coords.altitude):null,
+        heading_deg:Number.isFinite(coords.heading)?Number(coords.heading):null,
+        speed_mps:Number.isFinite(coords.speed)?Number(coords.speed):null,
+        client_time:new Date(position.timestamp||Date.now()).toISOString(),
+        updated_at:new Date().toISOString(),
+        source:"device"
+      };
+      S.fieldLocalLocation=location;
+      resolve(location);
+    },error=>reject(new Error(fieldLocationErrorMessage(error))),{
+      enableHighAccuracy:true,
+      maximumAge:5000,
+      timeout:15000
+    });
+  });
+}
+
+async function getFieldMapStartingLocation(unitId){
+  if(S.fieldLocalLocation?.unit_id===unitId)return S.fieldLocalLocation;
+
+  if(navigator.onLine){
+    try{
+      const {data,error}=await supabase.from("unit_locations")
+        .select("unit_id,latitude,longitude,accuracy_m,altitude_m,heading_deg,speed_mps,client_time,updated_at")
+        .eq("unit_id",unitId)
+        .maybeSingle();
+      if(!error&&data){
+        S.fieldLocalLocation={...data,source:"server"};
+        return S.fieldLocalLocation;
+      }
+    }catch{}
+  }
+
+  return null;
+}
+
+async function showFieldMap(incident,fs){
   const holder=document.querySelector("#fieldMapHolder");
-  holder.innerHTML=`<div id="fieldLayerName" class="small muted" style="margin-top:8px"></div><div id="fieldMap" style="height:420px;margin-top:6px;border-radius:10px;overflow:hidden"></div><div id="fieldMapReadout" class="small muted" style="margin-top:6px"></div>`;
+  if(!holder)return;
+
+  clearFieldUnitMap();
+
+  holder.innerHTML=`<div class="field-map-toolbar">
+    <div>
+      <div id="fieldLayerName" class="small muted"></div>
+      <div class="field-map-legend small">
+        <span><span class="field-map-legend-dot field-map-call-dot"></span>Call</span>
+        <span><span class="field-map-legend-dot field-map-unit-dot"></span>Your unit</span>
+      </div>
+    </div>
+    <div class="field-map-actions">
+      <button class="btn secondary compact" id="fieldMapLocateMe">Refresh My Location</button>
+      <button class="btn secondary compact" id="fieldMapFit">Fit Me + Call</button>
+      <button class="btn secondary compact" id="fieldMapClose">Close Map</button>
+    </div>
+  </div>
+  <div id="fieldMap" class="field-unit-call-map"></div>
+  <div id="fieldMapRelation" class="location-status field-map-relation">Loading event map…</div>
+  <div id="fieldMapReadout" class="small muted field-map-readout"></div>`;
 
   let m=null,url=null;
   const targetLayerId=incident.map_layer_id||null;
@@ -7782,21 +8034,39 @@ async function showFieldMap(incident){
   const offline=await getOfflineEvent(S.eventId).catch(()=>null);
   if(!m&&offline?.layers?.length){
     const item=offline.layers.find(x=>x.meta.id===targetLayerId)||offline.layers.find(x=>x.meta.is_default)||offline.layers[0];
-    m=item.meta;
-    url=URL.createObjectURL(item.mapBlob);
+    m=item?.meta||null;
+    if(item?.mapBlob)url=URL.createObjectURL(item.mapBlob);
   }
 
-  if(!m||!url)return alert("No published map layer is available. Download the event map while connected.");
+  if(!m||!url){
+    setFieldMapMessage("No published map layer is available. Download the event map while connected.",{error:true});
+    return;
+  }
 
-  document.querySelector("#fieldLayerName").textContent=`Map layer: ${m.name}${incident.zone_id?` · ${offline?.zones?.find(z=>z.id===incident.zone_id)?.name||""}`:""}`;
+  S.fieldMapLayer=m;
+  S.fieldMapIncident=incident;
+  S.fieldMapUnit={
+    id:fs?.unit_id||S.fieldSession?.unit_id||null,
+    name:fs?.units?.name||S.fieldSession?.units?.name||"Your unit",
+    current_map_layer_id:fs?.units?.current_map_layer_id||null
+  };
+
+  const unitLayerId=S.fieldMapUnit.current_map_layer_id;
+  const zoneNameText=offline?.zones?.find(z=>z.id===incident.zone_id)?.name||"";
+  document.querySelector("#fieldLayerName").textContent=`Call map: ${m.name}${incident.zone_id&&zoneNameText?` · ${zoneNameText}`:""}`;
 
   const map=L.map("fieldMap",{crs:L.CRS.Simple,minZoom:-4,maxZoom:5,attributionControl:false});
+  S.fieldMap=map;
   L.imageOverlay(url,[[0,0],[m.image_height,m.image_width]]).addTo(map);
 
   if(incident.map_x!=null&&incident.map_y!=null){
-    const pt=pixelToLeaflet(incident.map_x,incident.map_y,m.image_height);
-    L.marker(pt,{icon:fieldIncidentMapIcon()}).addTo(map).bindPopup(`${esc(incident.incident_number)}<br>${esc(incident.landmark||"")}`).openPopup();
-    map.setView(pt,0);
+    const callPoint=pixelToLeaflet(incident.map_x,incident.map_y,m.image_height);
+    S.fieldMapCallPoint=callPoint;
+    S.fieldMapCallMarker=L.marker(callPoint,{icon:fieldIncidentMapIcon()})
+      .addTo(map)
+      .bindPopup(`<strong>${esc(incident.incident_number)}</strong><br>${esc(incident.landmark||"")}`)
+      .openPopup();
+    map.setView(callPoint,0);
   }else{
     map.fitBounds([[0,0],[m.image_height,m.image_width]]);
   }
@@ -7805,12 +8075,61 @@ async function showFieldMap(incident){
     map.on("click",e=>{
       const px=leafletToPixel(e.latlng,m.image_height);
       const geo=pixelToGeo(px.x,px.y,m.georef_coefficients);
-      document.querySelector("#fieldMapReadout").textContent=`${m.name} · ${geo.lat.toFixed(6)}, ${geo.lon.toFixed(6)}`;
+      const readout=document.querySelector("#fieldMapReadout");
+      if(readout)readout.textContent=`${m.name} · ${geo.lat.toFixed(6)}, ${geo.lon.toFixed(6)}`;
     });
+  }
+
+  document.querySelector("#fieldMapClose")?.addEventListener("click",()=>{
+    clearFieldUnitMap();
+    holder.innerHTML="";
+  });
+
+  document.querySelector("#fieldMapFit")?.addEventListener("click",()=>fitFieldMapToCallAndUnit());
+
+  const locate=async({fit=true}={})=>{
+    const button=document.querySelector("#fieldMapLocateMe");
+    if(button){
+      button.disabled=true;
+      button.textContent="Locating…";
+    }
+    setFieldMapMessage(S.locationWatchId!=null?"Waiting for live GPS fix…":"Getting a one-time device GPS fix…");
+    try{
+      const location=await getDevicePositionOnce(S.fieldMapUnit.id);
+      updateFieldMapUnitLocation(location,{fit});
+    }catch(error){
+      setFieldMapMessage(error.message,{error:true});
+    }finally{
+      if(button){
+        button.disabled=false;
+        button.textContent="Refresh My Location";
+      }
+    }
+  };
+
+  document.querySelector("#fieldMapLocateMe")?.addEventListener("click",()=>locate({fit:true}));
+
+  const starting=await getFieldMapStartingLocation(S.fieldMapUnit.id);
+  if(starting){
+    updateFieldMapUnitLocation(starting,{fit:true});
+  }else{
+    // Opening "View Call & My Location" is an intentional location action.
+    // Use a one-time local fix even when Dispatch sharing is off; it is not
+    // uploaded unless the user separately enables Live Unit Location.
+    await locate({fit:true});
+  }
+
+  if(unitLayerId&&incident.map_layer_id&&unitLayerId!==incident.map_layer_id){
+    const unitLevel=layerName(unitLayerId)||"another venue level";
+    const callLevel=layerName(incident.map_layer_id)||m.name;
+    const current=document.querySelector("#fieldMapRelation")?.textContent||"";
+    setFieldMapMessage(`${current}${current?" · ":""}Level note: you are on ${unitLevel}; the call is on ${callLevel}.`);
   }
 }
 
 async function leaveField(){
+  clearFieldUnitMap();
+  S.fieldLocalLocation=null;
   if(S.fieldSession?.unit_id)await stopFieldLocationSharing(S.fieldSession.unit_id,{notifyServer:true});
   if(S.fieldSession?.id)await supabase.rpc("field_end_session",{p_field_session_id:S.fieldSession.id});
   await supabase.auth.signOut();S.mode=null;reset();clearNavigationState();route();
@@ -8030,6 +8349,7 @@ function subscribeField(unitId,sessionId){
 }
 function cleanupRealtime(){
   S.realtime.forEach(ch=>supabase.removeChannel(ch));S.realtime=[];
+  clearFieldUnitMap();
   S.unitLocationMarkers.clear();
   if(S.map){try{S.map.remove()}catch{}}S.map=null;
   clearCommandMap();
@@ -8048,6 +8368,8 @@ function reset(){
   S.locationLastSentAt=0;
   S.locationLastSent=null;
   S.locationWriteInFlight=false;
+  S.fieldLocalLocation=null;
+  clearFieldUnitMap();
   S.unitLocations=[];
   S.unitLocationMarkers.clear();
   S.emsUnitConfigs=[];

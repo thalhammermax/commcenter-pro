@@ -4620,3 +4620,69 @@ body.modal-open{
     grid-template-columns:1fr;
   }
 }
+
+/* v0.13.9 — Field Unit call-relative live map */
+.field-map-toolbar{
+  display:flex;
+  align-items:flex-start;
+  justify-content:space-between;
+  gap:10px;
+  flex-wrap:wrap;
+  margin-top:12px;
+}
+.field-map-actions{
+  display:flex;
+  gap:7px;
+  flex-wrap:wrap;
+}
+.field-map-legend{
+  display:flex;
+  align-items:center;
+  gap:14px;
+  flex-wrap:wrap;
+  margin-top:4px;
+}
+.field-map-legend>span{
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+}
+.field-map-legend-dot{
+  width:10px;
+  height:10px;
+  border-radius:50%;
+  display:inline-block;
+  border:2px solid #fff;
+}
+.field-map-call-dot{background:#dc2626;}
+.field-map-unit-dot{background:#2563eb;}
+.field-unit-call-map{
+  height:420px;
+  margin-top:8px;
+  border-radius:10px;
+  overflow:hidden;
+  border:1px solid #334155;
+}
+.field-map-relation{
+  margin-top:7px;
+}
+.field-map-readout{
+  margin-top:6px;
+}
+.field-map-unit-marker{
+  stroke:#dbeafe;
+  fill:#2563eb;
+}
+.field-map-unit-different-level{
+  stroke:#fde68a;
+  fill:#ca8a04;
+}
+.field-map-relation-line{
+  stroke:#93c5fd;
+}
+@media (max-width:640px){
+  .field-unit-call-map{height:340px;}
+  .field-map-actions{width:100%;}
+  .field-map-actions .btn{flex:1 1 auto;}
+}
+
