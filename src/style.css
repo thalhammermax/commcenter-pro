@@ -4427,3 +4427,36 @@ body.modal-open{
     justify-items:start;
   }
 }
+
+/* ============================================================
+   v0.13.2 — EDITABLE UNIT / TREATMENT AREA DETAILS
+   ============================================================ */
+
+.resource-edit-panel{
+  margin:12px 0 16px;
+  padding:14px;
+  border:1px solid #38536e;
+  border-left:4px solid #5c94c6;
+  border-radius:10px;
+  background:#0b1a29;
+}
+
+.resource-edit-panel h3{
+  margin:2px 0 0;
+}
+
+.resource-edit-panel .row.end{
+  justify-content:flex-end;
+}
+
+.treatment-admin-accepting{
+  display:grid;
+  gap:8px;
+  align-content:start;
+}
+
+@media(max-width:650px){
+  .resource-edit-panel{
+    padding:11px;
+  }
+}

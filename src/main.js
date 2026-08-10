@@ -4653,11 +4653,94 @@ function adminUnitListHtml(){
           <span class="badge status-${esc(u.status)}">${esc(statusLabel(u.status))}</span>
           ${ems?`<span class="badge">${esc(ems.ems_role==="ambulance"?"EMS Ambulance":ems.ems_role==="field_team"?"EMS Field Team":"EMS Command")}</span>`:""}
         </div>
-        <div class="small muted">${esc(dep?.name||"No department")}</div>
+        <div class="small muted">${esc(dep?.name||"No department")}${u.home_landmark?` · Home / Staging: ${esc(u.home_landmark)}`:""}</div>
       </div>
-      ${currentUserCanAdminEventUi()?`<button class="btn danger compact" data-archive-unit="${u.id}">Remove</button>`:""}
+      ${currentUserCanAdminEventUi()?`<div class="nav">
+        <button class="btn secondary compact" data-edit-unit="${u.id}">Edit</button>
+        <button class="btn danger compact" data-archive-unit="${u.id}">Remove</button>
+      </div>`:""}
     </div>`;
   }).join("")||`<div class="small muted">No active units configured.</div>`;
+}
+
+function renderUnitDetailsEditor(unitId){
+  const host=document.querySelector("#unitDetailsEditor");
+  if(!host)return;
+
+  const unit=S.units.find(u=>u.id===unitId);
+  if(!unit){host.innerHTML="";return;}
+
+  host.innerHTML=`<div class="resource-edit-panel stack">
+    <div class="row">
+      <div>
+        <div class="section-title">EDIT UNIT</div>
+        <h3>${esc(unit.name)}</h3>
+      </div>
+      <button class="btn secondary compact" id="cancelUnitDetailsEdit">Cancel</button>
+    </div>
+
+    <div class="grid2">
+      <div>
+        <label>Unit Name</label>
+        <input id="editUnitName" value="${esc(unit.name)}" placeholder="Unit name">
+      </div>
+      <div>
+        <label>Department</label>
+        <select id="editUnitDepartment">
+          ${S.departments.filter(d=>d.active!==false).map(d=>`<option value="${d.id}" ${d.id===unit.department_id?"selected":""}>${esc(d.name)}</option>`).join("")}
+        </select>
+      </div>
+    </div>
+
+    <div>
+      <label>Home / Staging Location</label>
+      <input id="editUnitHomeLandmark" value="${esc(unit.home_landmark||"")}" placeholder="Optional home post, staging location, or normal assignment area">
+      <div class="small muted">This is configuration only. Current CAD status remains controlled from Unit Controls / Field CAD.</div>
+    </div>
+
+    <div class="notice">
+      <strong>Department changes are protected.</strong><br>
+      CommCenter will allow a rename or staging-location change while the unit is operating, but it will refuse to move the unit to another department while it has an active Field session, CAD assignment, EMS patient custody, or open Guest Logistics movement.
+    </div>
+
+    <div class="row end">
+      <button class="btn" id="saveUnitDetails">Save Unit Details</button>
+    </div>
+    <div id="unitDetailsMessage" class="small destructive-error"></div>
+  </div>`;
+
+  document.querySelector("#cancelUnitDetailsEdit").onclick=()=>{host.innerHTML="";};
+  document.querySelector("#saveUnitDetails").onclick=async()=>{
+    const name=document.querySelector("#editUnitName").value.trim();
+    const departmentId=document.querySelector("#editUnitDepartment").value;
+    const home=document.querySelector("#editUnitHomeLandmark").value.trim();
+    const message=document.querySelector("#unitDetailsMessage");
+    const button=document.querySelector("#saveUnitDetails");
+
+    if(!name){message.textContent="Unit Name is required.";return;}
+    if(!departmentId){message.textContent="Choose a department.";return;}
+
+    message.textContent="";
+    button.disabled=true;
+    button.textContent="Saving…";
+
+    const {error}=await supabase.rpc("admin_update_unit_details",{
+      p_unit_id:unit.id,
+      p_name:name,
+      p_department_id:departmentId,
+      p_home_landmark:home||null
+    });
+
+    if(error){
+      button.disabled=false;
+      button.textContent="Save Unit Details";
+      message.textContent=error.message;
+      return;
+    }
+
+    await loadEventOps();
+    renderEventSetup();
+  };
 }
 
 async function renderArchivedResourcesModal(){
@@ -5750,6 +5833,8 @@ function renderEventSetup(){
         ${currentUserCanAdminEventUi()?`<button class="btn secondary compact" id="archivedResources">Archived Resources</button>`:""}
       </div>
       <div id="adminUnits" class="admin-resource-list">${adminUnitListHtml()}</div>
+      <div id="unitDetailsEditor"></div>
+      <div class="section-title">Add Unit</div>
       <div class="grid2">
         <select id="unitDept"><option value="">Department</option>${S.departments.map(d=>`<option value="${d.id}">${esc(d.name)}</option>`).join("")}</select>
         <input id="unitName" placeholder="Unit name">
@@ -5835,6 +5920,8 @@ function renderEventSetup(){
       }
     });
   });
+
+  document.querySelectorAll("[data-edit-unit]").forEach(btn=>btn.onclick=()=>renderUnitDetailsEditor(btn.dataset.editUnit));
 
   document.querySelectorAll("[data-archive-unit]").forEach(btn=>btn.onclick=()=>{
     const unit=S.units.find(u=>u.id===btn.dataset.archiveUnit);

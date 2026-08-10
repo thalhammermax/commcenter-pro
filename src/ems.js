@@ -447,10 +447,21 @@ export async function renderEmsAdmin(container,ctx,onRefresh){
     <div class="card">
       <h2>EMS Treatment Areas</h2>
       <p class="muted">Treatment areas are stationary EMS receiving locations. Their tablets use the event ID/PIN and then select a treatment area.</p>
-      ${areas.map(a=>`<div class="ems-admin-row">
-        <div><strong>${esc(a.name)}</strong><div class="small muted">Capacity ${a.capacity} · ${esc(a.status)} · ${a.accepting_patients?"Accepting":"Not accepting"}${a.poi_id?` · POI ${esc(pois.find(p=>p.id===a.poi_id)?.name||"")}`:""}</div></div>
-        <button class="btn danger compact" data-remove-area="${a.id}">Remove</button>
-      </div>`).join("")||`<div class="muted">No treatment areas configured.</div>`}
+      ${areas.map(a=>{
+        const dep=departments.find(d=>d.id===a.department_id);
+        return `<div class="ems-admin-row">
+          <div>
+            <strong>${esc(a.name)}</strong>
+            <div class="small muted">Capacity ${a.capacity} · ${esc(a.status)} · ${a.accepting_patients?"Accepting":"Not accepting"}${dep?` · ${esc(dep.name)}`:""}${a.poi_id?` · POI ${esc(pois.find(p=>p.id===a.poi_id)?.name||"")}`:""}</div>
+            ${a.notes?`<div class="small muted">${esc(a.notes)}</div>`:""}
+          </div>
+          <div class="nav">
+            <button class="btn secondary compact" data-edit-area="${a.id}">Edit</button>
+            <button class="btn danger compact" data-remove-area="${a.id}">Remove</button>
+          </div>
+        </div>`;
+      }).join("")||`<div class="muted">No treatment areas configured.</div>`}
+      <div id="treatmentAreaEditor"></div>
       <hr>
       <div class="grid2">
         <div><label>Name</label><input id="taName" placeholder="Treatment area name"></div>
@@ -483,6 +494,113 @@ export async function renderEmsAdmin(container,ctx,onRefresh){
       <div class="notice ok"><strong>CommCenter Pro → Treatment Area Station</strong><br>Event ID: <span class="mono">${esc(event?.event_code||"")}</span><br>Use the same 4-digit field PIN configured for the event, then select the treatment area.</div>
     </div>
   </div>`;
+
+  const renderTreatmentAreaEditor=areaId=>{
+    const host=document.querySelector("#treatmentAreaEditor");
+    const area=areas.find(a=>a.id===areaId);
+    if(!host||!area)return;
+
+    host.innerHTML=`<div class="resource-edit-panel stack">
+      <div class="row">
+        <div>
+          <div class="section-title">EDIT TREATMENT AREA</div>
+          <h3>${esc(area.name)}</h3>
+        </div>
+        <button class="btn secondary compact" id="cancelTreatmentAreaEdit">Cancel</button>
+      </div>
+
+      <div class="grid2">
+        <div>
+          <label>Name</label>
+          <input id="editTaName" value="${esc(area.name)}" placeholder="Treatment area name">
+        </div>
+        <div>
+          <label>Capacity</label>
+          <input id="editTaCapacity" type="number" min="1" value="${area.capacity}">
+        </div>
+        <div>
+          <label>Department</label>
+          <select id="editTaDept">
+            <option value="">No department link</option>
+            ${departments.filter(d=>d.active!==false).map(d=>`<option value="${d.id}" ${d.id===area.department_id?"selected":""}>${esc(d.name)}</option>`).join("")}
+          </select>
+        </div>
+        <div>
+          <label>POI / Common Location</label>
+          <select id="editTaPoi">
+            <option value="">No POI</option>
+            ${pois.filter(p=>p.active!==false).map(p=>`<option value="${p.id}" ${p.id===area.poi_id?"selected":""}>${esc(p.name)}</option>`).join("")}
+          </select>
+        </div>
+        <div>
+          <label>Operational Status</label>
+          <select id="editTaStatus">
+            ${["OPEN","LIMITED","FULL","CLOSED"].map(status=>`<option value="${status}" ${status===area.status?"selected":""}>${status}</option>`).join("")}
+          </select>
+        </div>
+        <div class="treatment-admin-accepting">
+          <label>Receiving State</label>
+          <label style="font-weight:500"><input id="editTaAccepting" type="checkbox" ${area.accepting_patients?"checked":""}> Accepting patients</label>
+        </div>
+      </div>
+
+      <div>
+        <label>Notes</label>
+        <textarea id="editTaNotes" rows="3" placeholder="Optional Treatment Area notes">${esc(area.notes||"")}</textarea>
+      </div>
+
+      <div class="notice">
+        <strong>Live patient state is protected.</strong><br>
+        Capacity cannot be reduced below the current census. CommCenter will also refuse to move a Treatment Area to another department while it has patients in census, inbound transports, pending handoffs, or an active Treatment Area Station session.
+      </div>
+
+      <div class="row end">
+        <button class="btn" id="saveTreatmentAreaDetails">Save Treatment Area Details</button>
+      </div>
+      <div id="treatmentAreaEditMessage" class="small destructive-error"></div>
+    </div>`;
+
+    document.querySelector("#cancelTreatmentAreaEdit").onclick=()=>{host.innerHTML="";};
+    document.querySelector("#editTaStatus").onchange=event=>{
+      if(event.target.value==="CLOSED")document.querySelector("#editTaAccepting").checked=false;
+    };
+
+    document.querySelector("#saveTreatmentAreaDetails").onclick=async()=>{
+      const name=document.querySelector("#editTaName").value.trim();
+      const capacity=Number(document.querySelector("#editTaCapacity").value);
+      const message=document.querySelector("#treatmentAreaEditMessage");
+      const button=document.querySelector("#saveTreatmentAreaDetails");
+
+      if(!name){message.textContent="Treatment Area name is required.";return;}
+      if(!Number.isInteger(capacity)||capacity<1){message.textContent="Capacity must be at least 1.";return;}
+
+      message.textContent="";
+      button.disabled=true;
+      button.textContent="Saving…";
+
+      const {error}=await supabase.rpc("admin_update_treatment_area_details",{
+        p_treatment_area_id:area.id,
+        p_name:name,
+        p_capacity:capacity,
+        p_department_id:document.querySelector("#editTaDept").value||null,
+        p_poi_id:document.querySelector("#editTaPoi").value||null,
+        p_notes:document.querySelector("#editTaNotes").value.trim()||null,
+        p_status:document.querySelector("#editTaStatus").value,
+        p_accepting_patients:document.querySelector("#editTaAccepting").checked
+      });
+
+      if(error){
+        button.disabled=false;
+        button.textContent="Save Treatment Area Details";
+        message.textContent=error.message;
+        return;
+      }
+
+      await onRefresh();
+    };
+  };
+
+  document.querySelectorAll("[data-edit-area]").forEach(button=>button.onclick=()=>renderTreatmentAreaEditor(button.dataset.editArea));
 
   document.querySelector("#addTreatmentArea").onclick=async()=>{
     const name=document.querySelector("#taName").value.trim();
