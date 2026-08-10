@@ -32,6 +32,8 @@ const S={
   commandUnitLayer:null,
   commandRefreshTimer:null,
   commandClockInterval:null,
+  commandTreatmentSummaries:[],
+  commandTreatmentRefreshInterval:null,
   mapPickMode:null,
   pendingIncidentDraft:null,
   fieldReportSessionOwned:false
@@ -4409,6 +4411,84 @@ function commandDisplayDepartmentControls(){
       </button>
     `).join("");
 }
+function commandTreatmentCenterClass(summary){
+  const capacity=Math.max(1,Number(summary?.capacity)||1);
+  const census=Math.max(0,Number(summary?.census_count)||0);
+  const pct=Math.round(census/capacity*100);
+  const status=String(summary?.status||"").toUpperCase();
+  if(status==="CLOSED"||summary?.accepting_patients===false)return "closed";
+  if(status==="FULL"||census>=capacity)return "full";
+  if(status==="LIMITED"||pct>=80)return "limited";
+  return "open";
+}
+
+function commandTreatmentCentersHtml(){
+  const rows=S.commandTreatmentSummaries||[];
+  if(!rows.length)return "";
+
+  return `<div class="command-treatment-centers-inner">
+    <div class="command-treatment-centers-label">
+      <span>TREATMENT CENTERS</span>
+      <small>Live census</small>
+    </div>
+    <div class="command-treatment-center-grid">
+      ${rows.map(row=>{
+        const capacity=Math.max(1,Number(row.capacity)||1);
+        const census=Math.max(0,Number(row.census_count)||0);
+        const inbound=Math.max(0,Number(row.inbound_count)||0);
+        const pct=Math.min(100,Math.max(0,Math.round(census/capacity*100)));
+        const stateClass=commandTreatmentCenterClass(row);
+        return `<article class="command-treatment-center-card command-treatment-${stateClass}">
+          <div class="command-treatment-center-heading">
+            <strong>${esc(row.name)}</strong>
+            <span class="badge ta-${esc(row.status)}">${esc(row.status)}</span>
+          </div>
+          <div class="command-treatment-center-body">
+            <div class="command-treatment-census">
+              <strong>${census} / ${capacity}</strong>
+              <span>Census</span>
+            </div>
+            <div class="command-treatment-inbound">
+              <strong>${inbound}</strong>
+              <span>Inbound</span>
+            </div>
+          </div>
+          <div class="command-treatment-progress" aria-label="${pct}% occupied"><div style="width:${pct}%"></div></div>
+          <div class="command-treatment-center-footer">
+            <span>${pct}% occupied</span>
+            <span>${row.accepting_patients?"Accepting":"Not accepting"}</span>
+          </div>
+        </article>`;
+      }).join("")}
+    </div>
+  </div>`;
+}
+
+function renderCommandTreatmentCenters(){
+  const host=document.querySelector("#commandTreatmentCenters");
+  if(!host)return;
+  const html=commandTreatmentCentersHtml();
+  host.innerHTML=html;
+  host.classList.toggle("hidden",!html);
+}
+
+async function loadCommandTreatmentSummary(){
+  const {data,error}=await supabase.rpc("command_treatment_center_summary",{p_event_id:S.eventId});
+  if(error)throw error;
+  S.commandTreatmentSummaries=data||[];
+  return S.commandTreatmentSummaries;
+}
+
+async function refreshCommandTreatmentSummary(){
+  if(!document.querySelector("#commandDisplayShell"))return;
+  try{
+    await loadCommandTreatmentSummary();
+    renderCommandTreatmentCenters();
+  }catch(error){
+    console.warn("Command Treatment Center census refresh failed",error);
+  }
+}
+
 function renderCommandDisplayLayout(){
   const content=document.querySelector("#commandDisplayContent");
   if(!content)return;
@@ -4436,6 +4516,7 @@ async function refreshCommandDisplayStructure(){
   try{
     if(S.mode==="command")await loadCommandDisplayOps();
     else await loadEventOps();
+    await loadCommandTreatmentSummary();
   }catch(error){
     console.warn("Command Display refresh failed",error);
     if(S.mode==="command")return commandAccessError(error.message);
@@ -4546,6 +4627,7 @@ async function commandDisplayPage({publicAccess=S.mode==="command"}={}){
   try{
     if(publicAccess)await loadCommandDisplayOps();
     else await loadEventOps();
+    await loadCommandTreatmentSummary();
   }catch(error){
     if(publicAccess)return commandAccessError(error.message);
     alert(error.message);
@@ -4592,6 +4674,7 @@ async function commandDisplayPage({publicAccess=S.mode==="command"}={}){
       </div>
     </div>
 
+    <section class="command-treatment-centers" id="commandTreatmentCenters"></section>
     <main id="commandDisplayContent"></main>
   </div>`;
 
@@ -4622,10 +4705,13 @@ async function commandDisplayPage({publicAccess=S.mode==="command"}={}){
   };
 
   bindCommandDisplayControls();
+  renderCommandTreatmentCenters();
   renderCommandDisplayLayout();
   updateCommandClock();
   if(S.commandClockInterval)clearInterval(S.commandClockInterval);
   S.commandClockInterval=setInterval(updateCommandClock,1000);
+  if(S.commandTreatmentRefreshInterval)clearInterval(S.commandTreatmentRefreshInterval);
+  S.commandTreatmentRefreshInterval=setInterval(refreshCommandTreatmentSummary,5000);
   ensureCallTimerTicker();
   ensureLocationAgeTicker();
   subscribeCommandDisplay();
@@ -7845,6 +7931,7 @@ function cleanupRealtime(){
   clearCommandMap();
   if(S.commandRefreshTimer){clearTimeout(S.commandRefreshTimer);S.commandRefreshTimer=null;}
   if(S.commandClockInterval){clearInterval(S.commandClockInterval);S.commandClockInterval=null;}
+  if(S.commandTreatmentRefreshInterval){clearInterval(S.commandTreatmentRefreshInterval);S.commandTreatmentRefreshInterval=null;}
 }
 function reset(){
   if(S.locationWatchId!=null&&navigator.geolocation){
@@ -7869,6 +7956,7 @@ function reset(){
   S.commandDepartmentIds=[];
   S.commandDisplayMode="calls";
   S.commandActiveMapLayerId=null;
+  S.commandTreatmentSummaries=[];
   S.mapPickMode=null;
   S.pendingIncidentDraft=null;
   S.openUnitId=null;

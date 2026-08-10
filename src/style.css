@@ -4460,3 +4460,163 @@ body.modal-open{
     padding:11px;
   }
 }
+
+
+/* ============================================================
+   v0.13.4 — COMMAND BOARD TREATMENT CENTER CENSUS
+   ============================================================ */
+
+.command-display-shell{
+  grid-template-rows:auto auto auto minmax(0,1fr);
+}
+
+.command-treatment-centers{
+  padding:8px 22px 10px;
+  border-bottom:1px solid #233149;
+  background:#07101c;
+}
+
+.command-treatment-centers-inner{
+  display:grid;
+  grid-template-columns:140px minmax(0,1fr);
+  gap:10px;
+  align-items:stretch;
+}
+
+.command-treatment-centers-label{
+  display:flex;
+  flex-direction:column;
+  justify-content:center;
+  padding:7px 0;
+}
+
+.command-treatment-centers-label span{
+  color:#93c5fd;
+  font-size:11px;
+  font-weight:900;
+  letter-spacing:.08em;
+}
+
+.command-treatment-centers-label small{
+  margin-top:2px;
+  color:#64748b;
+}
+
+.command-treatment-center-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(210px,1fr));
+  gap:7px;
+}
+
+.command-treatment-center-card{
+  min-width:0;
+  padding:8px 10px;
+  border:1px solid #334155;
+  border-left:4px solid #3b82f6;
+  border-radius:9px;
+  background:#0b1324;
+}
+
+.command-treatment-center-card.command-treatment-limited{
+  border-left-color:#f59e0b;
+}
+
+.command-treatment-center-card.command-treatment-full,
+.command-treatment-center-card.command-treatment-closed{
+  border-left-color:#ef4444;
+}
+
+.command-treatment-center-heading{
+  display:flex;
+  justify-content:space-between;
+  gap:8px;
+  align-items:center;
+}
+
+.command-treatment-center-heading strong{
+  overflow:hidden;
+  color:#f1f5f9;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+}
+
+.command-treatment-center-body{
+  display:grid;
+  grid-template-columns:1fr .7fr;
+  gap:8px;
+  margin-top:6px;
+}
+
+.command-treatment-census,
+.command-treatment-inbound{
+  display:grid;
+  grid-template-columns:auto 1fr;
+  gap:5px;
+  align-items:baseline;
+}
+
+.command-treatment-census strong,
+.command-treatment-inbound strong{
+  color:#f8fafc;
+  font-size:17px;
+  font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;
+}
+
+.command-treatment-census span,
+.command-treatment-inbound span{
+  color:#94a3b8;
+  font-size:10px;
+  text-transform:uppercase;
+}
+
+.command-treatment-progress{
+  height:4px;
+  overflow:hidden;
+  margin-top:6px;
+  border-radius:999px;
+  background:#1e293b;
+}
+
+.command-treatment-progress>div{
+  height:100%;
+  border-radius:999px;
+  background:#3b82f6;
+}
+
+.command-treatment-limited .command-treatment-progress>div{
+  background:#f59e0b;
+}
+
+.command-treatment-full .command-treatment-progress>div,
+.command-treatment-closed .command-treatment-progress>div{
+  background:#ef4444;
+}
+
+.command-treatment-center-footer{
+  display:flex;
+  justify-content:space-between;
+  gap:8px;
+  margin-top:4px;
+  color:#64748b;
+  font-size:9px;
+  text-transform:uppercase;
+}
+
+@media(max-width:950px){
+  .command-treatment-centers-inner{
+    grid-template-columns:1fr;
+  }
+  .command-treatment-centers-label{
+    padding-bottom:0;
+  }
+}
+
+@media(max-width:560px){
+  .command-treatment-centers{
+    padding-left:10px;
+    padding-right:10px;
+  }
+  .command-treatment-center-grid{
+    grid-template-columns:1fr;
+  }
+}
