@@ -18,7 +18,7 @@ const S={
   guestLogisticsMovements:[],
   emsUnitConfigs:[],treatmentAreas:[],activeMapLayerId:null,map:null,realtime:[],
   fieldSession:null,commandSession:null,currentLocation:null,isPlatformAdmin:false,callTimerInterval:null,
-  unitLocations:[],unitLocationMarkers:new Map(),locationAgeInterval:null,
+  unitLocations:[],unitLocationMarkers:new Map(),incidentMarkers:new Map(),locationAgeInterval:null,
   locationWatchId:null,locationLastSentAt:0,locationLastSent:null,locationWriteInFlight:false,
   openIncidentId:null,openUnitId:null,incidentModalMode:null,
   dispatchLayout:null,
@@ -36,8 +36,12 @@ const S={
   commandTreatmentRefreshInterval:null,
   dispatchUnitSyncInterval:null,
   dispatchUnitSyncInFlight:false,
+  dispatchIncidentSyncInFlight:false,
+  dispatchIncidentSnapshot:[],
+  dispatchIncidentSnapshotLoaded:false,
   dispatchRealtimeStatus:null,
   dispatchLastSyncAt:null,
+  dispatchIncidentLastSyncAt:null,
   dispatchVisibilityHandler:null,
   dispatchFocusHandler:null,
   fieldMap:null,
@@ -1541,6 +1545,19 @@ async function loadEventOps(){
   S.departments=depsRes.data||[];
   S.units=unitsRes.data||[];
   S.incidents=incidents;
+  S.dispatchIncidentSnapshot=incidents.map(i=>({
+    id:i.id,
+    incident_number:i.incident_number,
+    status:i.status,
+    map_x:i.map_x,
+    map_y:i.map_y,
+    map_layer_id:i.map_layer_id,
+    call_type:i.call_type,
+    priority:i.priority,
+    landmark:i.landmark,
+    closed_at:i.closed_at
+  }));
+  S.dispatchIncidentSnapshotLoaded=true;
   S.pois=poisRes.data||[];
   S.eventMap=eventMapRes.data||null;
   S.mapLayers=mapLayersRes.data||[];
@@ -3389,6 +3406,63 @@ function updateOperationalPeriodDispatchUi(){
   }
 }
 
+function clearDispatchIncidentMarkers(){
+  for(const marker of S.incidentMarkers.values()){
+    try{marker.remove();}catch{}
+  }
+  S.incidentMarkers.clear();
+}
+
+function dispatchMapIncidentRows(){
+  if(S.dispatchIncidentSnapshotLoaded)return S.dispatchIncidentSnapshot||[];
+  return S.incidents||[];
+}
+
+function renderDispatchIncidentMarkers(){
+  if(!S.map)return;
+  const layer=activeMapLayer();
+  if(!layer){
+    clearDispatchIncidentMarkers();
+    return;
+  }
+
+  const rows=dispatchMapIncidentRows().filter(i=>{
+    const local=S.incidents.find(x=>x.id===i.id)||i;
+    return i.status!=="CLOSED"
+      && incidentInDispatchScope(local)
+      && (!i.map_layer_id||i.map_layer_id===layer.id)
+      && i.map_x!=null
+      && i.map_y!=null;
+  });
+
+  const wanted=new Set(rows.map(i=>i.id));
+
+  for(const [incidentId,marker] of [...S.incidentMarkers.entries()]){
+    if(!wanted.has(incidentId)){
+      try{marker.remove();}catch{}
+      S.incidentMarkers.delete(incidentId);
+    }
+  }
+
+  for(const incident of rows){
+    const latlng=pixelToLeaflet(incident.map_x,incident.map_y,layer.image_height);
+    let marker=S.incidentMarkers.get(incident.id);
+
+    if(!marker){
+      marker=L.circleMarker(latlng,{radius:8,className:"incident-marker"})
+        .addTo(S.map)
+        .bindTooltip(incident.incident_number||"Incident");
+      marker.on("click",()=>{
+        if(S.incidents.some(i=>i.id===incident.id))selectIncident(incident.id);
+      });
+      S.incidentMarkers.set(incident.id,marker);
+    }else{
+      marker.setLatLng(latlng);
+      if(marker.getTooltip())marker.setTooltipContent(incident.incident_number||"Incident");
+    }
+  }
+}
+
 function refreshDispatchBoards(){
   const incidentHost=document.querySelector("#incidentList");
   const unitHost=document.querySelector("#unitList");
@@ -3397,6 +3471,10 @@ function refreshDispatchBoards(){
   updateOperationalPeriodDispatchUi();
   bindIncidentClicks();
   refreshLocationAges();
+  // Leaflet layers are not part of the DOM-based board render. Explicitly
+  // reconcile incident markers so a closed/moved call is removed immediately
+  // without rebuilding the entire map or forcing a page refresh.
+  renderDispatchIncidentMarkers();
 }
 
 
@@ -3696,6 +3774,7 @@ function selectUnit(unitId){
 
 async function setupDispatchMap(){
   S.unitLocationMarkers.clear();
+  clearDispatchIncidentMarkers();
   if(S.map){try{S.map.remove()}catch{}S.map=null;}
 
   if(S.dispatchLayout?.mapVisible===false||!document.querySelector("#map")){
@@ -3720,9 +3799,7 @@ async function setupDispatchMap(){
     const ap=S.accessPoints.find(a=>a.id===n.access_point_id);
     L.circleMarker(pixelToLeaflet(n.map_x,n.map_y,layer.image_height),{radius:6,className:"access-marker"}).addTo(S.map).bindTooltip(`${ap?.name||"Access"} · ${ap?.access_type||""}`);
   }
-  for(const i of S.incidents.filter(i=>incidentInDispatchScope(i)&&(!i.map_layer_id||i.map_layer_id===layer.id))){
-    if(i.map_x!=null&&i.map_y!=null)L.circleMarker(pixelToLeaflet(i.map_x,i.map_y,layer.image_height),{radius:8,className:"incident-marker"}).addTo(S.map).bindTooltip(i.incident_number);
-  }
+  renderDispatchIncidentMarkers();
   renderAllUnitLocationMarkers();
   if(layer.georef_coefficients){
     S.map.on("click",async e=>{
@@ -8252,16 +8329,84 @@ async function syncDispatcherUnitStatuses(){
   }
 }
 
+function incidentSnapshotSignature(row){
+  return [
+    row.id,
+    row.status||"",
+    row.map_layer_id||"",
+    row.map_x==null?"":Number(row.map_x).toFixed(4),
+    row.map_y==null?"":Number(row.map_y).toFixed(4),
+    row.incident_number||"",
+    row.call_type||"",
+    row.priority||"",
+    row.landmark||"",
+    row.closed_at||""
+  ].join("|");
+}
+
+async function syncDispatcherIncidentState(){
+  if(S.dispatchIncidentSyncInFlight || !S.eventId || !document.querySelector("#dispatchWorkspace"))return;
+  S.dispatchIncidentSyncInFlight=true;
+
+  try{
+    const {data,error}=await supabase.rpc("dispatch_active_incident_snapshot",{p_event_id:S.eventId});
+    if(error)throw error;
+
+    const next=data||[];
+    const previous=S.dispatchIncidentSnapshotLoaded?(S.dispatchIncidentSnapshot||[]):S.incidents||[];
+    const previousSignature=previous.map(incidentSnapshotSignature).sort().join("\n");
+    const nextSignature=next.map(incidentSnapshotSignature).sort().join("\n");
+    const changed=previousSignature!==nextSignature;
+
+    S.dispatchIncidentSnapshot=next;
+    S.dispatchIncidentSnapshotLoaded=true;
+    S.dispatchIncidentLastSyncAt=new Date().toISOString();
+
+    // Marker reconciliation is independent of a full CAD re-render. This is
+    // what guarantees that a CLOSED call disappears from the map even if the
+    // browser missed its Realtime event.
+    renderDispatchIncidentMarkers();
+
+    if(changed){
+      const editing=S.incidentModalMode==="edit"&&document.querySelector("[data-incident-modal-mode='edit']");
+      if(editing){
+        const footer=document.querySelector(".incident-modal-footer");
+        if(footer&&!document.querySelector("#incidentExternalUpdate")){
+          footer.insertAdjacentHTML("afterbegin",`<div class="notice" id="incidentExternalUpdate">Other CAD data changed while you are editing. The active-call board and map are continuing to synchronize; your unsaved fields are preserved.</div>`);
+        }
+      }else{
+        await refreshDispatchStructure();
+      }
+    }
+  }catch(error){
+    console.warn("Dispatch incident snapshot failed",error);
+    updateDispatchSyncIndicator({ok:false,message:`Incident synchronization failed: ${error.message}`});
+  }finally{
+    S.dispatchIncidentSyncInFlight=false;
+  }
+}
+
 function startDispatcherUnitStatusFallback(){
   if(S.dispatchUnitSyncInterval)clearInterval(S.dispatchUnitSyncInterval);
   // One authoritative snapshot per second is deliberately small (unit state
   // only) and makes Dispatch self-healing even if Realtime is unavailable.
-  S.dispatchUnitSyncInterval=setInterval(()=>syncDispatcherUnitStatuses(),1000);
+  S.dispatchUnitSyncInterval=setInterval(()=>{
+    syncDispatcherUnitStatuses();
+    syncDispatcherIncidentState();
+  },1000);
 
   if(S.dispatchVisibilityHandler)document.removeEventListener("visibilitychange",S.dispatchVisibilityHandler);
   if(S.dispatchFocusHandler)window.removeEventListener("focus",S.dispatchFocusHandler);
-  S.dispatchVisibilityHandler=()=>{if(document.visibilityState==="visible")syncDispatcherUnitStatuses();};
-  S.dispatchFocusHandler=()=>syncDispatcherUnitStatuses();
+  S.dispatchVisibilityHandler=()=>{
+    if(document.visibilityState==="visible"){
+      syncDispatcherUnitStatuses();
+      syncDispatcherIncidentState();
+    }
+  };
+  S.dispatchFocusHandler=()=>{
+    syncDispatcherUnitStatuses();
+    syncDispatcherIncidentState();
+  };
   document.addEventListener("visibilitychange",S.dispatchVisibilityHandler);
   window.addEventListener("focus",S.dispatchFocusHandler);
 }
@@ -8286,7 +8431,10 @@ function subscribeDispatch(){
     // Structural changes refresh the call/unit boards while preserving an open
     // incident modal. If the call editor has unsaved changes, the refresh is
     // deferred rather than destroying dispatcher input.
-    .on("postgres_changes",{event:"*",schema:"public",table:"incidents",filter:`event_id=eq.${S.eventId}`},()=>refreshDispatchStructure())
+    .on("postgres_changes",{event:"*",schema:"public",table:"incidents",filter:`event_id=eq.${S.eventId}`},()=>{
+      syncDispatcherIncidentState();
+      refreshDispatchStructure();
+    })
     .on("postgres_changes",{event:"*",schema:"public",table:"operational_periods",filter:`event_id=eq.${S.eventId}`},()=>refreshDispatchStructure())
     .on("postgres_changes",{event:"*",schema:"public",table:"guest_logistics_movements",filter:`event_id=eq.${S.eventId}`},()=>refreshDispatchStructure())
     .on("postgres_changes",{event:"*",schema:"public",table:"incident_units"},()=>refreshDispatchStructure())
@@ -8298,10 +8446,12 @@ function subscribeDispatch(){
       if(status==="SUBSCRIBED"){
         updateDispatchSyncIndicator({ok:true});
         syncDispatcherUnitStatuses();
+        syncDispatcherIncidentState();
       }else if(status==="CHANNEL_ERROR"||status==="TIMED_OUT"||status==="CLOSED"){
         console.warn(`Dispatch realtime channel status: ${status}. Authoritative database heartbeat remains active.`);
         updateDispatchSyncIndicator({ok:true,message:`Realtime ${status}; database heartbeat is still active.`});
         syncDispatcherUnitStatuses();
+        syncDispatcherIncidentState();
       }
     });
 
@@ -8375,6 +8525,7 @@ function cleanupRealtime(){
   S.realtime.forEach(ch=>supabase.removeChannel(ch));S.realtime=[];
   clearFieldUnitMap();
   S.unitLocationMarkers.clear();
+  clearDispatchIncidentMarkers();
   if(S.map){try{S.map.remove()}catch{}}S.map=null;
   clearCommandMap();
   if(S.commandRefreshTimer){clearTimeout(S.commandRefreshTimer);S.commandRefreshTimer=null;}
@@ -8384,8 +8535,12 @@ function cleanupRealtime(){
   if(S.dispatchVisibilityHandler){document.removeEventListener("visibilitychange",S.dispatchVisibilityHandler);S.dispatchVisibilityHandler=null;}
   if(S.dispatchFocusHandler){window.removeEventListener("focus",S.dispatchFocusHandler);S.dispatchFocusHandler=null;}
   S.dispatchUnitSyncInFlight=false;
+  S.dispatchIncidentSyncInFlight=false;
+  S.dispatchIncidentSnapshot=[];
+  S.dispatchIncidentSnapshotLoaded=false;
   S.dispatchRealtimeStatus=null;
   S.dispatchLastSyncAt=null;
+  S.dispatchIncidentLastSyncAt=null;
 }
 function reset(){
   if(S.locationWatchId!=null&&navigator.geolocation){

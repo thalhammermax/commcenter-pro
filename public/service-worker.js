@@ -1,4 +1,4 @@
-const CACHE = "commcenter-pro-v0.14.1";
+const CACHE = "commcenter-pro-v0.14.2";
 const CORE = ["/", "/manifest.webmanifest"];
 
 self.addEventListener("install", event => {
@@ -12,6 +12,15 @@ self.addEventListener("activate", event => {
 
 self.addEventListener("fetch", event => {
   if (event.request.method !== "GET") return;
+
+  const requestUrl = new URL(event.request.url);
+
+  // Only cache CommCenter's own application shell/static assets.
+  // Supabase REST/Realtime/Storage and every other cross-origin request must
+  // always go directly to the network so CAD operational data can never be
+  // satisfied from a service-worker cache.
+  if (requestUrl.origin !== self.location.origin) return;
+
   event.respondWith(
     fetch(event.request)
       .then(response => {
