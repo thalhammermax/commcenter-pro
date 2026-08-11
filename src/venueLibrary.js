@@ -57,6 +57,13 @@ export async function applyVenueVersionToEvent({eventId,versionId,onProgress=()=
   const payload=data||{};
   const layers=payload.layers||[];
 
+  const {data:venueLayerMeta,error:venueLayerMetaError}=await supabase
+    .from("organization_venue_map_layers")
+    .select("id,pdf_crop_x,pdf_crop_y,pdf_crop_width,pdf_crop_height")
+    .eq("version_id",versionId);
+  if(venueLayerMetaError)throw venueLayerMetaError;
+  const venueLayerMetaById=new Map((venueLayerMeta||[]).map(row=>[row.id,row]));
+
   for(let index=0;index<layers.length;index++){
     const layer=layers[index];
     onProgress(`Copying map layer ${index+1} of ${layers.length}: ${layer.name||"Map"}…`);
@@ -74,9 +81,14 @@ export async function applyVenueVersionToEvent({eventId,versionId,onProgress=()=
       await copyStorageObject(layer.rendered_image_path,imagePath);
     }
 
+    const cropMeta=venueLayerMetaById.get(layer.venue_layer_id)||{};
     const {error:updateError}=await supabase.from("event_map_layers").update({
       source_pdf_path:pdfPath,
       rendered_image_path:imagePath,
+      pdf_crop_x:cropMeta.pdf_crop_x??0,
+      pdf_crop_y:cropMeta.pdf_crop_y??0,
+      pdf_crop_width:cropMeta.pdf_crop_width??1,
+      pdf_crop_height:cropMeta.pdf_crop_height??1,
       status:layer.source_status||"draft",
       published_at:layer.source_published_at||null,
       updated_at:new Date().toISOString()
@@ -102,6 +114,14 @@ export async function saveEventToVenueLibrary({
 }){
   onProgress("Creating venue version…");
 
+  const {data:eventLayerMeta,error:eventLayerMetaError}=await supabase
+    .from("event_map_layers")
+    .select("id,pdf_crop_x,pdf_crop_y,pdf_crop_width,pdf_crop_height")
+    .eq("event_id",eventId)
+    .eq("active",true);
+  if(eventLayerMetaError)throw eventLayerMetaError;
+  const eventLayerMetaById=new Map((eventLayerMeta||[]).map(row=>[row.id,row]));
+
   const {data,error}=await supabase.rpc("save_event_as_venue_version",{
     p_event_id:eventId,
     p_venue_id:venueId||null,
@@ -118,6 +138,13 @@ export async function saveEventToVenueLibrary({
   }
 
   const layers=payload.layers||[];
+
+  const {data:savedVenueLayers,error:savedVenueLayersError}=await supabase
+    .from("organization_venue_map_layers")
+    .select("id,source_event_layer_id")
+    .eq("version_id",payload.version_id);
+  if(savedVenueLayersError)throw savedVenueLayersError;
+  const savedVenueLayerById=new Map((savedVenueLayers||[]).map(row=>[row.id,row]));
 
   for(let index=0;index<layers.length;index++){
     const layer=layers[index];
@@ -137,9 +164,15 @@ export async function saveEventToVenueLibrary({
       await copyStorageObject(layer.rendered_image_path,imagePath);
     }
 
+    const savedVenueLayer=savedVenueLayerById.get(layer.venue_layer_id);
+    const sourceMeta=eventLayerMetaById.get(savedVenueLayer?.source_event_layer_id)||{};
     const {error:updateError}=await supabase.from("organization_venue_map_layers").update({
       source_pdf_path:pdfPath,
-      rendered_image_path:imagePath
+      rendered_image_path:imagePath,
+      pdf_crop_x:sourceMeta.pdf_crop_x??0,
+      pdf_crop_y:sourceMeta.pdf_crop_y??0,
+      pdf_crop_width:sourceMeta.pdf_crop_width??1,
+      pdf_crop_height:sourceMeta.pdf_crop_height??1
     }).eq("id",layer.venue_layer_id);
 
     if(updateError)throw updateError;

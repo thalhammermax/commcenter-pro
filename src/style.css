@@ -4731,3 +4731,149 @@ body.modal-open{
   background:#450a0a;
 }
 
+/* v0.14.6 — PDF map crop editor */
+body.pdf-crop-open{
+  overflow:hidden;
+}
+.crop-option{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  margin:9px 0;
+  color:var(--cc-muted,#9eb4ca);
+  font-size:13px;
+}
+.crop-option input{
+  width:auto;
+  margin:0;
+}
+.pdf-crop-backdrop{
+  position:fixed;
+  inset:0;
+  z-index:12000;
+  display:none;
+  align-items:center;
+  justify-content:center;
+  padding:18px;
+  background:rgba(0,0,0,.78);
+}
+.pdf-crop-backdrop.open{
+  display:flex;
+}
+.pdf-crop-modal{
+  width:min(1320px,98vw);
+  max-height:96vh;
+  display:flex;
+  flex-direction:column;
+  overflow:hidden;
+  border:1px solid #344b63;
+  border-radius:14px;
+  background:#091522;
+  color:#e8f2ff;
+  box-shadow:0 24px 80px rgba(0,0,0,.6);
+}
+.pdf-crop-header,
+.pdf-crop-footer{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  gap:14px;
+  padding:14px 16px;
+  background:#0c1928;
+}
+.pdf-crop-header{
+  border-bottom:1px solid #26394d;
+}
+.pdf-crop-header h2{
+  margin:0;
+}
+.pdf-crop-footer{
+  border-top:1px solid #26394d;
+}
+.pdf-crop-help{
+  padding:10px 16px;
+  background:#102033;
+  color:#b9cde1;
+  font-size:13px;
+}
+.pdf-crop-stage{
+  min-height:0;
+  flex:1;
+  overflow:auto;
+  padding:16px;
+  text-align:center;
+  background:#050b12;
+}
+.pdf-crop-canvas-wrap{
+  position:relative;
+  display:inline-block;
+  max-width:100%;
+  line-height:0;
+  cursor:crosshair;
+  touch-action:none;
+  user-select:none;
+  box-shadow:0 5px 24px rgba(0,0,0,.5);
+}
+.pdf-crop-canvas{
+  display:block;
+  width:auto;
+  height:auto;
+  max-width:100%;
+  max-height:68vh;
+  background:white;
+}
+.pdf-crop-selection{
+  position:absolute;
+  z-index:3;
+  border:2px solid #59b2ff;
+  box-shadow:0 0 0 9999px rgba(0,0,0,.52);
+  pointer-events:none;
+}
+.pdf-crop-selection::before,
+.pdf-crop-selection::after{
+  content:"";
+  position:absolute;
+  width:10px;
+  height:10px;
+  border-radius:50%;
+  background:#59b2ff;
+  border:2px solid white;
+}
+.pdf-crop-selection::before{
+  left:-6px;
+  top:-6px;
+}
+.pdf-crop-selection::after{
+  right:-6px;
+  bottom:-6px;
+}
+.pdf-crop-actions{
+  display:flex;
+  justify-content:flex-end;
+  gap:8px;
+  flex-wrap:wrap;
+}
+@media(max-width:760px){
+  .pdf-crop-backdrop{
+    padding:6px;
+  }
+  .pdf-crop-modal{
+    width:100%;
+    max-height:98vh;
+  }
+  .pdf-crop-header,
+  .pdf-crop-footer{
+    align-items:flex-start;
+    flex-direction:column;
+  }
+  .pdf-crop-actions{
+    width:100%;
+  }
+  .pdf-crop-actions .btn{
+    flex:1;
+  }
+  .pdf-crop-canvas{
+    max-height:58vh;
+  }
+}
+
