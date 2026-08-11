@@ -1682,9 +1682,9 @@ function poiMapIcon(){
   return L.divIcon({
     className:"cc-leaflet-div-icon",
     html:`<span class="cc-map-pin cc-poi-pin" aria-hidden="true"><span class="cc-map-pin-dot"></span></span>`,
-    iconSize:[26,32],
-    iconAnchor:[13,31],
-    tooltipAnchor:[0,-28]
+    iconSize:[20,20],
+    iconAnchor:[10,10],
+    tooltipAnchor:[0,-10]
   });
 }
 

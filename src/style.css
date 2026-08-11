@@ -1364,7 +1364,19 @@ body.modal-open{
   border-radius:50%;
   background:#fff;
 }
-.cc-poi-pin{background:#2563eb;}
+.cc-poi-pin{
+  width:10px;
+  height:10px;
+  margin:5px;
+  border:1px solid rgba(255,255,255,.72);
+  border-radius:50%;
+  background:#2563eb;
+  transform:none;
+  box-shadow:0 1px 3px rgba(0,0,0,.32);
+  opacity:.48;
+  transition:opacity .12s ease,transform .12s ease,box-shadow .12s ease;
+}
+.cc-poi-pin .cc-map-pin-dot{display:none;}
 .cc-field-incident-pin{
   width:24px;
   height:24px;
@@ -2740,12 +2752,19 @@ body.modal-open{
   line-height:1.3;
 }
 
-/* POI markers are operational controls now; reinforce interactivity without
-   changing their existing visual identity. */
+/* v0.14.5 — POIs stay intentionally quiet so dense venue maps remain readable.
+   The transparent Leaflet icon remains 20×20 for a usable click target while the
+   visible mark is only a small, semi-transparent dot. Hover/focus temporarily
+   strengthens the selected POI. */
 .cc-poi-pin{
   cursor:pointer;
 }
-
+.leaflet-marker-icon:hover .cc-poi-pin,
+.leaflet-marker-icon:focus .cc-poi-pin{
+  opacity:.95;
+  transform:scale(1.35);
+  box-shadow:0 1px 5px rgba(0,0,0,.5);
+}
 .leaflet-marker-icon:focus .cc-poi-pin{
   outline:2px solid #60a5fa;
   outline-offset:3px;
