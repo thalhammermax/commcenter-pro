@@ -36,6 +36,7 @@ export async function renderMapBuilder(app,eventId,onBack){
   function layerOptionHtml(){return layers.map(l=>`<option value="${l.id}" ${l.id===activeLayer?.id?"selected":""}>${esc(l.name)}${l.level_code?` · ${esc(l.level_code)}`:""}${l.status==="published"?" ✓":""}</option>`).join("");}
   function currentZones(){return zones.filter(z=>z.map_layer_id===activeLayer?.id);}
   function currentPois(){return pois.filter(p=>p.map_layer_id===activeLayer?.id);}
+  function poiAliasList(p){return (p?.poi_aliases||[]).map(a=>a.alias).filter(Boolean);}
 
   function renderControls(){
     const controls=document.querySelector("#builderControls");
@@ -68,7 +69,26 @@ export async function renderMapBuilder(app,eventId,onBack){
   }
 
   function zoneHtml(){return currentZones().map(z=>`<div class="poi-row"><div class="row"><strong>${esc(z.name)}</strong><span class="badge">${esc(z.short_name||"")}</span></div></div>`).join("")||`<div class="small muted">No zones on this level.</div>`;}
-  function poiHtml(){return currentPois().map(p=>{const z=zones.find(x=>x.id===p.zone_id);return `<div class="poi-row"><div class="row"><strong>${esc(p.name)}</strong><span class="badge">${p.poi_scope==="venue_snapshot"?"Venue":"Event"}</span></div><span class="small muted">${esc(z?.name||"")}</span></div>`;}).join("")||`<div class="small muted">No POIs on this level.</div>`;}
+  function poiHtml(){
+    return currentPois().map(p=>{
+      const z=zones.find(x=>x.id===p.zone_id);
+      const aliases=poiAliasList(p);
+      return `<div class="poi-row">
+        <div class="row">
+          <div>
+            <strong>${esc(p.name)}</strong>
+            <span class="badge">${p.poi_scope==="venue_snapshot"?"Venue":"Event"}</span>
+          </div>
+          <div class="row" style="gap:6px">
+            <button class="btn secondary compact" data-edit-poi="${p.id}">Edit</button>
+            <button class="btn danger compact" data-delete-poi="${p.id}">Delete</button>
+          </div>
+        </div>
+        <div class="small muted">${esc([p.category,z?.name].filter(Boolean).join(" · "))}</div>
+        ${aliases.length?`<div class="small muted">Aliases: ${esc(aliases.join(", "))}</div>`:""}
+      </div>`;
+    }).join("")||`<div class="small muted">No POIs on this level.</div>`;
+  }
   function accessHtml(){return accessPoints.map(ap=>{const linked=accessNodes.filter(n=>n.access_point_id===ap.id).map(n=>layers.find(l=>l.id===n.map_layer_id)?.short_name||layers.find(l=>l.id===n.map_layer_id)?.name).filter(Boolean);return `<div class="poi-row"><strong>${esc(ap.name)}</strong> <span class="badge">${esc(ap.access_type)}</span><br><span class="small muted">${esc(linked.join(" ↕ "))}</span></div>`;}).join("")||`<div class="small muted">No vertical access points yet.</div>`;}
 
   function bindControls(){
@@ -82,6 +102,8 @@ export async function renderMapBuilder(app,eventId,onBack){
     document.querySelectorAll("[data-delcp]").forEach(b=>b.onclick=async()=>{await supabase.from("map_control_points").delete().eq("id",b.dataset.delcp);await loadAll(activeLayer.id);});
     document.querySelector("#addZone").onclick=addZone;
     document.querySelector("#addPoi").onclick=()=>{if(!coeff)return alert("Georeference this layer first.");clickMode="poi";document.querySelector("#pendingPoi").innerHTML=`<div class="notice">Click the POI on ${esc(activeLayer.name)}.</div>`;};
+    document.querySelectorAll("[data-edit-poi]").forEach(b=>b.onclick=()=>showEditPoiForm(b.dataset.editPoi));
+    document.querySelectorAll("[data-delete-poi]").forEach(b=>b.onclick=()=>deletePoi(b.dataset.deletePoi));
     document.querySelector("#addAccess").onclick=()=>{if(!coeff)return alert("Georeference this layer first.");clickMode="access";document.querySelector("#pendingAccess").innerHTML=`<div class="notice">Click the access point on ${esc(activeLayer.name)}.</div>`;};
     document.querySelector("#publishLayer").onclick=publishLayer;
   }
@@ -93,9 +115,33 @@ export async function renderMapBuilder(app,eventId,onBack){
 
   async function setupMap(){if(map){map.remove();map=null;}map=L.map("builderMap",{crs:L.CRS.Simple,minZoom:-4,maxZoom:5,zoomSnap:.25,attributionControl:false});layerGroup=L.layerGroup().addTo(map);if(!activeLayer?.rendered_image_path){map.setView([0,0],0);return;}const url=await signedMapUrl(activeLayer.rendered_image_path);const bounds=[[0,0],[activeLayer.image_height,activeLayer.image_width]];L.imageOverlay(url,bounds).addTo(map);map.fitBounds(bounds);
     for(const cp of points)L.circleMarker(pixelToLeaflet(cp.map_x,cp.map_y,activeLayer.image_height),{radius:6}).addTo(layerGroup).bindTooltip(`CP: ${cp.label}`);
-    for(const p of currentPois())L.marker(pixelToLeaflet(p.map_x,p.map_y,activeLayer.image_height),{icon:poiMapIcon()}).addTo(layerGroup).bindTooltip(p.name,{direction:"top",offset:[0,-4]});
+    for(const p of currentPois()){
+      const marker=L.marker(pixelToLeaflet(p.map_x,p.map_y,activeLayer.image_height),{icon:poiMapIcon()})
+        .addTo(layerGroup)
+        .bindTooltip(p.name,{direction:"top",offset:[0,-4]});
+      marker.on("click",e=>{
+        L.DomEvent.stopPropagation(e);
+        showEditPoiForm(p.id);
+      });
+    }
     for(const n of accessNodes.filter(n=>n.map_layer_id===activeLayer.id)){const ap=accessPoints.find(a=>a.id===n.access_point_id);L.circleMarker(pixelToLeaflet(n.map_x,n.map_y,activeLayer.image_height),{radius:7}).addTo(layerGroup).bindTooltip(`${ap?.name||"Access"} · ${ap?.access_type||""}`);}
-    map.on("click",async e=>{const px=leafletToPixel(e.latlng,activeLayer.image_height);if(clickMode==="control"){clickMode=null;showControlForm(px);}else if(clickMode==="poi"){clickMode=null;await showPoiForm(px);}else if(clickMode==="access"){clickMode=null;await showAccessForm(px);}});
+    map.on("click",async e=>{
+      const px=leafletToPixel(e.latlng,activeLayer.image_height);
+      if(clickMode==="control"){
+        clickMode=null;
+        showControlForm(px);
+      }else if(clickMode==="poi"){
+        clickMode=null;
+        await showPoiForm(px);
+      }else if(clickMode?.type==="move-poi"){
+        const poiId=clickMode.poiId;
+        clickMode=null;
+        await movePoiToPixel(poiId,px);
+      }else if(clickMode==="access"){
+        clickMode=null;
+        await showAccessForm(px);
+      }
+    });
   }
   function showControlForm(px){document.querySelector("#pendingControl").innerHTML=`<div class="card stack"><input id="cpLabel" placeholder="Control point label"><input id="cpLat" placeholder="Latitude"><input id="cpLon" placeholder="Longitude"><button class="btn" id="saveCp">Save Control Point</button></div>`;document.querySelector("#saveCp").onclick=async()=>{const row={event_id:eventId,map_layer_id:activeLayer.id,label:document.querySelector("#cpLabel").value.trim(),map_x:px.x,map_y:px.y,latitude:Number(document.querySelector("#cpLat").value),longitude:Number(document.querySelector("#cpLon").value)};if(!row.label||!Number.isFinite(row.latitude)||!Number.isFinite(row.longitude))return alert("Complete all fields.");const {error}=await supabase.from("map_control_points").insert(row);if(error)alert(error.message);else await loadAll(activeLayer.id);};}
   async function showPoiForm(px){
@@ -139,6 +185,121 @@ export async function renderMapBuilder(app,eventId,onBack){
       }
       await loadAll(activeLayer.id);
     };
+  }
+
+
+  function showEditPoiForm(poiId){
+    const p=pois.find(x=>x.id===poiId);
+    if(!p)return alert("POI not found.");
+    const aliases=poiAliasList(p).join(", ");
+
+    document.querySelector("#pendingPoi").innerHTML=`<div class="card stack">
+      <div class="row">
+        <div>
+          <div class="section-title">Edit POI</div>
+          <strong>${esc(p.name)}</strong>
+        </div>
+        <span class="badge">${p.poi_scope==="venue_snapshot"?"Venue snapshot":"Event"}</span>
+      </div>
+      ${p.poi_scope==="venue_snapshot"?`<div class="notice small">This POI came from the venue snapshot. Changes here apply to this event copy only; they do not modify the saved Venue Library version.</div>`:""}
+      <label>Name</label>
+      <input id="editPoiName" value="${esc(p.name)}" placeholder="POI name">
+      <label>Category</label>
+      <select id="editPoiCategory">
+        ${["Seating Section","Medical","Command","Gate","Portal","Concession","Restroom","Production","Security","Other"].map(category=>`<option value="${esc(category)}" ${p.category===category?"selected":""}>${esc(category)}</option>`).join("")}
+      </select>
+      <label>Zone</label>
+      <select id="editPoiZone"><option value="">No zone</option>${currentZones().map(z=>`<option value="${z.id}" ${p.zone_id===z.id?"selected":""}>${esc(z.name)}</option>`).join("")}</select>
+      <label>Aliases</label>
+      <input id="editPoiAliases" value="${esc(aliases)}" placeholder="Comma-separated aliases">
+      <label>Notes</label>
+      <textarea id="editPoiNotes" placeholder="Optional notes">${esc(p.notes||"")}</textarea>
+      <div class="small muted">Coordinates: ${Number(p.latitude).toFixed(7)}, ${Number(p.longitude).toFixed(7)}</div>
+      <div class="grid2">
+        <button class="btn" id="savePoiChanges">Save Changes</button>
+        <button class="btn secondary" id="movePoi">Move on Map</button>
+      </div>
+      <div class="grid2">
+        <button class="btn secondary" id="cancelPoiEdit">Cancel</button>
+        <button class="btn danger" id="deletePoiFromEdit">Delete POI</button>
+      </div>
+    </div>`;
+
+    document.querySelector("#savePoiChanges").onclick=()=>savePoiChanges(p);
+    document.querySelector("#movePoi").onclick=()=>{
+      if(!coeff)return alert("Georeference this layer first.");
+      clickMode={type:"move-poi",poiId:p.id};
+      document.querySelector("#pendingPoi").innerHTML=`<div class="notice">Click the new location for <strong>${esc(p.name)}</strong> on ${esc(activeLayer.name)}. Its name, category, aliases, zone, and notes will be preserved.</div>`;
+    };
+    document.querySelector("#cancelPoiEdit").onclick=()=>{clickMode=null;document.querySelector("#pendingPoi").innerHTML="";};
+    document.querySelector("#deletePoiFromEdit").onclick=()=>deletePoi(p.id);
+  }
+
+  async function savePoiChanges(p){
+    const name=document.querySelector("#editPoiName").value.trim();
+    if(!name)return alert("Enter a POI name.");
+
+    const aliases=document.querySelector("#editPoiAliases").value
+      .split(",")
+      .map(x=>x.trim())
+      .filter(Boolean);
+
+    const button=document.querySelector("#savePoiChanges");
+    button.disabled=true;
+    button.textContent="Saving…";
+
+    const {error}=await supabase.rpc("admin_update_event_poi",{
+      p_poi_id:p.id,
+      p_name:name,
+      p_category:document.querySelector("#editPoiCategory").value,
+      p_zone_id:document.querySelector("#editPoiZone").value||null,
+      p_notes:document.querySelector("#editPoiNotes").value.trim()||null,
+      p_aliases:aliases
+    });
+
+    if(error){
+      button.disabled=false;
+      button.textContent="Save Changes";
+      return alert(error.message);
+    }
+
+    await loadAll(activeLayer.id);
+  }
+
+  async function movePoiToPixel(poiId,px){
+    const p=pois.find(x=>x.id===poiId);
+    if(!p)return alert("POI not found.");
+    if(!coeff)return alert("Georeference this layer first.");
+
+    const geo=pixelToGeo(px.x,px.y,coeff);
+    const {error}=await supabase.rpc("admin_move_event_poi",{
+      p_poi_id:p.id,
+      p_map_layer_id:activeLayer.id,
+      p_zone_id:p.zone_id||null,
+      p_latitude:geo.lat,
+      p_longitude:geo.lon,
+      p_map_x:px.x,
+      p_map_y:px.y
+    });
+
+    if(error)return alert(error.message);
+    await loadAll(activeLayer.id);
+    showEditPoiForm(poiId);
+  }
+
+  async function deletePoi(poiId){
+    const p=pois.find(x=>x.id===poiId);
+    if(!p)return alert("POI not found.");
+
+    const message=`Delete "${p.name}" from this event?\n\nIt will immediately disappear from the active map and POI search. Existing incident/history references are preserved because CommCenter archives the POI rather than physically deleting the database row.`;
+    if(!confirm(message))return;
+
+    const {error}=await supabase.rpc("admin_archive_event_poi",{p_poi_id:p.id});
+    if(error)return alert(error.message);
+
+    clickMode=null;
+    document.querySelector("#pendingPoi").innerHTML="";
+    await loadAll(activeLayer.id);
   }
 
   async function showAccessForm(px){
