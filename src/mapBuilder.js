@@ -68,7 +68,21 @@ export async function renderMapBuilder(app,eventId,onBack){
     });
   }
 
-  function zoneHtml(){return currentZones().map(z=>`<div class="poi-row"><div class="row"><strong>${esc(z.name)}</strong><span class="badge">${esc(z.short_name||"")}</span></div></div>`).join("")||`<div class="small muted">No zones on this level.</div>`;}
+  function zoneHtml(){
+    return currentZones().map(z=>`<div class="poi-row">
+      <div class="row">
+        <div>
+          <strong>${esc(z.name)}</strong>
+          ${z.short_name?`<span class="badge">${esc(z.short_name)}</span>`:""}
+        </div>
+        <div class="row" style="gap:6px">
+          <button class="btn secondary compact" data-edit-zone="${z.id}">Edit</button>
+          <button class="btn danger compact" data-delete-zone="${z.id}">Delete</button>
+        </div>
+      </div>
+      <div class="small muted">${esc([z.category,z.notes].filter(Boolean).join(" · "))}</div>
+    </div>`).join("")||`<div class="small muted">No zones on this level.</div>`;
+  }
   function poiHtml(){
     return currentPois().map(p=>{
       const z=zones.find(x=>x.id===p.zone_id);
@@ -101,6 +115,8 @@ export async function renderMapBuilder(app,eventId,onBack){
     document.querySelector("#calculate").onclick=calculateGeoref;
     document.querySelectorAll("[data-delcp]").forEach(b=>b.onclick=async()=>{await supabase.from("map_control_points").delete().eq("id",b.dataset.delcp);await loadAll(activeLayer.id);});
     document.querySelector("#addZone").onclick=addZone;
+    document.querySelectorAll("[data-edit-zone]").forEach(b=>b.onclick=()=>showEditZoneForm(b.dataset.editZone));
+    document.querySelectorAll("[data-delete-zone]").forEach(b=>b.onclick=()=>deleteZone(b.dataset.deleteZone));
     document.querySelector("#addPoi").onclick=()=>{if(!coeff)return alert("Georeference this layer first.");clickMode="poi";document.querySelector("#pendingPoi").innerHTML=`<div class="notice">Click the POI on ${esc(activeLayer.name)}.</div>`;};
     document.querySelectorAll("[data-edit-poi]").forEach(b=>b.onclick=()=>showEditPoiForm(b.dataset.editPoi));
     document.querySelectorAll("[data-delete-poi]").forEach(b=>b.onclick=()=>deletePoi(b.dataset.deletePoi));
@@ -111,7 +127,103 @@ export async function renderMapBuilder(app,eventId,onBack){
   async function createLayer(){const name=document.querySelector("#layerName").value.trim();if(!name)return alert("Enter a layer name.");const {data,error}=await supabase.from("event_map_layers").insert({event_id:eventId,name,short_name:document.querySelector("#layerShort").value.trim()||null,level_code:document.querySelector("#layerShort").value.trim()||null,level_type:document.querySelector("#layerType").value,sort_order:(layers.length+1)*10,is_default:layers.length===0}).select().single();if(error)return alert(error.message);await loadAll(data.id);}
   async function uploadPdf(){const file=document.querySelector("#pdfFile").files[0];if(!file)return alert("Choose a PDF.");const st=document.querySelector("#uploadStatus");try{st.textContent="Rendering PDF…";const r=await renderFirstPdfPage(file,5000);const base=`${eventId}/layers/${activeLayer.id}`;let up=await supabase.storage.from("event-assets").upload(`${base}/source.pdf`,file,{upsert:true,contentType:"application/pdf"});if(up.error)throw up.error;up=await supabase.storage.from("event-assets").upload(`${base}/map.webp`,r.blob,{upsert:true,contentType:"image/webp"});if(up.error)throw up.error;const {error}=await supabase.from("event_map_layers").update({source_pdf_path:`${base}/source.pdf`,rendered_image_path:`${base}/map.webp`,image_width:r.width,image_height:r.height,status:"draft",updated_at:new Date().toISOString()}).eq("id",activeLayer.id);if(error)throw error;await loadAll(activeLayer.id);}catch(e){st.textContent=e.message;}}
   async function calculateGeoref(){try{const result=fitAffine(points);for(const r of result.residuals)await supabase.from("map_control_points").update({residual_m:r.meters}).eq("id",r.id);const {error}=await supabase.from("event_map_layers").update({georef_method:"affine",georef_coefficients:result.coefficients,georef_rmse_m:result.rmse,georef_max_error_m:result.max,status:"calibrated",updated_at:new Date().toISOString()}).eq("id",activeLayer.id);if(error)throw error;await loadAll(activeLayer.id);}catch(e){alert(e.message);}}
-  async function addZone(){const name=document.querySelector("#zoneName").value.trim();if(!name)return alert("Enter a zone name.");const {error}=await supabase.from("event_zones").insert({event_id:eventId,map_layer_id:activeLayer.id,name,short_name:document.querySelector("#zoneShort").value.trim()||null});if(error)alert(error.message);else await loadAll(activeLayer.id);}
+  async function addZone(){
+    const name=document.querySelector("#zoneName").value.trim();
+    if(!name)return alert("Enter a zone name.");
+    const {error}=await supabase.from("event_zones").insert({
+      event_id:eventId,
+      map_layer_id:activeLayer.id,
+      name,
+      short_name:document.querySelector("#zoneShort").value.trim()||null
+    });
+    if(error)alert(error.message);
+    else await loadAll(activeLayer.id);
+  }
+
+  function showEditZoneForm(zoneId){
+    const z=zones.find(x=>x.id===zoneId);
+    if(!z)return alert("Zone not found.");
+
+    const sourceNotice=z.source_venue_zone_id
+      ?`<div class="notice small">This zone came from the venue snapshot. Changes here apply only to this event copy; the saved Venue Library version is not modified.</div>`
+      :"";
+
+    document.querySelector("#zoneList").innerHTML=`<div class="card stack">
+      <div class="row">
+        <div>
+          <div class="section-title">Edit Zone</div>
+          <strong>${esc(z.name)}</strong>
+        </div>
+        ${z.short_name?`<span class="badge">${esc(z.short_name)}</span>`:""}
+      </div>
+      ${sourceNotice}
+      <label>Name</label>
+      <input id="editZoneName" value="${esc(z.name)}" placeholder="Zone name">
+      <label>Short name</label>
+      <input id="editZoneShort" value="${esc(z.short_name||"")}" placeholder="Short name">
+      <label>Category</label>
+      <input id="editZoneCategory" value="${esc(z.category||"")}" placeholder="Optional category">
+      <label>Notes</label>
+      <textarea id="editZoneNotes" placeholder="Optional notes">${esc(z.notes||"")}</textarea>
+      <label>Sort order</label>
+      <input id="editZoneSort" type="number" step="1" value="${Number.isFinite(Number(z.sort_order))?Number(z.sort_order):100}">
+      <div class="grid2">
+        <button class="btn" id="saveZoneChanges">Save Changes</button>
+        <button class="btn secondary" id="cancelZoneEdit">Cancel</button>
+      </div>
+      <button class="btn danger block" id="deleteZoneFromEdit">Delete Zone</button>
+    </div>`;
+
+    document.querySelector("#saveZoneChanges").onclick=()=>saveZoneChanges(z);
+    document.querySelector("#cancelZoneEdit").onclick=()=>renderControls();
+    document.querySelector("#deleteZoneFromEdit").onclick=()=>deleteZone(z.id);
+  }
+
+  async function saveZoneChanges(z){
+    const name=document.querySelector("#editZoneName").value.trim();
+    if(!name)return alert("Enter a zone name.");
+
+    const sortValue=Number(document.querySelector("#editZoneSort").value);
+    if(!Number.isFinite(sortValue))return alert("Sort order must be a number.");
+
+    const button=document.querySelector("#saveZoneChanges");
+    button.disabled=true;
+    button.textContent="Saving…";
+
+    const {error}=await supabase.rpc("admin_update_event_zone",{
+      p_zone_id:z.id,
+      p_name:name,
+      p_short_name:document.querySelector("#editZoneShort").value.trim()||null,
+      p_category:document.querySelector("#editZoneCategory").value.trim()||null,
+      p_notes:document.querySelector("#editZoneNotes").value.trim()||null,
+      p_sort_order:Math.trunc(sortValue)
+    });
+
+    if(error){
+      button.disabled=false;
+      button.textContent="Save Changes";
+      return alert(error.message);
+    }
+
+    await loadAll(activeLayer.id);
+  }
+
+  async function deleteZone(zoneId){
+    const z=zones.find(x=>x.id===zoneId);
+    if(!z)return alert("Zone not found.");
+
+    const linkedPois=pois.filter(p=>p.zone_id===z.id).length;
+    const detail=linkedPois
+      ?`\n\n${linkedPois} active POI${linkedPois===1?" is":"s are"} assigned to this zone. ${linkedPois===1?"It":"They"} will remain on the map but become unzoned.`
+      :"";
+
+    if(!confirm(`Delete zone "${z.name}" from this event?${detail}\n\nClosed incident history will retain its reference to the archived zone. A zone used by an active incident cannot be deleted until that incident is closed or moved.`))return;
+
+    const {error}=await supabase.rpc("admin_archive_event_zone",{p_zone_id:z.id});
+    if(error)return alert(error.message);
+
+    await loadAll(activeLayer.id);
+  }
 
   async function setupMap(){if(map){map.remove();map=null;}map=L.map("builderMap",{crs:L.CRS.Simple,minZoom:-4,maxZoom:5,zoomSnap:.25,attributionControl:false});layerGroup=L.layerGroup().addTo(map);if(!activeLayer?.rendered_image_path){map.setView([0,0],0);return;}const url=await signedMapUrl(activeLayer.rendered_image_path);const bounds=[[0,0],[activeLayer.image_height,activeLayer.image_width]];L.imageOverlay(url,bounds).addTo(map);map.fitBounds(bounds);
     for(const cp of points)L.circleMarker(pixelToLeaflet(cp.map_x,cp.map_y,activeLayer.image_height),{radius:6}).addTo(layerGroup).bindTooltip(`CP: ${cp.label}`);
