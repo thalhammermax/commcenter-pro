@@ -7716,7 +7716,12 @@ async function fieldUnitCad(){
     .map(block=>fieldBlocks[block.id]||"")
     .join("");
 
-  app.innerHTML=`<div class="shell">${header(`${esc(fs.events?.name||"")} · ${esc(fs.units?.event_departments?.name||"")}`)}
+  const fieldTaskAlertMode=assignmentNeedsAck&&moveNeedsAck?"dual":assignmentNeedsAck?"cad":moveNeedsAck?"move":"";
+  const fieldTaskAlertOverlay=fieldTaskAlertMode
+    ?`<div class="field-task-alert-overlay field-task-alert-${fieldTaskAlertMode}" aria-hidden="true"></div>`
+    :"";
+
+  app.innerHTML=`${fieldTaskAlertOverlay}<div class="shell">${header(`${esc(fs.events?.name||"")} · ${esc(fs.units?.event_departments?.name||"")}`)}
     <div class="field-shell stack">${fieldLayoutHtml}</div>
   </div>`;
   ensureCallTimerTicker();

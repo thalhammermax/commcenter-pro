@@ -5265,3 +5265,42 @@ body.field-dual-task-alert::after{
   body.field-dual-task-alert::after{animation:none!important}
   body.field-move-alert::after{opacity:.9;border-width:9px}
 }
+
+
+/* v0.15.2 — rendered Field Unit task alert overlay.
+   Do not rely solely on a body pseudo-element for MOVE acknowledgement alerts. */
+.field-task-alert-overlay{
+  position:fixed;
+  inset:0;
+  z-index:11950;
+  pointer-events:none;
+  border:8px solid transparent;
+}
+.field-task-alert-overlay.field-task-alert-cad{
+  border-color:rgba(239,68,68,.92);
+  background:rgba(220,38,38,.05);
+  box-shadow:inset 0 0 42px rgba(239,68,68,.72),inset 0 0 120px rgba(185,28,28,.28);
+  animation:cc-field-assignment-pulse 1.05s ease-in-out infinite;
+}
+.field-task-alert-overlay.field-task-alert-move{
+  border-color:rgba(250,204,21,.95);
+  background:rgba(234,179,8,.045);
+  box-shadow:inset 0 0 42px rgba(250,204,21,.68),inset 0 0 120px rgba(161,98,7,.28);
+  animation:cc-field-move-pulse 1.05s ease-in-out infinite;
+}
+.field-task-alert-overlay.field-task-alert-dual{
+  border-color:#ef4444;
+  background:rgba(220,38,38,.05);
+  box-shadow:inset 0 0 52px rgba(239,68,68,.62),inset 0 0 120px rgba(127,29,29,.22);
+  animation:cc-field-dual-task-pulse 1.1s ease-in-out infinite;
+}
+/* The rendered overlay is the authoritative screen pulse. Keep the legacy
+   pseudo-element from painting a second layer over it. */
+body.field-assignment-alert::after,
+body.field-move-alert:not(.field-assignment-alert)::after,
+body.field-dual-task-alert::after{
+  display:none;
+}
+@media(prefers-reduced-motion:reduce){
+  .field-task-alert-overlay{animation:none!important;opacity:.92;border-width:9px}
+}
