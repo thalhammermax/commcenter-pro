@@ -692,6 +692,10 @@ async function movementDetailModal(ctx,state,movementId){
   const movement=state.movements.find(m=>m.id===movementId);
   if(!movement)return;
 
+  const linkedIncidents=(ctx.incidents||[])
+    .filter(incident=>incident.guest_logistics_movement_id===movement.id)
+    .sort((a,b)=>new Date(b.created_at||0).getTime()-new Date(a.created_at||0).getTime());
+
   const activity=await fetchActivity(movement.id);
   const unit=(ctx.units||[]).find(u=>u.id===movement.assigned_unit_id);
   const department=(ctx.departments||[]).find(d=>d.id===movement.department_id);
@@ -752,6 +756,16 @@ async function movementDetailModal(ctx,state,movementId){
 
     ${movement.notes?`<section class="incident-info-section"><div class="section-title">Notes</div><div class="report-notes">${esc(movement.notes)}</div></section>`:""}
 
+    ${linkedIncidents.length?`<section class="incident-info-section logistics-linked-cad-section">
+      <div class="row"><div class="section-title">Linked CAD Tickets</div><span class="badge">${linkedIncidents.length}</span></div>
+      <div class="logistics-linked-cad-list">
+        ${linkedIncidents.map(incident=>`<button type="button" class="choice" data-linked-move-cad="${incident.id}">
+          <strong>${esc(incident.incident_number)} · ${esc(incident.call_type)}</strong>
+          <span>${esc(incident.priority||"Standard")}${incident.landmark?` · ${esc(incident.landmark)}`:""}</span>
+        </button>`).join("")}
+      </div>
+    </section>`:""}
+
     ${!TERMINAL_STATUSES.has(movement.status)?`
       <section class="incident-info-section logistics-driver-section">
         <div class="section-title">Driver Dispatch</div>
@@ -809,6 +823,13 @@ async function movementDetailModal(ctx,state,movementId){
     closeModal();
     ctx.onNewCadTask?.(movement.department_id,movement);
   };
+
+  document.querySelectorAll("[data-linked-move-cad]").forEach(button=>{
+    button.addEventListener("click",()=>{
+      closeModal();
+      ctx.onOpenIncident?.(button.dataset.linkedMoveCad);
+    });
+  });
 
   document.querySelector("#editLogisticsMovement")?.addEventListener("click",()=>movementFormModal(ctx,state,{movement}));
 

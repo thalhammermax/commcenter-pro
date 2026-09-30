@@ -5304,3 +5304,86 @@ body.field-dual-task-alert::after{
 @media(prefers-reduced-motion:reduce){
   .field-task-alert-overlay{animation:none!important;opacity:.92;border-width:9px}
 }
+
+/* v0.15.4 — link CAD incidents to Guest Logistics MOVEs */
+.incident-guest-move-link{
+  display:grid;
+  gap:8px;
+  padding:12px;
+  border:1px solid #725828;
+  border-radius:12px;
+  background:#201a0f;
+}
+.guest-move-search-results{
+  display:grid;
+  gap:5px;
+  max-height:260px;
+  overflow:auto;
+}
+.guest-move-search-result{
+  display:grid;
+  gap:3px;
+  width:100%;
+  padding:10px 11px;
+  text-align:left;
+  color:#e5e7eb;
+  background:#17140d;
+  border:1px solid #5f4a25;
+  border-radius:9px;
+  cursor:pointer;
+}
+.guest-move-search-result:hover,
+.guest-move-search-result:focus{
+  border-color:#d6a84d;
+  background:#241c0e;
+}
+.guest-move-search-result span{
+  color:#d6d3d1;
+  font-size:12px;
+}
+.guest-move-search-result small{
+  color:#a8a29e;
+}
+.guest-move-no-results{
+  padding:7px 2px;
+}
+.guest-move-selected-host:empty{
+  display:none;
+}
+.guest-move-selected-card{
+  padding:10px;
+  border:1px solid #8a692e;
+  border-radius:10px;
+  background:#15120c;
+}
+.incident-linked-move-section{
+  border-color:#725828;
+  background:#17140d;
+}
+.incident-linked-move-grid{
+  display:grid;
+  grid-template-columns:repeat(2,minmax(0,1fr));
+  gap:8px 14px;
+  margin-top:10px;
+}
+.incident-linked-move-grid>div{
+  display:grid;
+  gap:2px;
+}
+.incident-linked-move-route{
+  grid-column:1/-1;
+}
+.logistics-linked-cad-list{
+  display:grid;
+  gap:7px;
+  margin-top:8px;
+}
+.logistics-linked-cad-list .choice{
+  display:grid;
+  gap:3px;
+  text-align:left;
+}
+@media(max-width:620px){
+  .incident-linked-move-grid{grid-template-columns:1fr}
+  .incident-linked-move-route{grid-column:auto}
+}

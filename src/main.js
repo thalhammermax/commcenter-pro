@@ -1398,7 +1398,7 @@ async function loadCommandDisplayOps(){
       .eq("active",true)
       .order("name"),
     supabase.from("guest_logistics_movements")
-      .select("id,event_id,department_id,movement_number,movement_type,guest_name,status,scheduled_at,assigned_unit_id,origin,destination")
+      .select("id,event_id,department_id,movement_number,movement_type,guest_name,guest_group,status,scheduled_at,assigned_unit_id,origin,destination,airline,flight_number,airport,terminal")
       .eq("event_id",S.eventId)
       .not("status","in","(COMPLETE,NO_SHOW,CANCELLED)")
       .not("assigned_unit_id","is",null)
@@ -1509,7 +1509,7 @@ async function loadEventOps(){
     supabase.from("unit_locations").select("*").eq("event_id",S.eventId),
     supabase.from("operational_periods").select("*").eq("event_id",S.eventId).order("created_at"),
     supabase.from("event_dispositions").select("*").eq("event_id",S.eventId).eq("active",true).order("scope").order("sort_order").order("label"),
-    supabase.from("guest_logistics_movements").select("id,event_id,department_id,movement_number,movement_type,guest_name,status,scheduled_at,assigned_unit_id,origin,destination").eq("event_id",S.eventId).not("status","in","(COMPLETE,NO_SHOW,CANCELLED)").order("scheduled_at"),
+    supabase.from("guest_logistics_movements").select("id,event_id,department_id,movement_number,movement_type,guest_name,guest_group,status,scheduled_at,assigned_unit_id,origin,destination,airline,flight_number,airport,terminal").eq("event_id",S.eventId).not("status","in","(COMPLETE,NO_SHOW,CANCELLED)").order("scheduled_at"),
     supabase.from("ems_unit_config").select("*"),
     supabase.from("ems_treatment_areas").select("*").eq("event_id",S.eventId).eq("active",true).order("name")
   ]);
@@ -2215,7 +2215,9 @@ async function guestLogisticsPage({allDepartments=false}={}){
       landmark:movement?.origin||"",
       notes:movement
         ?`${movement.movement_number} · ${movement.guest_name} · ${movement.origin} → ${movement.destination}${movement.flight_number?` · Flight ${movement.flight_number}`:""}`
-        :""
+        :"",
+      guestLogisticsMovementId:movement?.id||null,
+      guestLogisticsMovement:movement||null
     })
   });
 }
@@ -2598,6 +2600,7 @@ function activityTitle(action){
   const labels={
     INCIDENT_CREATED:"Incident created",
     INCIDENT_UPDATED:"Call details updated",
+    GUEST_LOGISTICS_MOVE_LINKED:"Guest Logistics MOVE linked",
     UNIT_ASSIGNED:"Unit assigned",
     UNIT_ASSIGNMENT_ACKNOWLEDGED:"Unit assignment acknowledged",
     UNIT_UNASSIGNED:"Unit unassigned",
@@ -2650,6 +2653,9 @@ function activitySummary(row){
     const destination=d.transport_destination_text||d.destination||"";
     return `${u?.name||row.unit_name||"Unit"}${from||to?` · ${String(from||"").replaceAll("_"," ")}${to?` → ${String(to).replaceAll("_"," ")}`:""}`:""}${destination?` · ${destination}`:""}`;
   }
+  if(row.action==="GUEST_LOGISTICS_MOVE_LINKED"){
+    return `${d.movement_number||"MOVE"}${d.guest_name?` · ${d.guest_name}`:""}${d.flight_number?` · Flight ${d.flight_number}`:""}`;
+  }
   if(row.action==="INCIDENT_UPDATED"){
     const changes=[];
     if(d.old_call_type!==undefined&&d.old_call_type!==d.new_call_type)changes.push(`${d.old_call_type||"Nature"} → ${d.new_call_type||""}`);
@@ -2696,8 +2702,8 @@ function handoffResourceName({unitId,areaId},areas){
   return "Unknown";
 }
 
-async function loadIncidentCommandData(incidentId){
-  const [activityRes,encounterRes,areasRes]=await Promise.all([
+async function loadIncidentCommandData(incidentId,guestMovementId=null){
+  const [activityRes,encounterRes,areasRes,linkedMovementRes]=await Promise.all([
     supabase.from("cad_activity")
       .select("id,action,detail,unit_id,actor_kind,created_at")
       .eq("event_id",S.eventId)
@@ -2716,12 +2722,20 @@ async function loadIncidentCommandData(incidentId){
       .select("id,name,status,accepting_patients")
       .eq("event_id",S.eventId)
       .eq("active",true)
-      .order("name")
+      .order("name"),
+    guestMovementId
+      ?supabase.from("guest_logistics_movements")
+        .select("id,event_id,department_id,movement_number,movement_type,guest_name,guest_group,status,scheduled_at,assigned_unit_id,origin,destination,airline,flight_number,airport,terminal")
+        .eq("event_id",S.eventId)
+        .eq("id",guestMovementId)
+        .maybeSingle()
+      :Promise.resolve({data:null,error:null})
   ]);
 
   if(activityRes.error)console.warn("Incident activity could not be loaded",activityRes.error);
   if(encounterRes.error)console.warn("Incident EMS custody could not be loaded",encounterRes.error);
   if(areasRes.error)console.warn("Treatment areas could not be loaded",areasRes.error);
+  if(linkedMovementRes.error)console.warn("Linked Guest Logistics MOVE could not be loaded",linkedMovementRes.error);
 
   const encounter=encounterRes.data||null;
   let handoffs=[];
@@ -2738,7 +2752,8 @@ async function loadIncidentCommandData(incidentId){
     activity:activityRes.data||[],
     encounter,
     handoffs,
-    areas:areasRes.data||[]
+    areas:areasRes.data||[],
+    linkedMovement:linkedMovementRes.data||null
   };
 }
 
@@ -3241,7 +3256,7 @@ async function selectIncident(id){
   const content=openIncidentModalShell();
   content.innerHTML=`<div class="incident-modal-loading">Loading ${esc(i.incident_number)}…</div>`;
 
-  const extra=await loadIncidentCommandData(id);
+  const extra=await loadIncidentCommandData(id,i.guest_logistics_movement_id||null);
 
   // Incident may have been closed while detail was loading.
   const current=S.incidents.find(x=>x.id===id);
@@ -3286,6 +3301,21 @@ async function selectIncident(id){
           <div><span class="small muted">Status</span><strong>${esc(current.status||"OPEN")}</strong></div>
         </div>
       </section>
+
+      ${extra.linkedMovement?`<section class="incident-info-section incident-linked-move-section">
+        <div class="row start">
+          <div>
+            <div class="section-title">Linked Guest Logistics MOVE</div>
+            <strong>${esc(extra.linkedMovement.movement_number)} · ${esc(extra.linkedMovement.guest_name||"Guest")}</strong>
+          </div>
+          <span class="badge">${esc(String(extra.linkedMovement.status||"").replaceAll("_"," "))}</span>
+        </div>
+        <div class="incident-linked-move-grid">
+          <div><span class="small muted">Scheduled</span><strong>${esc(dateTime24(extra.linkedMovement.scheduled_at))}</strong></div>
+          <div><span class="small muted">Flight</span><strong>${esc([extra.linkedMovement.airline,extra.linkedMovement.flight_number].filter(Boolean).join(" ")||"—")}</strong></div>
+          <div class="incident-linked-move-route"><span class="small muted">Route</span><strong>${esc([extra.linkedMovement.origin,extra.linkedMovement.destination].filter(Boolean).join(" → ")||"—")}</strong></div>
+        </div>
+      </section>`:""}
 
       <section class="incident-info-section">
         <div class="section-title">Location</div>
@@ -4003,6 +4033,64 @@ function treatmentWalkInForm(){
 }
 
 
+
+function guestMovementSearchText(movement){
+  return [
+    movement?.movement_number,
+    movement?.guest_name,
+    movement?.guest_group,
+    movement?.airline,
+    movement?.flight_number
+  ].filter(Boolean).join(" ").toLowerCase();
+}
+
+function searchActiveGuestMovements(query,limit=12){
+  const q=String(query||"").trim().toLowerCase();
+  const compactQuery=q.replace(/[^a-z0-9]/g,"");
+  const rows=(S.guestLogisticsMovements||[])
+    .filter(m=>{
+      if(!q)return true;
+      const text=guestMovementSearchText(m);
+      return text.includes(q)||(compactQuery&&text.replace(/[^a-z0-9]/g,"").includes(compactQuery));
+    })
+    .sort((a,b)=>{
+      const underwayDiff=Number(LOGISTICS_UNDERWAY_STATUSES.has(b.status))-Number(LOGISTICS_UNDERWAY_STATUSES.has(a.status));
+      if(underwayDiff)return underwayDiff;
+      return new Date(a.scheduled_at||0).getTime()-new Date(b.scheduled_at||0).getTime();
+    });
+  return rows.slice(0,limit);
+}
+
+function guestMovementSearchResultsHtml(query){
+  const rows=searchActiveGuestMovements(query);
+  return rows.map(m=>{
+    const flight=[m.airline,m.flight_number].filter(Boolean).join(" ");
+    const route=[m.origin,m.destination].filter(Boolean).join(" → ");
+    return `<button type="button" class="guest-move-search-result" data-guest-move-result="${m.id}">
+      <strong>${esc(m.movement_number)} · ${esc(m.guest_name||"Guest")}</strong>
+      <span>${esc([flight?`Flight ${flight}`:"",dateTime24(m.scheduled_at),String(m.status||"").replaceAll("_"," ")].filter(Boolean).join(" · "))}</span>
+      ${route?`<small>${esc(route)}</small>`:""}
+    </button>`;
+  }).join("")||`<div class="small muted guest-move-no-results">No active MOVEs match that search.</div>`;
+}
+
+function guestMovementSelectedHtml(movement){
+  if(!movement)return `<div class="small muted">No MOVE attached.</div>`;
+  const flight=[movement.airline,movement.flight_number].filter(Boolean).join(" ");
+  const route=[movement.origin,movement.destination].filter(Boolean).join(" → ");
+  return `<div class="guest-move-selected-card">
+    <div class="row start">
+      <div>
+        <div class="small task-priority-label">ATTACHED GUEST LOGISTICS MOVE</div>
+        <strong>${esc(movement.movement_number)} · ${esc(movement.guest_name||"Guest")}</strong>
+        <div class="small muted">${esc([flight?`Flight ${flight}`:"",dateTime24(movement.scheduled_at),String(movement.status||"").replaceAll("_"," ")].filter(Boolean).join(" · "))}</div>
+        ${route?`<div class="small muted">${esc(route)}</div>`:""}
+      </div>
+      <button type="button" class="btn secondary compact" id="clearGuestMoveLink">Remove</button>
+    </div>
+  </div>`;
+}
+
 function incidentForm(loc,draft=null){
   if(!S.activeOperationalPeriod){
     return alert("No Operational Period is active. Event Admin must activate one before creating a new incident.");
@@ -4016,6 +4104,10 @@ function incidentForm(loc,draft=null){
   const defaultDepartmentIds=normalizeDepartmentSelection(
     draft?.departmentIds?.length?draft.departmentIds:S.dispatchDepartmentIds
   );
+  let linkedGuestMovement=draft?.guestLogisticsMovement
+    ||(draft?.guestLogisticsMovementId
+      ?(S.guestLogisticsMovements||[]).find(m=>m.id===draft.guestLogisticsMovementId)||null
+      :null);
 
   detail.innerHTML=`<div class="incident-modal-header">
     <div>
@@ -4037,6 +4129,21 @@ function incidentForm(loc,draft=null){
           ${["Standard","Urgent","Critical"].map(p=>`<option ${draft?.priority===p?"selected":(!draft&&p==="Standard"?"selected":"")}>${p}</option>`).join("")}
         </select></div>
       </div>
+
+      ${eventHasGuestLogisticsEnabled()?`
+        <div class="incident-guest-move-link">
+          <div class="row start">
+            <div>
+              <div class="section-title">Attach to Existing MOVE</div>
+              <div class="small muted">Optional · Search active Guest Logistics by MOVE number, guest name, or flight number.</div>
+            </div>
+            <span class="badge">Guest Logistics</span>
+          </div>
+          <input id="guestMoveSearchNew" autocomplete="off" placeholder="Search MOVE #, guest name, or flight #">
+          <div id="guestMoveSearchResults" class="guest-move-search-results"></div>
+          <div id="guestMoveSelected" class="guest-move-selected-host">${guestMovementSelectedHtml(linkedGuestMovement)}</div>
+        </div>
+      `:""}
 
       <div>
         <div class="row">
@@ -4153,6 +4260,42 @@ function incidentForm(loc,draft=null){
 
   setInlinePoiVisibility();
 
+  const bindGuestMoveLinkUi=()=>{
+    const input=document.querySelector("#guestMoveSearchNew");
+    const results=document.querySelector("#guestMoveSearchResults");
+    const selectedHost=document.querySelector("#guestMoveSelected");
+    if(!input||!results||!selectedHost)return;
+
+    const renderSelected=()=>{
+      selectedHost.innerHTML=guestMovementSelectedHtml(linkedGuestMovement);
+      selectedHost.querySelector("#clearGuestMoveLink")?.addEventListener("click",()=>{
+        linkedGuestMovement=null;
+        input.value="";
+        results.innerHTML="";
+        renderSelected();
+        input.focus();
+      });
+    };
+
+    const renderResults=()=>{
+      results.innerHTML=guestMovementSearchResultsHtml(input.value);
+      results.querySelectorAll("[data-guest-move-result]").forEach(button=>{
+        button.addEventListener("click",()=>{
+          linkedGuestMovement=(S.guestLogisticsMovements||[]).find(m=>m.id===button.dataset.guestMoveResult)||null;
+          input.value="";
+          results.innerHTML="";
+          renderSelected();
+        });
+      });
+    };
+
+    input.addEventListener("focus",renderResults);
+    input.addEventListener("input",renderResults);
+    renderSelected();
+  };
+
+  bindGuestMoveLinkUi();
+
   const renderUnitChoices=()=>{
     const selectedDeps=new Set([...document.querySelectorAll('input[name="dept"]:checked')].map(x=>x.value));
     document.querySelectorAll('input[name="initialUnit"]:checked').forEach(x=>preservedUnitIds.add(x.value));
@@ -4220,7 +4363,7 @@ function incidentForm(loc,draft=null){
     const buttons=[document.querySelector("#saveIncidentOnly"),document.querySelector("#saveAndDispatch")];
     buttons.forEach(b=>{if(b)b.disabled=true;});
 
-    const {data,error}=await supabase.rpc("create_incident_v4",{
+    const {data,error}=await supabase.rpc("create_incident_v5",{
       p_event_id:S.eventId,
       p_department_ids:deps,
       p_call_type:callType,
@@ -4236,7 +4379,8 @@ function incidentForm(loc,draft=null){
       p_zone_id:chosen?.zone_id||null,
       p_create_poi:saveAsPoi,
       p_poi_category:saveAsPoi?document.querySelector("#incidentPoiCategory").value:null,
-      p_poi_aliases:poiAliases
+      p_poi_aliases:poiAliases,
+      p_guest_logistics_movement_id:linkedGuestMovement?.id||null
     });
 
     if(error){
