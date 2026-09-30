@@ -36,6 +36,9 @@ const S={
   commandTreatmentRefreshInterval:null,
   dispatchUnitSyncInterval:null,
   dispatchUnitSyncInFlight:false,
+  dispatchTaskSyncInFlight:false,
+  dispatchTaskSignature:null,
+  dispatchTaskLastSyncAt:null,
   dispatchIncidentSyncInFlight:false,
   dispatchIncidentSnapshot:[],
   dispatchIncidentSnapshotLoaded:false,
@@ -1398,7 +1401,7 @@ async function loadCommandDisplayOps(){
       .eq("active",true)
       .order("name"),
     supabase.from("guest_logistics_movements")
-      .select("id,event_id,department_id,movement_number,movement_type,guest_name,guest_group,status,scheduled_at,assigned_unit_id,origin,destination,airline,flight_number,airport,terminal")
+      .select("id,event_id,department_id,movement_number,movement_type,guest_name,guest_group,status,scheduled_at,assigned_unit_id,assigned_at,driver_acknowledged_at,updated_at,origin,destination,airline,flight_number,airport,terminal")
       .eq("event_id",S.eventId)
       .not("status","in","(COMPLETE,NO_SHOW,CANCELLED)")
       .not("assigned_unit_id","is",null)
@@ -1509,7 +1512,7 @@ async function loadEventOps(){
     supabase.from("unit_locations").select("*").eq("event_id",S.eventId),
     supabase.from("operational_periods").select("*").eq("event_id",S.eventId).order("created_at"),
     supabase.from("event_dispositions").select("*").eq("event_id",S.eventId).eq("active",true).order("scope").order("sort_order").order("label"),
-    supabase.from("guest_logistics_movements").select("id,event_id,department_id,movement_number,movement_type,guest_name,guest_group,status,scheduled_at,assigned_unit_id,origin,destination,airline,flight_number,airport,terminal").eq("event_id",S.eventId).not("status","in","(COMPLETE,NO_SHOW,CANCELLED)").order("scheduled_at"),
+    supabase.from("guest_logistics_movements").select("id,event_id,department_id,movement_number,movement_type,guest_name,guest_group,status,scheduled_at,assigned_unit_id,assigned_at,driver_acknowledged_at,updated_at,origin,destination,airline,flight_number,airport,terminal").eq("event_id",S.eventId).not("status","in","(COMPLETE,NO_SHOW,CANCELLED)").order("scheduled_at"),
     supabase.from("ems_unit_config").select("*"),
     supabase.from("ems_treatment_areas").select("*").eq("event_id",S.eventId).eq("active",true).order("name")
   ]);
@@ -2281,7 +2284,9 @@ function unitLocationTooltip(unit,location){
   const age=locationAgeLabel(location);
   const accuracy=location.accuracy_m!=null?` · ±${Math.round(location.accuracy_m)}m`:"";
   const layer=unitLocationLayerId(unit);
-  return `<strong>${esc(unit.name)}</strong><br>${esc(String(unit.status||"").replaceAll("_"," "))}<br>${esc(age)}${esc(accuracy)}${layer?`<br>${esc(layerName(layer))}`:""}`;
+  const cadStatus=dispatchCadStatusForUnit(unit);
+  const move=underwayLogisticsMovementForUnit(unit.id)||logisticsMovementsForUnit(unit.id)[0]||null;
+  return `<strong>${esc(unit.name)}</strong><br>CAD ${esc(String(cadStatus||"").replaceAll("_"," "))}${move?`<br>MOVE ${esc(String(move.status||"").replaceAll("_"," "))}`:""}<br>${esc(age)}${esc(accuracy)}${layer?`<br>${esc(layerName(layer))}`:""}`;
 }
 
 function removeUnitLocationMarker(unitId){
@@ -2408,7 +2413,13 @@ function activeAssignmentForUnit(unitId){
 
 function cadAssignmentStatus(active,unit=null){
   if(!active?.link)return unit?.status||"ASSIGNED";
-  return active.link.cad_status||((logisticsMovementsForUnit(active.link.unit_id)||[]).length?"ASSIGNED":unit?.status||"ASSIGNED");
+  return active.link.cad_status||unit?.status||"ASSIGNED";
+}
+
+function dispatchCadStatusForUnit(unit){
+  if(!unit)return "AVAILABLE";
+  const active=activeAssignmentForUnit(unit.id);
+  return active?cadAssignmentStatus(active,unit):(unit.status||"AVAILABLE");
 }
 
 function incidentList(){
@@ -2436,10 +2447,11 @@ function unitList(){
     ${units.map(u=>{
       const active=activeAssignmentForUnit(u.id);
       const moves=logisticsMovementsForUnit(u.id);
+      const cadStatus=dispatchCadStatusForUnit(u);
       return `<button class="unit unit-button ${moves.length?"unit-has-moves":""}" data-unit-detail="${u.id}">
         <div class="row">
           <strong>${esc(u.name)}</strong>
-          <span class="badge status-${esc(u.status)}" data-dispatch-unit-status="${u.id}">${esc(u.status.replaceAll("_"," "))}</span>
+          <span class="badge status-${esc(cadStatus)}" data-dispatch-unit-status="${u.id}">${active?"CAD ":""}${esc(String(cadStatus||"").replaceAll("_"," "))}</span>
         </div>
         ${moves.length?`<div class="unit-task-primary">
           <div class="small task-priority-label">PRIMARY · ${moves.length} MOVE${moves.length===1?"":"S"}</div>
@@ -2725,7 +2737,7 @@ async function loadIncidentCommandData(incidentId,guestMovementId=null){
       .order("name"),
     guestMovementId
       ?supabase.from("guest_logistics_movements")
-        .select("id,event_id,department_id,movement_number,movement_type,guest_name,guest_group,status,scheduled_at,assigned_unit_id,origin,destination,airline,flight_number,airport,terminal")
+        .select("id,event_id,department_id,movement_number,movement_type,guest_name,guest_group,status,scheduled_at,assigned_unit_id,assigned_at,driver_acknowledged_at,updated_at,origin,destination,airline,flight_number,airport,terminal")
         .eq("event_id",S.eventId)
         .eq("id",guestMovementId)
         .maybeSingle()
@@ -2848,30 +2860,31 @@ function transportDestinationEditorHtml(unit,taskStatus=unit.status){
 function updateDispatcherUnitStatusUI(unitId,status){
   const unit=S.units.find(u=>u.id===unitId);
   if(unit)unit.status=status;
+  const activeAssignment=activeAssignmentForUnit(unitId);
+  const displayStatus=activeAssignment?cadAssignmentStatus(activeAssignment,unit):(status||"AVAILABLE");
 
   document.querySelectorAll(`[data-dispatch-unit-status="${unitId}"]`).forEach(badge=>{
     [...badge.classList].filter(c=>c.startsWith("status-")).forEach(c=>badge.classList.remove(c));
-    badge.classList.add(`status-${status}`);
-    badge.textContent=String(status||"").replaceAll("_"," ");
+    badge.classList.add(`status-${displayStatus}`);
+    badge.textContent=`${activeAssignment?"CAD ":""}${String(displayStatus||"").replaceAll("_"," ")}`;
   });
 
   document.querySelectorAll(`[data-create-unit-status="${unitId}"]`).forEach(el=>{
-    const active=activeAssignmentForUnit(unitId);
-    el.textContent=`${String(status||"").replaceAll("_"," ")}${active?` · ${active.incident.incident_number}`:""}`;
+    el.textContent=`${String(displayStatus||"").replaceAll("_"," ")}${activeAssignment?` · ${activeAssignment.incident.incident_number}`:""}`;
   });
 
   document.querySelectorAll(`[data-status-unit="${unitId}"]`).forEach(select=>{
-    if([...select.options].some(o=>o.value===status))select.value=status;
+    if([...select.options].some(o=>o.value===displayStatus))select.value=displayStatus;
   });
 
   document.querySelectorAll(`[data-dispatch-status-option="${unitId}"]`).forEach(btn=>{
-    const active=btn.dataset.status===status;
-    btn.classList.toggle("field-status-active",active);
-    btn.setAttribute("aria-pressed",active?"true":"false");
+    const selected=btn.dataset.status===displayStatus;
+    btn.classList.toggle("field-status-active",selected);
+    btn.setAttribute("aria-pressed",selected?"true":"false");
   });
 
   const currentLabel=document.querySelector(`[data-unit-current-status="${unitId}"]`);
-  if(currentLabel)currentLabel.textContent=String(status||"").replaceAll("_"," ");
+  if(currentLabel)currentLabel.textContent=String(displayStatus||"").replaceAll("_"," ");
 }
 
 
@@ -3338,7 +3351,7 @@ async function selectIncident(id){
               <div>
                 <strong>${esc(u.event_departments?.short_name||"")} · ${esc(u.name)}</strong><br>
                 <span class="badge cad-task-status-badge">CAD ${esc(cadAssignmentStatus({incident:current,link},u).replaceAll("_"," "))}</span>
-                ${moves.length?`<span class="badge status-${esc(u.status)}" data-dispatch-unit-status="${u.id}">PRIMARY ${esc(String(u.status||"").replaceAll("_"," "))}</span>`:""}
+                ${moves.length?`<span class="badge">PRIMARY ${esc(String((underwayLogisticsMovementForUnit(u.id)||moves[0])?.status||"ASSIGNED").replaceAll("_"," "))}</span>`:""}
                 <span class="assignment-ack-badge ${link.acknowledged_at?"acknowledged":"pending"}" title="${link.acknowledged_at?`Acknowledged ${dateTime24(link.acknowledged_at,{seconds:true})}`:"Awaiting Field Unit acknowledgement"}">${link.acknowledged_at?`ACK ${time24(link.acknowledged_at)}`:"AWAITING ACK"}</span>
                 <span class="small ${unitLocation(u.id)?`gps-${locationFreshness(unitLocation(u.id))}`:"muted"}" data-unit-gps="${u.id}">${unitLocation(u.id)?`${locationAgeLabel(unitLocation(u.id))}${unitLocation(u.id).accuracy_m!=null?` · ±${Math.round(unitLocation(u.id).accuracy_m)}m`:""}`:(S.event?.field_location_enabled?"GPS not shared":"GPS disabled")}</span>
                 ${moves.length?`<div class="assignment-secondary-moves"><span class="small task-priority-label">PRIMARY MOVE${moves.length===1?"":"S"}</span>${moves.map(m=>`<span class="badge">${esc(m.movement_number)}</span>`).join("")}</div>`:""}
@@ -3613,7 +3626,7 @@ function selectUnit(unitId){
       <div class="incident-modal-eyebrow">${esc(u.event_departments?.name||"UNIT")}</div>
       <div class="incident-modal-title-row">
         <h2 id="incidentModalTitle">${esc(u.name)}</h2>
-        <span class="badge status-${esc(u.status)}" data-dispatch-unit-status="${u.id}" data-unit-current-status="${u.id}">${esc(u.status.replaceAll("_"," "))}</span>
+        <span class="badge status-${esc(currentCadStatus)}" data-dispatch-unit-status="${u.id}" data-unit-current-status="${u.id}">${active?"CAD ":""}${esc(String(currentCadStatus||"").replaceAll("_"," "))}</span>
       </div>
       <div class="incident-modal-nature">${primaryMove
         ?`Primary: ${esc(primaryMove.movement_number)}${moves.length>1?` +${moves.length-1} MOVE${moves.length-1===1?"":"S"}`:""}${active?` · Secondary CAD: ${esc(active.incident.incident_number)}`:""}`
@@ -4307,7 +4320,7 @@ function incidentForm(loc,draft=null){
       return `<label class="create-unit-option ${active?"disabled":""}">
         <input type="checkbox" name="initialUnit" value="${u.id}" ${active?"disabled":""} ${!active&&preservedUnitIds.has(u.id)?"checked":""}>
         <span><strong>${esc(u.event_departments?.short_name||"")} · ${esc(u.name)}</strong><br>
-        <span class="small muted" data-create-unit-status="${u.id}">${esc(u.status.replaceAll("_"," "))}${active?` · ${esc(active.incident.incident_number)}`:""}</span></span>
+        <span class="small muted" data-create-unit-status="${u.id}">${esc(dispatchCadStatusForUnit(u).replaceAll("_"," "))}${active?` · ${esc(active.incident.incident_number)}`:""}</span></span>
       </label>`;
     }).join("")||`<div class="small muted">No units are configured for the selected department(s).</div>`;
   };
@@ -4690,7 +4703,7 @@ function renderCommandUnitMarkers(){
       opacity:freshness==="live"?1:.6,
       className:`command-unit-marker command-unit-${freshness}`
     }).addTo(S.commandUnitLayer)
-      .bindTooltip(`<strong>${esc(unit.name)}</strong><br>${esc(String(unit.status||"").replaceAll("_"," "))}<br>${esc(locationAgeLabel(location))}${location.accuracy_m!=null?` · ±${Math.round(location.accuracy_m)}m`:""}`,{direction:"top"});
+      .bindTooltip(`<strong>${esc(unit.name)}</strong><br>CAD ${esc(String(dispatchCadStatusForUnit(unit)||"").replaceAll("_"," "))}${logisticsMovementsForUnit(unit.id).length?`<br>MOVE ${esc(String((underwayLogisticsMovementForUnit(unit.id)||logisticsMovementsForUnit(unit.id)[0])?.status||"").replaceAll("_"," "))}`:""}<br>${esc(locationAgeLabel(location))}${location.accuracy_m!=null?` · ±${Math.round(location.accuracy_m)}m`:""}`,{direction:"top"});
   }
 }
 async function setupCommandDisplayMap(){
@@ -8726,6 +8739,173 @@ async function syncDispatcherUnitStatuses(){
   }
 }
 
+function dispatchTaskSnapshotSignature(rows){
+  return (rows||[]).map(row=>[
+    row.task_kind||"",
+    row.incident_id||"",
+    row.movement_id||"",
+    row.unit_id||"",
+    row.status||"",
+    row.assigned_at||"",
+    row.acknowledged_at||"",
+    row.updated_at||""
+  ].join("|")).sort().join("\n");
+}
+
+function refreshOpenDispatchTaskView(){
+  if(S.incidentModalMode==="edit"&&document.querySelector("[data-incident-modal-mode='edit']"))return;
+  if(S.incidentModalMode==="unit"&&S.openUnitId&&S.units.some(u=>u.id===S.openUnitId)){
+    selectUnit(S.openUnitId);
+    return;
+  }
+  if(S.openIncidentId&&S.incidents.some(i=>i.id===S.openIncidentId)){
+    selectIncident(S.openIncidentId).catch(error=>console.warn("Incident task view refresh failed",error));
+  }
+}
+
+function mergeDispatcherTaskSnapshot(rows){
+  const cadRows=(rows||[]).filter(row=>row.task_kind==="CAD");
+  const moveRows=(rows||[]).filter(row=>row.task_kind==="MOVE");
+  const cadByKey=new Map(cadRows.map(row=>[`${row.incident_id}:${row.unit_id}`,row]));
+  const moveById=new Map(moveRows.map(row=>[row.movement_id,row]));
+  let changed=false;
+  let structuralMismatch=false;
+
+  const localCadKeys=new Set();
+  for(const incident of S.incidents){
+    for(const link of incident.incident_units||[]){
+      if(link.cleared_at)continue;
+      const key=`${incident.id}:${link.unit_id}`;
+      localCadKeys.add(key);
+      const row=cadByKey.get(key);
+      if(!row){
+        structuralMismatch=true;
+        continue;
+      }
+      const nextStatus=row.status||"ASSIGNED";
+      if((link.cad_status||"ASSIGNED")!==nextStatus){link.cad_status=nextStatus;changed=true;}
+      if((link.acknowledged_at||null)!==(row.acknowledged_at||null)){link.acknowledged_at=row.acknowledged_at||null;changed=true;}
+      if((link.assigned_at||null)!==(row.assigned_at||null)){link.assigned_at=row.assigned_at||link.assigned_at;changed=true;}
+      if((link.cad_status_updated_at||null)!==(row.updated_at||null)){link.cad_status_updated_at=row.updated_at||null;changed=true;}
+    }
+  }
+  for(const key of cadByKey.keys()){
+    if(!localCadKeys.has(key)){structuralMismatch=true;break;}
+  }
+
+  const localMoveIds=new Set();
+  for(const movement of S.guestLogisticsMovements||[]){
+    if(["COMPLETE","NO_SHOW","CANCELLED"].includes(movement.status))continue;
+    localMoveIds.add(movement.id);
+    const row=moveById.get(movement.id);
+    if(!row){
+      structuralMismatch=true;
+      continue;
+    }
+    if((movement.status||"")!==(row.status||"")){movement.status=row.status;changed=true;}
+    if((movement.assigned_unit_id||null)!==(row.unit_id||null)){movement.assigned_unit_id=row.unit_id||null;changed=true;}
+    if((movement.assigned_at||null)!==(row.assigned_at||null)){movement.assigned_at=row.assigned_at||null;changed=true;}
+    if((movement.driver_acknowledged_at||null)!==(row.acknowledged_at||null)){movement.driver_acknowledged_at=row.acknowledged_at||null;changed=true;}
+    if((movement.updated_at||null)!==(row.updated_at||null)){movement.updated_at=row.updated_at||null;changed=true;}
+  }
+  for(const id of moveById.keys()){
+    if(!localMoveIds.has(id)){structuralMismatch=true;break;}
+  }
+
+  if(changed){
+    refreshDispatchBoards();
+    refreshOpenDispatchTaskView();
+  }
+
+  return {changed,structuralMismatch};
+}
+
+async function syncDispatcherTaskState(){
+  if(S.dispatchTaskSyncInFlight || !S.eventId || !document.querySelector("#dispatchWorkspace"))return;
+  S.dispatchTaskSyncInFlight=true;
+
+  try{
+    const {data,error}=await supabase.rpc("dispatch_task_status_snapshot",{p_event_id:S.eventId});
+    if(error)throw error;
+    const rows=data||[];
+    const signature=dispatchTaskSnapshotSignature(rows);
+    if(signature===S.dispatchTaskSignature){
+      S.dispatchTaskLastSyncAt=new Date().toISOString();
+      updateDispatchSyncIndicator({ok:true});
+      return;
+    }
+    const result=mergeDispatcherTaskSnapshot(rows);
+
+    if(result.structuralMismatch){
+      // Assignment creation/removal and MOVE creation/completion require a
+      // structural reload, but the status fields above were still reconciled
+      // first so the visible board is never left stale while that reload runs.
+      const editing=S.incidentModalMode==="edit"&&document.querySelector("[data-incident-modal-mode='edit']");
+      await refreshDispatchStructure();
+      // An open editor deliberately defers structural reloads. Do not bless the
+      // new signature yet; the watchdog will retry until the structure is merged.
+      if(editing){
+        S.dispatchTaskLastSyncAt=new Date().toISOString();
+        updateDispatchSyncIndicator({ok:true,message:"Task changes detected; structural refresh is deferred until the open CAD editor is closed."});
+        return;
+      }
+    }
+
+    S.dispatchTaskSignature=signature;
+    S.dispatchTaskLastSyncAt=new Date().toISOString();
+    updateDispatchSyncIndicator({ok:true});
+  }catch(error){
+    console.warn("Dispatch task-state snapshot failed",error);
+    updateDispatchSyncIndicator({ok:false,message:`Task synchronization failed: ${error.message}`});
+  }finally{
+    S.dispatchTaskSyncInFlight=false;
+  }
+}
+
+function applyDispatcherIncidentUnitRealtime(payload){
+  const row=payload?.new||payload?.old;
+  if(!row?.incident_id||!row?.unit_id)return;
+  const incident=S.incidents.find(i=>i.id===row.incident_id);
+  const link=incident?.incident_units?.find(item=>item.unit_id===row.unit_id&&!item.cleared_at);
+
+  if(payload.eventType==="UPDATE"&&incident&&link&&!row.cleared_at){
+    link.cad_status=row.cad_status||"ASSIGNED";
+    link.cad_status_updated_at=row.cad_status_updated_at||link.cad_status_updated_at||null;
+    link.acknowledged_at=row.acknowledged_at||null;
+    link.assigned_at=row.assigned_at||link.assigned_at;
+    refreshDispatchBoards();
+    refreshOpenDispatchTaskView();
+    syncDispatcherTaskState();
+    return;
+  }
+
+  // INSERT, DELETE, clear/unassign, or an unknown assignment changes structure.
+  refreshDispatchStructure();
+  syncDispatcherTaskState();
+}
+
+function applyDispatcherMovementRealtime(payload){
+  const row=payload?.new||payload?.old;
+  if(!row?.id||row.event_id!==S.eventId)return;
+  const terminal=["COMPLETE","NO_SHOW","CANCELLED"].includes(row.status);
+  const index=(S.guestLogisticsMovements||[]).findIndex(m=>m.id===row.id);
+
+  if(payload.eventType==="DELETE"||terminal){
+    if(index>=0)S.guestLogisticsMovements.splice(index,1);
+  }else if(index>=0){
+    Object.assign(S.guestLogisticsMovements[index],row);
+  }else{
+    // New active MOVE: row data from Realtime is sufficient for the main board;
+    // a background structural refresh follows to load every optional field.
+    S.guestLogisticsMovements.push(row);
+  }
+
+  refreshDispatchBoards();
+  refreshOpenDispatchTaskView();
+  if(index<0&&payload.eventType!=="DELETE"&&!terminal)refreshDispatchStructure();
+  syncDispatcherTaskState();
+}
+
 function incidentSnapshotSignature(row){
   return [
     row.id,
@@ -8789,6 +8969,7 @@ function startDispatcherUnitStatusFallback(){
   // only) and makes Dispatch self-healing even if Realtime is unavailable.
   S.dispatchUnitSyncInterval=setInterval(()=>{
     syncDispatcherUnitStatuses();
+    syncDispatcherTaskState();
     syncDispatcherIncidentState();
   },1000);
 
@@ -8797,11 +8978,13 @@ function startDispatcherUnitStatusFallback(){
   S.dispatchVisibilityHandler=()=>{
     if(document.visibilityState==="visible"){
       syncDispatcherUnitStatuses();
+      syncDispatcherTaskState();
       syncDispatcherIncidentState();
     }
   };
   S.dispatchFocusHandler=()=>{
     syncDispatcherUnitStatuses();
+    syncDispatcherTaskState();
     syncDispatcherIncidentState();
   };
   document.addEventListener("visibilitychange",S.dispatchVisibilityHandler);
@@ -8833,8 +9016,8 @@ function subscribeDispatch(){
       refreshDispatchStructure();
     })
     .on("postgres_changes",{event:"*",schema:"public",table:"operational_periods",filter:`event_id=eq.${S.eventId}`},()=>refreshDispatchStructure())
-    .on("postgres_changes",{event:"*",schema:"public",table:"guest_logistics_movements",filter:`event_id=eq.${S.eventId}`},()=>refreshDispatchStructure())
-    .on("postgres_changes",{event:"*",schema:"public",table:"incident_units"},()=>refreshDispatchStructure())
+    .on("postgres_changes",{event:"*",schema:"public",table:"guest_logistics_movements",filter:`event_id=eq.${S.eventId}`},payload=>applyDispatcherMovementRealtime(payload))
+    .on("postgres_changes",{event:"*",schema:"public",table:"incident_units"},payload=>applyDispatcherIncidentUnitRealtime(payload))
     // GPS changes update only the unit's map marker/readout.
     .on("postgres_changes",{event:"*",schema:"public",table:"unit_locations"},payload=>updateDispatcherUnitLocation(payload))
     .on("postgres_changes",{event:"INSERT",schema:"public",table:"event_pois",filter:`event_id=eq.${S.eventId}`},payload=>handleRealtimePoiInsert(payload))
@@ -8843,11 +9026,13 @@ function subscribeDispatch(){
       if(status==="SUBSCRIBED"){
         updateDispatchSyncIndicator({ok:true});
         syncDispatcherUnitStatuses();
+        syncDispatcherTaskState();
         syncDispatcherIncidentState();
       }else if(status==="CHANNEL_ERROR"||status==="TIMED_OUT"||status==="CLOSED"){
         console.warn(`Dispatch realtime channel status: ${status}. Authoritative database heartbeat remains active.`);
         updateDispatchSyncIndicator({ok:true,message:`Realtime ${status}; database heartbeat is still active.`});
         syncDispatcherUnitStatuses();
+        syncDispatcherTaskState();
         syncDispatcherIncidentState();
       }
     });
