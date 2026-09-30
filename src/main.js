@@ -3589,8 +3589,14 @@ async function focusUnitOnDispatchMap(unitId){
 }
 
 function unitStatusButtonsHtml(u,active,taskStatus=u.status){
+  // Response/progress statuses belong to an active CAD assignment. When a unit
+  // is unassigned, Dispatch may only change its standalone availability state.
+  const options=active
+    ?unitStatusOptions(u)
+    :unitStatusOptions(u).filter(status=>["AVAILABLE","OUT_OF_SERVICE"].includes(status));
+
   return `<div class="status-buttons dispatcher-status-grid">
-    ${unitStatusOptions(u).map(status=>`
+    ${options.map(status=>`
       <button
         class="btn field-status-button ${fieldStatusColorClass(status)} ${status===taskStatus?"field-status-active":""}"
         data-dispatch-status-option="${u.id}"
@@ -3599,7 +3605,9 @@ function unitStatusButtonsHtml(u,active,taskStatus=u.status){
       >${esc(status.replaceAll("_"," "))}</button>
     `).join("")}
   </div>
-  <div class="small muted">${active?"These controls update the CAD ticket status independently from any assigned MOVE.":"Choose a status for this unit."}</div>`;
+  <div class="small muted">${active
+    ?"These controls update the CAD ticket status independently from any assigned MOVE."
+    :"Only availability states are available until this unit is assigned to an active CAD ticket."}</div>`;
 }
 
 function selectUnit(unitId){
@@ -7735,6 +7743,9 @@ async function fieldUnitCad(){
 
   const fieldIsAmbulance=!!(emsState?.config?.active&&(emsState.config.ems_role==="ambulance"||emsState.config.transport_capable));
   const cadTaskStatus=incident?(a?.cad_status||"ASSIGNED"):fs.units?.status;
+  // CAD response states only make sense while this unit has an active CAD assignment.
+  // With no incident, Field Unit exposes availability controls only.
+  const standaloneUnitStatuses=statuses.filter(status=>["AVAILABLE","OUT_OF_SERVICE"].includes(status));
 
   const fieldLayout=normalizeFieldLayoutConfig(fs.events?.field_layout_config);
   const liveLocationVisible=fieldLayout.blocks.find(block=>block.id==="live_location")?.enabled!==false;
@@ -7807,10 +7818,11 @@ async function fieldUnitCad(){
       <div class="row"><div class="section-title">${logisticsState?.movements?.length?"SECONDARY CAD STATUS":"CAD TICKET STATUS"}</div><span class="badge cad-task-status-badge">${esc(String(cadTaskStatus||"ASSIGNED").replaceAll("_"," "))}</span></div>
       <div class="status-buttons">${statuses.map(status=>`<button class="btn field-status-button ${fieldStatusColorClass(status)} ${status===cadTaskStatus?"field-status-active":""}" data-cad-status="${esc(status)}" aria-pressed="${status===cadTaskStatus?"true":"false"}">${esc(status.replaceAll("_"," "))}</button>`).join("")}</div>
       ${logisticsState?.movements?.length?`<div class="small muted">This status belongs only to ${esc(incident.incident_number)}. MOVE status is controlled independently above.</div>`:""}
-    </div>`:logisticsState?.movements?.length?"":`<div class="field-status-layout-block">
-      <div class="section-title">Unit Status</div>
-      <div class="status-buttons">${statuses.map(status=>`<button class="btn field-status-button ${fieldStatusColorClass(status)} ${status===fs.units?.status?"field-status-active":""}" data-unit-status-option="${esc(status)}" aria-pressed="${status===fs.units?.status?"true":"false"}">${esc(status.replaceAll("_"," "))}</button>`).join("")}</div>
-    </div>`,
+    </div>`:logisticsState?.movements?.length?"":standaloneUnitStatuses.length?`<div class="field-status-layout-block card standalone-unit-status-card">
+      <div class="row"><div class="section-title">UNIT AVAILABILITY</div><span class="badge status-${esc(fs.units?.status)}">${esc(String(fs.units?.status||"").replaceAll("_"," "))}</span></div>
+      <div class="status-buttons">${standaloneUnitStatuses.map(status=>`<button class="btn field-status-button ${fieldStatusColorClass(status)} ${status===fs.units?.status?"field-status-active":""}" data-unit-status-option="${esc(status)}" aria-pressed="${status===fs.units?.status?"true":"false"}">${esc(status.replaceAll("_"," "))}</button>`).join("")}</div>
+      <div class="small muted">CAD response statuses such as En Route and On Scene are available only while this unit is assigned to an active CAD ticket.</div>
+    </div>`:"",
 
     transport_destination:!fieldHasEms||!incident?"":`<div class="card transport-destination-editor ${cadTaskStatus==="TRANSPORTING"?"":"hidden"}" id="fieldTransportDestinationPanel">
       <div class="section-title">Transport Destination</div>
