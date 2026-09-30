@@ -2116,6 +2116,7 @@ async function dispatchPage(){
   document.querySelector("#topActions").innerHTML=`
     <button class="btn secondary" id="poiFinderBtn">Find POI</button>
     <button class="btn secondary" id="commandDisplayBtn">Command Display</button>
+    ${eventHasGuestLogisticsEnabled()?`<button class="btn secondary" id="guestLogisticsQuickBtn">Guest Logistics</button>`:""}
 
     <details class="topbar-menu" id="dispatchMoreMenu">
       <summary class="btn secondary">More ▾</summary>
@@ -2164,6 +2165,7 @@ async function dispatchPage(){
 
   document.querySelector("#poiFinderBtn").onclick=()=>showPoiFinder();
   document.querySelector("#commandDisplayBtn").onclick=()=>commandDisplayPage();
+  document.querySelector("#guestLogisticsQuickBtn")?.addEventListener("click",()=>guestLogisticsPage({allDepartments:true}));
   document.querySelector("#layoutButton").onclick=()=>{closeDispatchMenu();renderDispatchLayoutModal();};
   document.querySelector("#operationalPeriodsBtn").onclick=()=>{closeDispatchMenu();eventAdmin("periods");};
   document.querySelector("#emsOpsBtn")?.addEventListener("click",()=>{closeDispatchMenu();renderEmsOps(app,{eventId:S.eventId,event:S.event,header,onBack:()=>dispatchPage(),onAdmin:()=>eventAdmin("ems")});});
