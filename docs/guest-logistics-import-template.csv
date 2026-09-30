@@ -1,0 +1,2 @@
+guest_name,guest_group,party_size,scheduled_time,movement_type,origin,destination,airline,flight_number,airport,terminal,contact_phone,contact_email,external_reference,operational_period,notes
+"Jane Guest","Featured Speaker",2,"2026-08-09 14:30","AIRPORT_ARRIVAL","ORD Terminal 1","Convention Hotel","United","UA1234","ORD","1","","","SHEET-001","","Meet at baggage claim"

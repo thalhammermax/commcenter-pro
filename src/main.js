@@ -53,6 +53,11 @@ const S={
   fieldMapIncident:null,
   fieldMapUnit:null,
   fieldLocalLocation:null,
+  fieldAssignmentSyncInterval:null,
+  fieldAssignmentSyncInFlight:false,
+  fieldAssignmentSignature:null,
+  fieldAssignmentVisibilityHandler:null,
+  fieldAssignmentFocusHandler:null,
   mapPickMode:null,
   pendingIncidentDraft:null,
   fieldReportSessionOwned:false
@@ -1406,7 +1411,7 @@ async function loadCommandDisplayOps(){
         .select("incident_id,department_id,event_departments(name,short_name)")
         .in("incident_id",incidentIds),
       supabase.from("incident_units")
-        .select("incident_id,unit_id,cleared_at,units(name)")
+        .select("incident_id,unit_id,assigned_at,acknowledged_at,cleared_at,units(name)")
         .in("incident_id",incidentIds)
     ]);
 
@@ -1520,7 +1525,7 @@ async function loadEventOps(){
         .select("incident_id,department_id,event_departments(name,short_name)")
         .in("incident_id",incidentIds),
       supabase.from("incident_units")
-        .select("incident_id,unit_id,cleared_at,units(name)")
+        .select("incident_id,unit_id,assigned_at,acknowledged_at,cleared_at,units(name)")
         .in("incident_id",incidentIds)
     ]);
 
@@ -2557,6 +2562,7 @@ function activityTitle(action){
     INCIDENT_CREATED:"Incident created",
     INCIDENT_UPDATED:"Call details updated",
     UNIT_ASSIGNED:"Unit assigned",
+    UNIT_ASSIGNMENT_ACKNOWLEDGED:"Unit assignment acknowledged",
     UNIT_UNASSIGNED:"Unit unassigned",
     UNIT_STATUS_CHANGED:"Unit status changed",
     UNIT_TRANSPORT_DESTINATION_UPDATED:"Transport destination updated",
@@ -2591,6 +2597,10 @@ function activitySummary(row){
   if(row.action==="UNIT_ASSIGNED"){
     const u=S.units.find(x=>x.id===row.unit_id);
     return u?u.name:"Unit assigned";
+  }
+  if(row.action==="UNIT_ASSIGNMENT_ACKNOWLEDGED"){
+    const u=S.units.find(x=>x.id===row.unit_id);
+    return `${u?.name||row.unit_name||"Unit"}${d.acknowledged_at?` · acknowledged ${time24(d.acknowledged_at,{seconds:true})}`:""}`;
   }
   if(row.action==="UNIT_UNASSIGNED"){
     const u=S.units.find(x=>x.id===row.unit_id);
@@ -3266,6 +3276,7 @@ async function selectIncident(id){
               <div>
                 <strong>${esc(u.event_departments?.short_name||"")} · ${esc(u.name)}</strong><br>
                 <span class="badge status-${esc(u.status)}" data-dispatch-unit-status="${u.id}">${esc(String(u.status||"").replaceAll("_"," "))}</span>
+                <span class="assignment-ack-badge ${link.acknowledged_at?"acknowledged":"pending"}" title="${link.acknowledged_at?`Acknowledged ${dateTime24(link.acknowledged_at,{seconds:true})}`:"Awaiting Field Unit acknowledgement"}">${link.acknowledged_at?`ACK ${time24(link.acknowledged_at)}`:"AWAITING ACK"}</span>
                 <span class="small ${unitLocation(u.id)?`gps-${locationFreshness(unitLocation(u.id))}`:"muted"}" data-unit-gps="${u.id}">${unitLocation(u.id)?`${locationAgeLabel(unitLocation(u.id))}${unitLocation(u.id).accuracy_m!=null?` · ±${Math.round(unitLocation(u.id).accuracy_m)}m`:""}`:(S.event?.field_location_enabled?"GPS not shared":"GPS disabled")}</span>
               </div>
               <div class="assignment-unit-actions">
@@ -7337,12 +7348,80 @@ async function fieldUnitPicker(){
   document.querySelector("#leaveEvent").onclick=leaveField;
   subscribeFieldSessionLifecycle(S.fieldSession?.id);
 }
+function setFieldAssignmentAlert(active){
+  document.body.classList.toggle("field-assignment-alert",!!active);
+}
+
+function fieldAssignmentSignature(row){
+  if(!row)return "";
+  return [
+    row.incident_id||"",
+    row.assigned_at||"",
+    row.acknowledged_at||"",
+    row.cleared_at||""
+  ].join("|");
+}
+
+async function syncFieldAssignment(unitId){
+  if(
+    S.fieldAssignmentSyncInFlight ||
+    !unitId ||
+    !S.fieldSession?.id ||
+    !document.querySelector(".field-shell")
+  )return;
+
+  S.fieldAssignmentSyncInFlight=true;
+  try{
+    const {data,error}=await supabase.from("incident_units")
+      .select("incident_id,assigned_at,acknowledged_at,cleared_at")
+      .eq("unit_id",unitId)
+      .is("cleared_at",null)
+      .order("assigned_at",{ascending:false})
+      .limit(1)
+      .maybeSingle();
+
+    if(error)throw error;
+
+    const signature=fieldAssignmentSignature(data);
+    if(signature!==S.fieldAssignmentSignature){
+      S.fieldAssignmentSignature=signature;
+      await fieldUnitCad();
+    }
+  }catch(error){
+    console.warn("Field assignment heartbeat failed",error);
+  }finally{
+    S.fieldAssignmentSyncInFlight=false;
+  }
+}
+
+function startFieldAssignmentFallback(unitId){
+  if(S.fieldAssignmentSyncInterval)clearInterval(S.fieldAssignmentSyncInterval);
+  S.fieldAssignmentSyncInterval=setInterval(()=>syncFieldAssignment(unitId),1500);
+
+  if(S.fieldAssignmentVisibilityHandler){
+    document.removeEventListener("visibilitychange",S.fieldAssignmentVisibilityHandler);
+  }
+  if(S.fieldAssignmentFocusHandler){
+    window.removeEventListener("focus",S.fieldAssignmentFocusHandler);
+  }
+
+  S.fieldAssignmentVisibilityHandler=()=>{
+    if(document.visibilityState==="visible")syncFieldAssignment(unitId);
+  };
+  S.fieldAssignmentFocusHandler=()=>syncFieldAssignment(unitId);
+
+  document.addEventListener("visibilitychange",S.fieldAssignmentVisibilityHandler);
+  window.addEventListener("focus",S.fieldAssignmentFocusHandler);
+}
+
 async function fieldUnitCad(){
   clearFieldUnitMap();
   const {data:fs,error}=await supabase.from("field_sessions")
     .select("*,events(name,field_location_enabled,venue_type,field_layout_config),operational_periods(name,incident_prefix,status),units(name,status,event_id,current_map_layer_id,current_zone_id,current_transport_destination_text,current_transport_treatment_area_id,event_departments(name,status_profile))")
     .eq("auth_user_id",S.session.user.id).eq("active",true).order("started_at",{ascending:false}).limit(1).single();
   if(error){
+    setFieldAssignmentAlert(false);
+    S.fieldAssignmentSignature=null;
     S.fieldSession=null;
     return fieldJoin({message:"Your previous Field Unit session is no longer active. Re-enter the event for the current Operational Period."});
   }
@@ -7350,6 +7429,9 @@ async function fieldUnitCad(){
   const {data:a}=await supabase.from("incident_units").select("*,incidents(*)")
     .eq("unit_id",fs.unit_id).is("cleared_at",null).order("assigned_at",{ascending:false}).limit(1).maybeSingle();
   const incident=a?.incidents;
+  const assignmentNeedsAck=!!(a&&incident&&!a.acknowledged_at);
+  S.fieldAssignmentSignature=fieldAssignmentSignature(a);
+  setFieldAssignmentAlert(assignmentNeedsAck);
   let fieldLayer=null,fieldZone=null;
   if(incident?.map_layer_id){fieldLayer=(await supabase.from("event_map_layers").select("id,name,level_code").eq("id",incident.map_layer_id).maybeSingle()).data||null;}
   if(incident?.zone_id){fieldZone=(await supabase.from("event_zones").select("id,name").eq("id",incident.zone_id).maybeSingle()).data||null;}
@@ -7388,7 +7470,15 @@ async function fieldUnitCad(){
       <div class="small field-operational-period-line">Operational Period: <strong>${esc(fs.operational_periods?.name||"Active")}</strong>${fs.operational_periods?.incident_prefix?` · <span class="mono">${esc(fs.operational_periods.incident_prefix)}</span>`:""}</div>
     </div>`,
 
-    current_call:incident?`<div class="card assignment">
+    current_call:incident?`<div class="card assignment ${assignmentNeedsAck?"field-assignment-card-pending":""}">
+      ${assignmentNeedsAck?`<div class="field-new-assignment" role="alert" aria-live="assertive">
+        <div>
+          <div class="field-new-assignment-kicker">NEW ASSIGNMENT</div>
+          <strong>${esc(incident.incident_number)} · ${esc(incident.call_type)}</strong>
+          <div class="small">Assigned ${a?.assigned_at?dateTime24(a.assigned_at,{seconds:true}):"just now"}. Acknowledge receipt of this call.</div>
+        </div>
+        <button class="btn field-acknowledge-button" id="fieldAcknowledgeAssignment">ACKNOWLEDGE</button>
+      </div>`:`<div class="field-assignment-acknowledged"><span class="badge">ACKNOWLEDGED${a?.acknowledged_at?` · ${time24(a.acknowledged_at)}`:""}</span></div>`}
       <div class="row"><strong>${esc(incident.incident_number)}</strong><span class="incident-head-meta"><span class="call-timer field-call-timer" title="Elapsed call time" data-call-start="${esc(incident.created_at)}">00:00</span><span class="badge">${esc(incident.priority)}</span></span></div>
       <h2>${esc(incident.call_type)}</h2>
       ${fieldLayer?`<div class="venue-location-line"><span class="badge layer-badge">${esc(fieldLayer.name)}</span>${fieldZone?` <span class="badge">${esc(fieldZone.name)}</span>`:""}</div>`:""}
@@ -7558,6 +7648,28 @@ async function fieldUnitCad(){
     const ok=await setFieldStatus("TRANSPORTING",{destinationText,treatmentAreaId});
     button.disabled=false;
     if(ok)fieldUnitCad();
+  });
+
+  document.querySelector("#fieldAcknowledgeAssignment")?.addEventListener("click",async()=>{
+    if(!incident||!a)return;
+
+    const button=document.querySelector("#fieldAcknowledgeAssignment");
+    button.disabled=true;
+    button.textContent="ACKNOWLEDGING…";
+
+    const {error}=await supabase.rpc("field_acknowledge_assignment",{
+      p_field_session_id:fs.id,
+      p_incident_id:incident.id
+    });
+
+    if(error){
+      button.disabled=false;
+      button.textContent="ACKNOWLEDGE";
+      return alert(error.message);
+    }
+
+    setFieldAssignmentAlert(false);
+    await fieldUnitCad();
   });
 
   document.querySelector("#fieldArriveTreatmentArea")?.addEventListener("click",async()=>{
@@ -8520,9 +8632,22 @@ function subscribeField(unitId,sessionId){
     .subscribe();
 
   S.realtime.push(ch);
+  startFieldAssignmentFallback(unitId);
 }
 function cleanupRealtime(){
   S.realtime.forEach(ch=>supabase.removeChannel(ch));S.realtime=[];
+  setFieldAssignmentAlert(false);
+  if(S.fieldAssignmentSyncInterval){clearInterval(S.fieldAssignmentSyncInterval);S.fieldAssignmentSyncInterval=null;}
+  if(S.fieldAssignmentVisibilityHandler){
+    document.removeEventListener("visibilitychange",S.fieldAssignmentVisibilityHandler);
+    S.fieldAssignmentVisibilityHandler=null;
+  }
+  if(S.fieldAssignmentFocusHandler){
+    window.removeEventListener("focus",S.fieldAssignmentFocusHandler);
+    S.fieldAssignmentFocusHandler=null;
+  }
+  S.fieldAssignmentSyncInFlight=false;
+  S.fieldAssignmentSignature=null;
   clearFieldUnitMap();
   S.unitLocationMarkers.clear();
   clearDispatchIncidentMarkers();
