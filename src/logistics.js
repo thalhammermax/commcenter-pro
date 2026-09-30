@@ -1350,8 +1350,19 @@ function fieldMovementTaskHtml(movement,state,index){
   const flight=[movement.airline,movement.flight_number].filter(Boolean).join(" ");
   const underway=state?.underwayMovement?.id===movement.id;
   const queuedBehindOther=!!state?.underwayMovement&&state.underwayMovement.id!==movement.id;
+  const pendingAck=!movement.driver_acknowledged_at;
+  const actions=fieldNextActions(movement);
 
-  return `<section class="field-logistics-task ${underway?"field-logistics-task-underway":""}">
+  return `<section class="field-logistics-task ${underway?"field-logistics-task-underway":""} ${pendingAck?"field-move-card-pending":""}">
+    ${pendingAck?`<div class="field-new-move" role="alert" aria-live="assertive">
+      <div>
+        <div class="field-new-move-kicker">NEW MOVE ASSIGNMENT</div>
+        <strong>${esc(movement.movement_number)} · ${esc(movement.guest_name||"Guest")}</strong>
+        <div class="small">${esc([movement.origin,movement.destination].filter(Boolean).join(" → ")||"Route not entered")} · Assigned ${movement.assigned_at?esc(dateTime24(movement.assigned_at,{seconds:true})):"just now"}</div>
+      </div>
+      <button class="btn field-move-acknowledge-button" data-field-logistics-ack="${movement.id}">ACKNOWLEDGE MOVE</button>
+    </div>`:`<div class="field-move-acknowledged"><span class="badge">ACKNOWLEDGED${movement.driver_acknowledged_at?` · ${esc(time24(movement.driver_acknowledged_at))}`:""}</span></div>`}
+
     <div class="row">
       <div>
         <div class="small task-priority-label">${underway?"ACTIVE PRIMARY MOVE":index===0?"PRIMARY MOVE":"QUEUED MOVE"}</div>
@@ -1393,19 +1404,19 @@ function fieldMovementTaskHtml(movement,state,index){
 
     ${queuedBehindOther?`<div class="notice"><strong>Queued behind ${esc(state.underwayMovement.movement_number)}.</strong><br>Only one MOVE can be underway at a time. This assignment remains queued and visible.</div>`:""}
 
-    ${!movement.driver_acknowledged_at&&["ASSIGNED","READY"].includes(movement.status)?`
-      <button class="btn secondary block" data-field-logistics-ack="${movement.id}">Acknowledge MOVE</button>
-    `:movement.driver_acknowledged_at?`
-      <div class="small logistics-field-ack">Acknowledged ${esc(dateTime24(movement.driver_acknowledged_at))}</div>
-    `:""}
-
-    <div class="logistics-action-grid field-logistics-actions">
-      ${queuedBehindOther
-        ?``
-        :fieldNextActions(movement).map(([status,label,kind])=>`
-          <button class="btn ${kind==="danger"?"danger":"good"}" data-field-logistics-status="${status}" data-movement-id="${movement.id}">${esc(label)}</button>
-        `).join("")}
-    </div>
+    ${pendingAck?`<div class="small field-move-status-locked">Acknowledge this MOVE before using its Field Unit status controls.</div>`:`
+      <div class="field-task-status-head">
+        <div class="section-title">MOVE STATUS</div>
+        <span class="badge ${movementStatusClass(movement.status)}">${esc(movementStatusLabel(movement.status))}</span>
+      </div>
+      <div class="logistics-action-grid field-logistics-actions">
+        ${queuedBehindOther
+          ?`<div class="small muted">Status controls become available when the active MOVE is completed.</div>`
+          :actions.map(([status,label,kind])=>`
+            <button class="btn ${kind==="danger"?"danger":"good"}" data-field-logistics-status="${status}" data-movement-id="${movement.id}">${esc(label)}</button>
+          `).join("")||`<div class="small muted">No additional MOVE status action is available.</div>`}
+      </div>
+    `}
   </section>`;
 }
 
