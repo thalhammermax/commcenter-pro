@@ -5387,3 +5387,48 @@ body.field-dual-task-alert::after{
   .incident-linked-move-grid{grid-template-columns:1fr}
   .incident-linked-move-route{grid-column:auto}
 }
+
+/* v0.15.7 — module-required department status profiles */
+.department-status-picker-locked{
+  opacity:.88;
+}
+.status-select-option-locked{
+  cursor:not-allowed;
+}
+.status-select-option-locked input{
+  cursor:not-allowed;
+}
+.department-status-lock-note{
+  padding:8px 10px;
+  border:1px solid var(--cc-line, #334155);
+  border-radius:8px;
+  background:rgba(148,163,184,.08);
+}
+
+/* v0.15.8 — editable event status templates */
+.status-template-admin-card .status-template-grid{
+  margin-top:12px;
+}
+.status-template-panel{
+  border:1px solid var(--cc-line,#334155);
+  border-radius:10px;
+  padding:12px;
+  background:rgba(15,23,42,.22);
+}
+.status-template-panel .department-status-picker{
+  margin-top:10px;
+}
+.status-template-required{
+  opacity:.9;
+}
+.status-template-required input{
+  cursor:not-allowed;
+}
+.status-template-required-label{
+  display:inline-block;
+  margin-left:5px;
+  font-size:9px;
+  letter-spacing:.06em;
+  font-weight:800;
+  opacity:.7;
+}

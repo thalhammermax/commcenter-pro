@@ -211,32 +211,107 @@ const DEPARTMENT_STATUS_CATALOG=[
   {value:"OUT_OF_SERVICE",label:"Out of Service"}
 ];
 
-const DEFAULT_DEPARTMENT_STATUSES=[
+const STANDARD_CAD_DEPARTMENT_STATUSES=[
   "AVAILABLE",
-  "RESPONDING",
+  "EN_ROUTE",
   "ON_SCENE",
+  "WORKING",
   "CLEAR",
   "OUT_OF_SERVICE"
 ];
+
+const EMS_DEPARTMENT_STATUSES=[
+  "AVAILABLE",
+  "EN_ROUTE",
+  "ON_SCENE",
+  "WORKING",
+  "TRANSPORTING",
+  "AT_HOSPITAL",
+  "CLEAR",
+  "OUT_OF_SERVICE"
+];
+
+const STANDARD_CAD_TEMPLATE_REQUIRED=["AVAILABLE","EN_ROUTE","ON_SCENE","OUT_OF_SERVICE"];
+const GUEST_LOGISTICS_CAD_TEMPLATE_REQUIRED=["AVAILABLE","EN_ROUTE","ON_SCENE","OUT_OF_SERVICE"];
+const EMS_CAD_TEMPLATE_REQUIRED=["AVAILABLE","EN_ROUTE","ON_SCENE","TRANSPORTING","AT_HOSPITAL","OUT_OF_SERVICE"];
+const CAD_TERMINAL_STATUSES=new Set(["AVAILABLE","CLEAR","COMPLETE"]);
+const DEFAULT_DEPARTMENT_STATUSES=[...STANDARD_CAD_DEPARTMENT_STATUSES];
+
+function eventStatusTemplate(kind){
+  if(kind==="EMS")return Array.isArray(S.event?.ems_status_template)?S.event.ems_status_template:[...EMS_DEPARTMENT_STATUSES];
+  if(kind==="GUEST_LOGISTICS")return Array.isArray(S.event?.guest_logistics_cad_status_template)?S.event.guest_logistics_cad_status_template:[...STANDARD_CAD_DEPARTMENT_STATUSES];
+  return Array.isArray(S.event?.cad_status_template)?S.event.cad_status_template:[...STANDARD_CAD_DEPARTMENT_STATUSES];
+}
+
+function requiredDepartmentStatuses({emsEnabled=false,guestLogisticsEnabled=false}={}){
+  if(emsEnabled)return [...eventStatusTemplate("EMS")];
+  if(guestLogisticsEnabled)return [...eventStatusTemplate("GUEST_LOGISTICS")];
+  return null;
+}
+
+function departmentStatusModeDescription({emsEnabled=false,guestLogisticsEnabled=false}={}){
+  if(emsEnabled&&guestLogisticsEnabled){
+    return "Locked to the event EMS CAD template. MOVE statuses remain separate. Edit the event Status Templates to change this profile for every EMS-enabled department.";
+  }
+  if(emsEnabled){
+    return "Locked to the event EMS CAD template. Edit Status Templates above to change the inherited profile; required EMS workflow statuses cannot be removed.";
+  }
+  if(guestLogisticsEnabled){
+    return "Locked to the event Guest Logistics CAD template. MOVE statuses are separate. Edit Status Templates above to change the inherited CAD profile.";
+  }
+  return "This department may use a custom profile. New standard departments start from the event Standard CAD template. Assigned is automatic; Available/Clear/Complete from an active CAD assignment closes the ticket.";
+}
 
 function statusLabel(value){
   return DEPARTMENT_STATUS_CATALOG.find(s=>s.value===value)?.label || String(value||"").replaceAll("_"," ");
 }
 
-function departmentStatusPicker(name,selected=DEFAULT_DEPARTMENT_STATUSES){
+function departmentStatusPicker(name,selected=DEFAULT_DEPARTMENT_STATUSES,{locked=false}={}){
   const chosen=new Set(Array.isArray(selected)?selected:[]);
-  return `<div class="department-status-picker">
+  return `<div class="department-status-picker ${locked?"department-status-picker-locked":""}">
     ${DEPARTMENT_STATUS_CATALOG.map(status=>`
-      <label class="status-select-option">
-        <input type="checkbox" name="${esc(name)}" value="${status.value}" ${chosen.has(status.value)?"checked":""}>
+      <label class="status-select-option ${locked?"status-select-option-locked":""}">
+        <input type="checkbox" name="${esc(name)}" value="${status.value}" ${chosen.has(status.value)?"checked":""} ${locked?"disabled":""}>
         <span>${esc(status.label)}</span>
       </label>
     `).join("")}
   </div>`;
 }
 
+function statusTemplatePicker(name,selected,required=[]){
+  const chosen=new Set(Array.isArray(selected)?selected:[]);
+  const requiredSet=new Set(required);
+  return `<div class="department-status-picker status-template-picker">
+    ${DEPARTMENT_STATUS_CATALOG.map(status=>{
+      const isRequired=requiredSet.has(status.value);
+      return `<label class="status-select-option ${isRequired?"status-template-required":""}">
+        <input type="checkbox" name="${esc(name)}" value="${status.value}" ${chosen.has(status.value)||isRequired?"checked":""} ${isRequired?"disabled":""}>
+        <span>${esc(status.label)}${isRequired?` <small class="status-template-required-label">REQUIRED</small>`:""}</span>
+      </label>`;
+    }).join("")}
+  </div>`;
+}
+
+function selectedStatusTemplate(name,required=[]){
+  const selected=selectedDepartmentStatuses(name);
+  return [...new Set([...required,...selected])];
+}
+
 function selectedDepartmentStatuses(name){
   return [...document.querySelectorAll(`input[name="${name}"]:checked`)].map(el=>el.value);
+}
+
+function syncDepartmentStatusProfileUi({emsCheckbox,guestCheckbox,statusName,host,note}){
+  if(!host)return;
+  const emsEnabled=!!emsCheckbox?.checked;
+  const guestLogisticsEnabled=!!guestCheckbox?.checked;
+  const lockedStatuses=requiredDepartmentStatuses({emsEnabled,guestLogisticsEnabled});
+  const current=lockedStatuses||selectedDepartmentStatuses(statusName);
+  host.innerHTML=departmentStatusPicker(statusName,current,{locked:!!lockedStatuses});
+  if(note){
+    note.textContent=departmentStatusModeDescription({emsEnabled,guestLogisticsEnabled});
+    note.classList.toggle("department-status-lock-note",!!lockedStatuses);
+  }
 }
 
 
@@ -2638,6 +2713,7 @@ function activityTitle(action){
     EMS_TRANSPORT_REFUSAL:"Transport ended with refusal",
     EMS_ENCOUNTER_CLOSED:"EMS patient flow closed",
     EMS_TREATMENT_CLEARED_BY_DISPATCH:"Patient cleared from treatment by Dispatch",
+    EMS_TREATMENT_CLEARED_BY_FIELD:"Patient cleared from treatment by Field Unit",
     TREATMENT_LAYOUT_UPDATED:"Treatment Area layout updated",
     INCIDENT_CLOSED:"Incident closed"
   };
@@ -2802,10 +2878,23 @@ function bindIncidentClicks(){
   document.querySelectorAll("[data-unit-detail]").forEach(b=>b.onclick=()=>selectUnit(b.dataset.unitDetail));
 }
 
-function unitStatusOptions(unit){
+const UNIT_AVAILABILITY_STATUSES=new Set(["AVAILABLE","OUT_OF_SERVICE"]);
+
+function departmentStatusProfileForUnit(unit){
   const dep=S.departments.find(d=>d.id===unit.department_id);
-  const raw=Array.isArray(dep?.status_profile)?dep.status_profile:[];
-  return [...new Set(["ASSIGNED",...raw])];
+  return [...new Set(Array.isArray(dep?.status_profile)?dep.status_profile:[])];
+}
+
+function unitStatusOptions(unit){
+  // Active CAD controls show task states plus terminal AVAILABLE. ASSIGNED is
+  // automatic. OUT_OF_SERVICE remains a standalone availability state only.
+  // AVAILABLE / CLEAR / COMPLETE are routed through incident closure instead
+  // of being treated as ordinary assignment-status mutations.
+  return departmentStatusProfileForUnit(unit).filter(status=>status!=="OUT_OF_SERVICE");
+}
+
+function unitAvailabilityOptions(unit){
+  return departmentStatusProfileForUnit(unit).filter(status=>UNIT_AVAILABILITY_STATUSES.has(status));
 }
 
 
@@ -3041,6 +3130,117 @@ async function maybePromptAmbulanceTransportOutcome({
   }
 }
 
+async function fieldCloseIncidentFromStatus({unitId,incident,requestedStatus="AVAILABLE",onComplete}){
+  if(!incident?.id)return false;
+
+  const [departmentContext,encounterContext,dispositionContext]=await Promise.all([
+    supabase.from("incident_departments")
+      .select("department_id,event_departments!inner(ems_enabled)")
+      .eq("incident_id",incident.id)
+      .eq("event_departments.ems_enabled",true)
+      .limit(1),
+    supabase.from("ems_encounters")
+      .select("id,current_status,final_disposition")
+      .eq("event_id",S.eventId)
+      .eq("incident_id",incident.id)
+      .order("created_at",{ascending:false})
+      .limit(10),
+    supabase.from("event_dispositions")
+      .select("scope,code,label,sort_order")
+      .eq("event_id",S.eventId)
+      .eq("active",true)
+      .order("scope")
+      .order("sort_order")
+      .order("label")
+  ]);
+
+  if(departmentContext.error)console.warn("Could not determine EMS department context for field close",departmentContext.error);
+  if(encounterContext.error)console.warn("Could not determine EMS encounter context for field close",encounterContext.error);
+  if(dispositionContext.error)return alert(dispositionContext.error.message)||true;
+
+  const emsEncounters=encounterContext.data||[];
+  const hasEms=!!departmentContext.data?.length||!!emsEncounters.length;
+  const generalOptions=(dispositionContext.data||[]).filter(row=>row.scope==="GENERAL");
+  const emsOptions=(dispositionContext.data||[]).filter(row=>row.scope==="EMS");
+
+  if(!generalOptions.length)return alert("No General dispositions are configured for this event. An Event Admin must configure them before a Field Unit can close a CAD ticket.")||true;
+  if(hasEms&&!emsOptions.length)return alert("No EMS dispositions are configured for this event. An Event Admin must configure them before this EMS ticket can be closed from the Field Unit portal.")||true;
+
+  const previousDisposition=emsEncounters.find(row=>row.final_disposition)?.final_disposition||"";
+  const defaultGeneral=generalOptions.find(row=>row.code==="COMPLETED")?.code||generalOptions[0].code;
+  const terminalLabel=String(requestedStatus||"AVAILABLE").replaceAll("_"," ");
+
+  S.incidentModalMode="field-close-disposition";
+  const content=openIncidentModalShell();
+  content.innerHTML=`<div class="incident-modal-header">
+    <div>
+      <div class="incident-modal-eyebrow">${esc(terminalLabel)} · CLOSE CAD TICKET</div>
+      <div class="incident-modal-title-row"><h2 id="incidentModalTitle">${esc(incident.incident_number)}</h2></div>
+      <div class="incident-modal-nature">${esc(incident.call_type||"Incident")}</div>
+    </div>
+    <button class="incident-modal-close" id="closeIncidentModal" aria-label="Cancel incident close">×</button>
+  </div>
+  <div class="close-disposition-modal stack">
+    <div class="notice"><strong>${esc(terminalLabel)} closes this CAD ticket.</strong><br>All units still committed to the incident will be released and returned to their appropriate available state. MOVE assignments remain separate.</div>
+    <div class="${hasEms?"grid2":""}">
+      <div>
+        <label>General Call Disposition</label>
+        <select id="fieldCloseGeneralDisposition">
+          ${generalOptions.map(option=>`<option value="${esc(option.code)}" ${option.code===defaultGeneral?"selected":""}>${esc(option.label)}</option>`).join("")}
+        </select>
+      </div>
+      ${hasEms?`<div>
+        <label>EMS Patient Disposition</label>
+        <select id="fieldCloseEmsDisposition">
+          <option value="">Choose EMS disposition…</option>
+          ${emsOptions.map(option=>`<option value="${esc(option.code)}" ${option.code===previousDisposition?"selected":""}>${esc(option.label)}</option>`).join("")}
+        </select>
+      </div>`:""}
+    </div>
+    <div id="fieldCloseError" class="small destructive-error" role="alert" aria-live="polite"></div>
+  </div>
+  <div class="incident-modal-footer">
+    <button class="btn secondary" id="cancelFieldClose">Cancel</button>
+    <button class="btn danger" id="confirmFieldClose">Close Ticket & Set Available</button>
+  </div>`;
+
+  const cancel=()=>{closeIncidentModal();};
+  document.querySelector("#closeIncidentModal").onclick=cancel;
+  document.querySelector("#cancelFieldClose").onclick=cancel;
+  document.querySelector("#confirmFieldClose").onclick=async()=>{
+    const generalDisposition=document.querySelector("#fieldCloseGeneralDisposition").value;
+    const emsDisposition=hasEms?document.querySelector("#fieldCloseEmsDisposition").value:null;
+    const errorHost=document.querySelector("#fieldCloseError");
+    if(!generalDisposition){
+      errorHost.textContent="Choose a General call disposition.";
+      return;
+    }
+    if(hasEms&&!emsDisposition){
+      errorHost.textContent="Choose an EMS patient disposition.";
+      return;
+    }
+
+    const button=document.querySelector("#confirmFieldClose");
+    button.disabled=true;
+    button.textContent="Closing…";
+    const {error}=await supabase.rpc("close_incident_v2",{
+      p_incident_id:incident.id,
+      p_disposition:generalDisposition,
+      p_ems_disposition:emsDisposition
+    });
+    if(error){
+      button.disabled=false;
+      button.textContent="Close Ticket & Set Available";
+      errorHost.textContent=error.message;
+      return;
+    }
+    closeIncidentModal();
+    if(onComplete)await onComplete();
+  };
+
+  return true;
+}
+
 async function dispatcherSetUnitStatus(unitId,status,incidentId=null,{destinationText=null,treatmentAreaId=null}={}){
   const {error}=await supabase.rpc("staff_set_unit_status_v2",{
     p_unit_id:unitId,
@@ -3186,7 +3386,7 @@ async function openCloseIncidentDispositionModal(incident,{hasEms=false}={}){
         <select id="closeGeneralDisposition">
           <option value="">Choose disposition…</option>
           ${generalOptions.map(option=>`
-            <option value="${esc(option.code)}">${esc(option.label)}</option>
+            <option value="${esc(option.code)}" ${option.code==="COMPLETED"?"selected":""}>${esc(option.label)}</option>
           `).join("")}
         </select>
         <div class="small muted">Overall operational outcome for the CAD incident.</div>
@@ -3593,7 +3793,7 @@ function unitStatusButtonsHtml(u,active,taskStatus=u.status){
   // is unassigned, Dispatch may only change its standalone availability state.
   const options=active
     ?unitStatusOptions(u)
-    :unitStatusOptions(u).filter(status=>["AVAILABLE","OUT_OF_SERVICE"].includes(status));
+    :unitAvailabilityOptions(u);
 
   return `<div class="status-buttons dispatcher-status-grid">
     ${options.map(status=>`
@@ -3606,7 +3806,7 @@ function unitStatusButtonsHtml(u,active,taskStatus=u.status){
     `).join("")}
   </div>
   <div class="small muted">${active
-    ?"These controls update the CAD ticket status independently from any assigned MOVE."
+    ?"These controls update the CAD ticket independently from any assigned MOVE. Available / Clear / Complete closes the ticket and releases all committed units."
     :"Only availability states are available until this unit is assigned to an active CAD ticket."}</div>`;
 }
 
@@ -3746,6 +3946,10 @@ function selectUnit(unitId){
 
   document.querySelectorAll(`[data-dispatch-status-option="${u.id}"]`).forEach(btn=>btn.onclick=async()=>{
     const status=btn.dataset.status;
+
+    if(active&&CAD_TERMINAL_STATUSES.has(status)){
+      return openCloseIncidentDispositionModal(active.incident,{hasEms:incidentHasEmsDepartment(active.incident)});
+    }
 
     if(status==="TRANSPORTING"){
       document.querySelector("#unitTransportDestinationPanel")?.classList.remove("hidden");
@@ -6224,6 +6428,35 @@ function renderEventSetup(){
       <div id="pinMsg" class="small muted"></div>
     </div>
 
+    <div class="card status-template-admin-card">
+      <div class="row">
+        <div>
+          <h2>Status Templates</h2>
+          <div class="small muted">These are the event-wide defaults used to keep CAD workflows consistent. EMS and Guest Logistics departments inherit their applicable template and cannot edit it at the department level.</div>
+        </div>
+      </div>
+      <div class="grid3 status-template-grid">
+        <div class="status-template-panel">
+          <div class="section-title">Standard CAD</div>
+          <div class="small muted">Default for newly created ordinary departments. Existing ordinary departments may still customize their own profile.</div>
+          ${statusTemplatePicker("standardCadTemplate",eventStatusTemplate("STANDARD"),STANDARD_CAD_TEMPLATE_REQUIRED)}
+        </div>
+        <div class="status-template-panel">
+          <div class="section-title">Guest Logistics CAD</div>
+          <div class="small muted">Locked CAD-ticket statuses for Guest Logistics departments. MOVE statuses remain completely separate.</div>
+          ${statusTemplatePicker("guestCadTemplate",eventStatusTemplate("GUEST_LOGISTICS"),GUEST_LOGISTICS_CAD_TEMPLATE_REQUIRED)}
+        </div>
+        <div class="status-template-panel">
+          <div class="section-title">EMS CAD</div>
+          <div class="small muted">Locked CAD-ticket statuses for EMS departments. Transporting and At Hospital remain required for patient transport workflows.</div>
+          ${statusTemplatePicker("emsCadTemplate",eventStatusTemplate("EMS"),EMS_CAD_TEMPLATE_REQUIRED)}
+        </div>
+      </div>
+      <div class="notice" style="margin-top:12px"><strong>Terminal CAD statuses:</strong> Available, Clear, and Complete close the incident rather than merely changing one unit's status. Out of Service is only available when the unit is not committed to a CAD ticket.</div>
+      <button class="btn" id="saveStatusTemplates">Save Status Templates</button>
+      <div id="statusTemplateSaveMsg" class="small muted"></div>
+    </div>
+
     <div class="card">
       <h2>Departments</h2>
       <div id="deptList">${S.departments.map(d=>`<div class="poi-row department-row">
@@ -6268,9 +6501,9 @@ function renderEventSetup(){
       </label>
 
       <div style="margin-top:12px">
-        <label>Field Unit Status Options</label>
-        <div class="small muted" style="margin-bottom:8px">Select the buttons field units in this department should have available. ASSIGNED is handled automatically by Dispatch.</div>
-        ${departmentStatusPicker("newDeptStatuses")}
+        <label>CAD Task / Unit Status Profile</label>
+        <div id="newDeptStatusNote" class="small muted" style="margin-bottom:8px">${esc(departmentStatusModeDescription())}</div>
+        <div id="newDeptStatusPickerHost">${departmentStatusPicker("newDeptStatuses",eventStatusTemplate("STANDARD"))}</div>
       </div>
 
       <button class="btn" id="addDept">Add Department</button>
@@ -6402,6 +6635,34 @@ function renderEventSetup(){
     });
   });
 
+  document.querySelector("#saveStatusTemplates")?.addEventListener("click",async()=>{
+    const button=document.querySelector("#saveStatusTemplates");
+    const msg=document.querySelector("#statusTemplateSaveMsg");
+    const cadTemplate=selectedStatusTemplate("standardCadTemplate",STANDARD_CAD_TEMPLATE_REQUIRED);
+    const guestTemplate=selectedStatusTemplate("guestCadTemplate",GUEST_LOGISTICS_CAD_TEMPLATE_REQUIRED);
+    const emsTemplate=selectedStatusTemplate("emsCadTemplate",EMS_CAD_TEMPLATE_REQUIRED);
+
+    button.disabled=true;
+    if(msg)msg.textContent="Saving templates…";
+    const {error}=await supabase.rpc("admin_update_event_status_templates",{
+      p_event_id:S.eventId,
+      p_cad_template:cadTemplate,
+      p_guest_logistics_template:guestTemplate,
+      p_ems_template:emsTemplate
+    });
+    button.disabled=false;
+
+    if(error){
+      if(msg)msg.textContent="";
+      return alert(error.message);
+    }
+
+    await loadEventOps();
+    renderEventSetup();
+    const saved=document.querySelector("#statusTemplateSaveMsg");
+    if(saved)saved.textContent="Templates saved. EMS and Guest Logistics departments were synchronized automatically.";
+  });
+
   document.querySelector("#archivedResources")?.addEventListener("click",()=>renderArchivedResourcesModal());
 
   document.querySelector("#archiveEvent")?.addEventListener("click",()=>{
@@ -6431,10 +6692,24 @@ function renderEventSetup(){
     });
   });
 
+  const newDeptEmsCheckbox=document.querySelector("#newDeptEmsEnabled");
+  const newDeptGuestCheckbox=document.querySelector("#newDeptGuestLogisticsEnabled");
+  const syncNewDeptStatuses=()=>syncDepartmentStatusProfileUi({
+    emsCheckbox:newDeptEmsCheckbox,
+    guestCheckbox:newDeptGuestCheckbox,
+    statusName:"newDeptStatuses",
+    host:document.querySelector("#newDeptStatusPickerHost"),
+    note:document.querySelector("#newDeptStatusNote")
+  });
+  newDeptEmsCheckbox?.addEventListener("change",syncNewDeptStatuses);
+  newDeptGuestCheckbox?.addEventListener("change",syncNewDeptStatuses);
+
   document.querySelector("#addDept").onclick=async()=>{
     const name=document.querySelector("#deptName").value.trim();
     const shortName=document.querySelector("#deptShort").value.trim().toUpperCase();
-    const statuses=selectedDepartmentStatuses("newDeptStatuses");
+    const emsEnabled=newDeptEmsCheckbox.checked;
+    const guestLogisticsEnabled=newDeptGuestCheckbox.checked;
+    const statuses=requiredDepartmentStatuses({emsEnabled,guestLogisticsEnabled})||selectedDepartmentStatuses("newDeptStatuses");
 
     if(!name)return alert("Enter a department name.");
     if(!statuses.length)return alert("Select at least one field unit status.");
@@ -6444,8 +6719,8 @@ function renderEventSetup(){
       name,
       short_name:shortName,
       status_profile:statuses,
-      ems_enabled:document.querySelector("#newDeptEmsEnabled").checked,
-      guest_logistics_enabled:document.querySelector("#newDeptGuestLogisticsEnabled").checked
+      ems_enabled:emsEnabled,
+      guest_logistics_enabled:guestLogisticsEnabled
     });
     if(error)alert(error.message);else await eventAdmin("setup");
   };
@@ -6567,21 +6842,35 @@ function renderDepartmentStatusEditor(departmentId){
       </span>
     </label>
 
-    <p class="small muted">These become the selectable status buttons on field devices assigned to ${esc(dep.name)}.</p>
-    ${departmentStatusPicker("editDeptStatuses",dep.status_profile)}
+    <p id="editDeptStatusNote" class="small muted">${esc(departmentStatusModeDescription({emsEnabled:dep.ems_enabled,guestLogisticsEnabled:dep.guest_logistics_enabled}))}</p>
+    <div id="editDeptStatusPickerHost">${departmentStatusPicker("editDeptStatuses",requiredDepartmentStatuses({emsEnabled:dep.ems_enabled,guestLogisticsEnabled:dep.guest_logistics_enabled})||dep.status_profile,{locked:dep.ems_enabled||dep.guest_logistics_enabled})}</div>
     <button class="btn" id="saveDeptStatuses">Save Department</button>
   </div>`;
 
   document.querySelector("#cancelDeptStatusEdit").onclick=()=>{host.innerHTML="";};
+  const editDeptEmsCheckbox=document.querySelector("#editDeptEmsEnabled");
+  const editDeptGuestCheckbox=document.querySelector("#editDeptGuestLogisticsEnabled");
+  const syncEditDeptStatuses=()=>syncDepartmentStatusProfileUi({
+    emsCheckbox:editDeptEmsCheckbox,
+    guestCheckbox:editDeptGuestCheckbox,
+    statusName:"editDeptStatuses",
+    host:document.querySelector("#editDeptStatusPickerHost"),
+    note:document.querySelector("#editDeptStatusNote")
+  });
+  editDeptEmsCheckbox?.addEventListener("change",syncEditDeptStatuses);
+  editDeptGuestCheckbox?.addEventListener("change",syncEditDeptStatuses);
+
   document.querySelector("#saveDeptStatuses").onclick=async()=>{
-    const statuses=selectedDepartmentStatuses("editDeptStatuses");
+    const emsEnabled=editDeptEmsCheckbox.checked;
+    const guestLogisticsEnabled=editDeptGuestCheckbox.checked;
+    const statuses=requiredDepartmentStatuses({emsEnabled,guestLogisticsEnabled})||selectedDepartmentStatuses("editDeptStatuses");
     if(!statuses.length)return alert("Select at least one field unit status.");
 
     const {error}=await supabase.from("event_departments")
       .update({
         status_profile:statuses,
-        ems_enabled:document.querySelector("#editDeptEmsEnabled").checked,
-        guest_logistics_enabled:document.querySelector("#editDeptGuestLogisticsEnabled").checked
+        ems_enabled:emsEnabled,
+        guest_logistics_enabled:guestLogisticsEnabled
       })
       .eq("id",departmentId)
       .eq("event_id",S.eventId);
@@ -7713,7 +8002,8 @@ async function fieldUnitCad(){
   let fieldLayer=null,fieldZone=null;
   if(incident?.map_layer_id){fieldLayer=(await supabase.from("event_map_layers").select("id,name,level_code").eq("id",incident.map_layer_id).maybeSingle()).data||null;}
   if(incident?.zone_id){fieldZone=(await supabase.from("event_zones").select("id,name").eq("id",incident.zone_id).maybeSingle()).data||null;}
-  const statuses=fs.units?.event_departments?.status_profile||["AVAILABLE","RESPONDING","ON_SCENE","CLEAR"];
+  const statusProfile=fs.units?.event_departments?.status_profile||STANDARD_CAD_DEPARTMENT_STATUSES;
+  const statuses=statusProfile.filter(status=>status!=="OUT_OF_SERVICE");
   const [{data:fieldMapLayers},{data:fieldZones},{data:fieldEmsDepartments}]=await Promise.all([
     supabase.from("event_map_layers").select("id,name,level_code,is_default").eq("event_id",S.eventId).eq("active",true).eq("status","published").order("sort_order"),
     supabase.from("event_zones").select("id,map_layer_id,name").eq("event_id",S.eventId).eq("active",true).order("sort_order"),
@@ -7745,7 +8035,7 @@ async function fieldUnitCad(){
   const cadTaskStatus=incident?(a?.cad_status||"ASSIGNED"):fs.units?.status;
   // CAD response states only make sense while this unit has an active CAD assignment.
   // With no incident, Field Unit exposes availability controls only.
-  const standaloneUnitStatuses=statuses.filter(status=>["AVAILABLE","OUT_OF_SERVICE"].includes(status));
+  const standaloneUnitStatuses=statusProfile.filter(status=>UNIT_AVAILABILITY_STATUSES.has(status));
 
   const fieldLayout=normalizeFieldLayoutConfig(fs.events?.field_layout_config);
   const liveLocationVisible=fieldLayout.blocks.find(block=>block.id==="live_location")?.enabled!==false;
@@ -7817,7 +8107,7 @@ async function fieldUnitCad(){
     status_controls:incident?`<div class="field-status-layout-block card cad-task-status-card">
       <div class="row"><div class="section-title">${logisticsState?.movements?.length?"SECONDARY CAD STATUS":"CAD TICKET STATUS"}</div><span class="badge cad-task-status-badge">${esc(String(cadTaskStatus||"ASSIGNED").replaceAll("_"," "))}</span></div>
       <div class="status-buttons">${statuses.map(status=>`<button class="btn field-status-button ${fieldStatusColorClass(status)} ${status===cadTaskStatus?"field-status-active":""}" data-cad-status="${esc(status)}" aria-pressed="${status===cadTaskStatus?"true":"false"}">${esc(status.replaceAll("_"," "))}</button>`).join("")}</div>
-      ${logisticsState?.movements?.length?`<div class="small muted">This status belongs only to ${esc(incident.incident_number)}. MOVE status is controlled independently above.</div>`:""}
+      <div class="small muted">Available / Clear / Complete closes ${esc(incident.incident_number)} and releases all units still committed to the ticket.${logisticsState?.movements?.length?" MOVE status remains independent.":""}</div>
     </div>`:logisticsState?.movements?.length?"":standaloneUnitStatuses.length?`<div class="field-status-layout-block card standalone-unit-status-card">
       <div class="row"><div class="section-title">UNIT AVAILABILITY</div><span class="badge status-${esc(fs.units?.status)}">${esc(String(fs.units?.status||"").replaceAll("_"," "))}</span></div>
       <div class="status-buttons">${standaloneUnitStatuses.map(status=>`<button class="btn field-status-button ${fieldStatusColorClass(status)} ${status===fs.units?.status?"field-status-active":""}" data-unit-status-option="${esc(status)}" aria-pressed="${status===fs.units?.status?"true":"false"}">${esc(status.replaceAll("_"," "))}</button>`).join("")}</div>
@@ -7918,22 +8208,30 @@ async function fieldUnitCad(){
     const requested=b.dataset.cadStatus||b.dataset.unitStatusOption;
     const currentTaskStatus=incident?cadTaskStatus:fs.units.status;
 
+    if(incident&&CAD_TERMINAL_STATUSES.has(requested)){
+      if(fieldIsAmbulance){
+        const handled=await maybePromptAmbulanceTransportOutcome({
+          unitId:fs.unit_id,
+          incidentId:incident.id,
+          unitName:fs.units?.name,
+          incidentNumber:incident.incident_number,
+          onComplete:async()=>fieldUnitCad(),
+          onCancel:()=>{}
+        });
+        if(handled)return;
+      }
+      return fieldCloseIncidentFromStatus({
+        unitId:fs.unit_id,
+        incident,
+        requestedStatus:requested,
+        onComplete:async()=>fieldUnitCad()
+      });
+    }
+
     if(requested==="TRANSPORTING"){
       document.querySelector("#fieldTransportDestinationPanel")?.classList.remove("hidden");
       document.querySelector(fieldIsAmbulance?"#fieldTransportFacility":"#fieldTransportTreatmentArea")?.focus();
       return;
-    }
-
-    if(requested==="AVAILABLE"&&fieldIsAmbulance&&incident?.id){
-      const handled=await maybePromptAmbulanceTransportOutcome({
-        unitId:fs.unit_id,
-        incidentId:incident.id,
-        unitName:fs.units?.name,
-        incidentNumber:incident.incident_number,
-        onComplete:async()=>fieldUnitCad(),
-        onCancel:()=>{}
-      });
-      if(handled)return;
     }
 
     if(requested===currentTaskStatus)return;
