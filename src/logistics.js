@@ -316,12 +316,10 @@ function activeCadAssignment(unitId,ctx){
   return null;
 }
 
-function activeMovementForUnit(unitId,movements,currentId=null){
-  return (movements||[]).find(m=>
-    m.assigned_unit_id===unitId
-    &&m.id!==currentId
-    &&["EN_ROUTE_PICKUP","AT_PICKUP","PASSENGER_ONBOARD","EN_ROUTE_DESTINATION"].includes(m.status)
-  )||null;
+function movementsForUnit(unitId,movements,currentId=null){
+  return (movements||[])
+    .filter(m=>m.assigned_unit_id===unitId&&m.id!==currentId&&!TERMINAL_STATUSES.has(m.status))
+    .sort((a,b)=>new Date(a.scheduled_at||0).getTime()-new Date(b.scheduled_at||0).getTime());
 }
 
 function driverUnitOptions(ctx,movements,movement){
@@ -330,12 +328,13 @@ function driverUnitOptions(ctx,movements,movement){
     .filter(unit=>unit.active!==false&&logisticsDeptIds.has(unit.department_id))
     .map(unit=>{
       const cad=activeCadAssignment(unit.id,ctx);
-      const other=activeMovementForUnit(unit.id,movements,movement.id);
-      const suffix=other
-        ?` · UNDERWAY ${other.movement_number}`
-        :cad
-          ?` · CAD ${cad.incident_number}`
-          :` · ${String(unit.status||"").replaceAll("_"," ")}`;
+      const otherMoves=movementsForUnit(unit.id,movements,movement.id);
+      const underway=otherMoves.find(m=>["EN_ROUTE_PICKUP","AT_PICKUP","PASSENGER_ONBOARD","EN_ROUTE_DESTINATION"].includes(m.status));
+      const parts=[];
+      if(otherMoves.length)parts.push(`${otherMoves.length} other MOVE${otherMoves.length===1?"":"S"}${underway?` · underway ${underway.movement_number}`:""}`);
+      if(cad)parts.push(`secondary CAD ${cad.incident_number}`);
+      if(!parts.length)parts.push(String(unit.status||"").replaceAll("_"," "));
+      const suffix=` · ${parts.join(" · ")}`;
       return `<option value="${unit.id}" ${unit.id===movement.assigned_unit_id?"selected":""}>${esc(unit.name)}${esc(suffix)}</option>`;
     })
     .join("");
@@ -1307,13 +1306,20 @@ export async function loadFieldLogisticsState(eventId,unitId){
 
   if(error)throw error;
 
-  const rows=data||[];
-  const underwayStatuses=["EN_ROUTE_PICKUP","AT_PICKUP","PASSENGER_ONBOARD","EN_ROUTE_DESTINATION"];
-  const current=rows.find(row=>underwayStatuses.includes(row.status))||rows[0]||null;
+  const underwayStatuses=new Set(["EN_ROUTE_PICKUP","AT_PICKUP","PASSENGER_ONBOARD","EN_ROUTE_DESTINATION"]);
+  const rows=[...(data||[])].sort((a,b)=>{
+    const underwayDiff=Number(underwayStatuses.has(b.status))-Number(underwayStatuses.has(a.status));
+    if(underwayDiff)return underwayDiff;
+    return new Date(a.scheduled_at||0).getTime()-new Date(b.scheduled_at||0).getTime();
+  });
+  const underwayMovement=rows.find(row=>underwayStatuses.has(row.status))||null;
+  const current=underwayMovement||rows[0]||null;
 
   return {
     current,
-    underway:!!current&&underwayStatuses.includes(current.status),
+    underway:!!underwayMovement,
+    underwayMovement,
+    movements:rows,
     upcoming:rows
   };
 }
@@ -1340,16 +1346,15 @@ function fieldNextActions(movement){
   }
 }
 
-export function fieldLogisticsPanelHtml(state){
-  const movement=state?.current;
-  if(!movement)return "";
-
+function fieldMovementTaskHtml(movement,state,index){
   const flight=[movement.airline,movement.flight_number].filter(Boolean).join(" ");
+  const underway=state?.underwayMovement?.id===movement.id;
+  const queuedBehindOther=!!state?.underwayMovement&&state.underwayMovement.id!==movement.id;
 
-  return `<div class="card field-logistics-card">
+  return `<section class="field-logistics-task ${underway?"field-logistics-task-underway":""}">
     <div class="row">
       <div>
-        <div class="section-title">GUEST LOGISTICS MOVEMENT</div>
+        <div class="small task-priority-label">${underway?"ACTIVE PRIMARY MOVE":index===0?"PRIMARY MOVE":"QUEUED MOVE"}</div>
         <div class="row start">
           <strong class="big">${esc(movement.movement_number)}</strong>
           <span class="badge ${movementStatusClass(movement.status)}">${esc(movementStatusLabel(movement.status))}</span>
@@ -1386,59 +1391,73 @@ export function fieldLogisticsPanelHtml(state){
 
     ${movement.notes?`<div class="notice">${esc(movement.notes)}</div>`:""}
 
-    ${state?.blockedByCad&&!state?.underway?`
-      <div class="notice">
-        <strong>CAD assignment in progress.</strong><br>
-        This guest movement is preassigned to your unit, but it cannot begin until the current CAD incident is cleared.
-      </div>
-    `:""}
+    ${queuedBehindOther?`<div class="notice"><strong>Queued behind ${esc(state.underwayMovement.movement_number)}.</strong><br>Only one MOVE can be underway at a time. This assignment remains queued and visible.</div>`:""}
 
     ${!movement.driver_acknowledged_at&&["ASSIGNED","READY"].includes(movement.status)?`
-      <button class="btn secondary block" id="fieldAcknowledgeGuestMovement">Acknowledge Assignment</button>
+      <button class="btn secondary block" data-field-logistics-ack="${movement.id}">Acknowledge MOVE</button>
     `:movement.driver_acknowledged_at?`
       <div class="small logistics-field-ack">Acknowledged ${esc(dateTime24(movement.driver_acknowledged_at))}</div>
     `:""}
 
     <div class="logistics-action-grid field-logistics-actions">
-      ${state?.blockedByCad&&!state?.underway
+      ${queuedBehindOther
         ?``
         :fieldNextActions(movement).map(([status,label,kind])=>`
-          <button class="btn ${kind==="danger"?"danger":"good"}" data-field-logistics-status="${status}">${esc(label)}</button>
+          <button class="btn ${kind==="danger"?"danger":"good"}" data-field-logistics-status="${status}" data-movement-id="${movement.id}">${esc(label)}</button>
         `).join("")}
     </div>
+  </section>`;
+}
 
-    ${Array.isArray(state?.upcoming)&&state.upcoming.length>1?`
-      <div class="small muted">Additional preassigned trips: ${state.upcoming.length-1}</div>
-    `:""}
+export function fieldLogisticsPanelHtml(state){
+  const movements=state?.movements||state?.upcoming||[];
+  if(!movements.length)return "";
+
+  return `<div class="card field-logistics-card field-logistics-stack-card">
+    <div class="row">
+      <div>
+        <div class="section-title">PRIMARY TASK · GUEST LOGISTICS</div>
+        <strong>${movements.length} assigned MOVE${movements.length===1?"":"S"}</strong>
+      </div>
+      ${state?.underwayMovement?`<span class="badge logistics-primary-badge">UNDERWAY</span>`:`<span class="badge">QUEUED</span>`}
+    </div>
+    <div class="field-logistics-task-stack">
+      ${movements.map((movement,index)=>fieldMovementTaskHtml(movement,state,index)).join("")}
+    </div>
   </div>`;
 }
 
 export function bindFieldLogisticsPanel(state,{refresh}){
-  const movement=state?.current;
-  if(!movement)return;
+  const movements=state?.movements||state?.upcoming||[];
+  if(!movements.length)return;
+  const byId=new Map(movements.map(m=>[m.id,m]));
 
-  document.querySelector("#fieldAcknowledgeGuestMovement")?.addEventListener("click",async()=>{
-    const button=document.querySelector("#fieldAcknowledgeGuestMovement");
-    button.disabled=true;
-    button.textContent="Acknowledging…";
+  document.querySelectorAll("[data-field-logistics-ack]").forEach(button=>{
+    button.onclick=async()=>{
+      const movement=byId.get(button.dataset.fieldLogisticsAck);
+      if(!movement)return;
+      button.disabled=true;
+      const original=button.textContent;
+      button.textContent="Acknowledging…";
 
-    const {error}=await supabase.rpc("guest_logistics_acknowledge_movement",{
-      p_movement_id:movement.id
-    });
+      const {error}=await supabase.rpc("guest_logistics_acknowledge_movement",{
+        p_movement_id:movement.id
+      });
 
-    if(error){
-      button.disabled=false;
-      button.textContent="Acknowledge Assignment";
-      return alert(error.message);
-    }
+      if(error){
+        button.disabled=false;
+        button.textContent=original;
+        return alert(error.message);
+      }
 
-    await refresh();
+      await refresh();
+    };
   });
 
-  if(state?.blockedByCad&&!state?.underway)return;
-
-  document.querySelectorAll("[data-field-logistics-status]").forEach(button=>{
+  document.querySelectorAll("[data-field-logistics-status][data-movement-id]").forEach(button=>{
     button.onclick=async()=>{
+      const movement=byId.get(button.dataset.movementId);
+      if(!movement)return;
       const status=button.dataset.fieldLogisticsStatus;
       if(status==="NO_SHOW"&&!confirm("Confirm the guest / party is a No Show?"))return;
 
@@ -1461,3 +1480,4 @@ export function bindFieldLogisticsPanel(state,{refresh}){
     };
   });
 }
+

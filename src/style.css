@@ -5020,3 +5020,161 @@ body.field-assignment-alert .topbar{
   }
 }
 
+
+/* v0.15.0 — multi-task Guest Logistics + inline EMS incident workflow */
+.task-priority-label{
+  color:#93c5fd;
+  font-weight:900;
+  letter-spacing:.08em;
+  text-transform:uppercase;
+}
+.unit-has-moves{
+  border-color:#386b9e;
+  box-shadow:inset 3px 0 0 #3b82f6,0 8px 24px rgba(0,0,0,.12);
+}
+.unit-task-primary{
+  display:grid;
+  gap:3px;
+  margin:8px 0 7px;
+  padding:8px 9px;
+  border:1px solid #2f567c;
+  border-radius:8px;
+  background:#0b1b2c;
+  text-align:left;
+}
+.assignment-secondary-moves{
+  display:flex;
+  align-items:center;
+  gap:5px;
+  flex-wrap:wrap;
+  margin-top:6px;
+}
+.unit-move-section{
+  border-color:#2f567c;
+  background:#0b1828;
+}
+.unit-move-stack,
+.field-logistics-task-stack{
+  display:grid;
+  gap:8px;
+}
+.unit-move-row{
+  display:grid;
+  grid-template-columns:minmax(0,1fr) auto;
+  align-items:center;
+  gap:10px;
+  padding:9px 10px;
+  border:1px solid #334155;
+  border-radius:9px;
+  background:#0b1324;
+}
+.unit-move-row.underway{
+  border-color:#3b82f6;
+  box-shadow:inset 3px 0 0 #3b82f6;
+}
+.field-logistics-stack-card{
+  border-color:#386b9e;
+  box-shadow:inset 4px 0 0 #3b82f6,0 8px 24px rgba(0,0,0,.16);
+}
+.field-logistics-task{
+  display:grid;
+  gap:10px;
+  padding:12px;
+  border:1px solid #334155;
+  border-radius:10px;
+  background:#0a1523;
+}
+.field-logistics-task-underway{
+  border-color:#3b82f6;
+  box-shadow:inset 3px 0 0 #3b82f6;
+}
+.field-secondary-cad-label{
+  margin-bottom:7px;
+  color:#c4b5fd;
+}
+.logistics-primary-badge{
+  background:#123e5e;
+  color:#bfdbfe;
+  border-color:#2563eb;
+}
+.command-move-board{
+  grid-column:1/-1;
+  padding:12px 14px;
+  border-bottom:1px solid #233149;
+  background:#081421;
+}
+.command-move-board-head{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  gap:12px;
+  margin-bottom:9px;
+}
+.command-move-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(250px,1fr));
+  gap:8px;
+}
+.command-move-card{
+  display:grid;
+  gap:5px;
+  padding:10px 11px;
+  border:1px solid #334155;
+  border-left:5px solid #3b82f6;
+  border-radius:9px;
+  background:#0b1324;
+}
+.command-move-card.underway{
+  border-color:#3b82f6;
+  background:#0b1b30;
+}
+.command-move-guest{
+  font-size:16px;
+  font-weight:800;
+}
+.command-move-route{
+  color:#a9bdd3;
+}
+.treatment-dispatch-panel-inline{
+  padding:0;
+  border:0;
+  background:transparent;
+  box-shadow:none;
+}
+.incident-ems-inline-section{
+  border-color:#275d8c;
+}
+@media(max-width:620px){
+  .unit-move-row{
+    grid-template-columns:1fr;
+  }
+  .command-move-grid{
+    grid-template-columns:1fr;
+  }
+}
+
+/* Keep MOVE cards above the main Command Board without reducing map/call usability. */
+.command-display-content.mode-calls:has(.command-move-board),
+.command-display-content.mode-map:has(.command-move-board){
+  display:grid;
+  grid-template-rows:auto minmax(0,1fr);
+}
+.command-display-content.mode-split:has(.command-move-board){
+  grid-template-rows:auto minmax(0,1fr);
+}
+.command-display-content.mode-split:not(:has(.command-move-board)){
+  grid-template-rows:minmax(0,1fr);
+}
+.command-display-content.mode-map:has(.command-move-board) .command-map-board,
+.command-display-content.mode-calls:has(.command-move-board) .command-call-board{
+  height:auto;
+  min-height:0;
+}
+.command-display-content.mode-map:has(.command-move-board) #commandMap{
+  height:100%;
+  min-height:420px;
+}
+.unit-task-move-line span{
+  color:#bfdbfe;
+  font-weight:800;
+}

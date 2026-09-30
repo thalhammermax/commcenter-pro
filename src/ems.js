@@ -327,7 +327,7 @@ export async function renderEmsOps(app,ctx,{preserveRealtime=false}={}){
 
 
 
-export async function renderDispatchIncidentTreatmentPanel(container,{eventId,incidentId,onBack}){
+export async function renderDispatchIncidentTreatmentPanel(container,{eventId,incidentId,onBack,embedded=false}){
   try{
     const [incidentRes,areasRes,encRes,units]=await Promise.all([
       supabase.from("incidents").select("id,incident_number,call_type,priority,landmark").eq("id",incidentId).single(),
@@ -346,13 +346,13 @@ export async function renderDispatchIncidentTreatmentPanel(container,{eventId,in
       ? resourceName({unitId:encounter.current_unit_id,areaId:encounter.current_treatment_area_id,units,areas})
       : "No EMS custody recorded";
 
-    container.innerHTML=`<div class="card stack treatment-dispatch-panel">
+    container.innerHTML=`<div class="${embedded?"stack treatment-dispatch-panel treatment-dispatch-panel-inline":"card stack treatment-dispatch-panel"}">
       <div class="row">
         <div>
           <div class="section-title">EMS Patient Flow</div>
           <strong>${esc(incident.incident_number)} · ${esc(incident.call_type)}</strong>
         </div>
-        <button class="btn secondary" id="emsTreatmentBack">Back</button>
+        ${embedded?`<span class="badge">${esc(encounter?pretty(encounter.current_status):"NO CUSTODY")}</span>`:`<button class="btn secondary" id="emsTreatmentBack">Back</button>`}
       </div>
 
       <div class="notice">
@@ -385,7 +385,7 @@ export async function renderDispatchIncidentTreatmentPanel(container,{eventId,in
       <div class="small muted">Patient-flow changes take effect immediately. Direct handoffs do not require the receiving resource to accept a request.</div>
     </div>`;
 
-    document.querySelector("#emsTreatmentBack").onclick=onBack;
+    if(!embedded)document.querySelector("#emsTreatmentBack").onclick=onBack;
 
     const transfer=async({areaId=null,unitId=null})=>{
       const destination=areaId
@@ -418,8 +418,10 @@ export async function renderDispatchIncidentTreatmentPanel(container,{eventId,in
       transfer({unitId});
     };
   }catch(error){
-    container.innerHTML=`<div class="card stack"><div class="notice error">${esc(error.message)}</div><button class="btn secondary" id="emsTreatmentBack">Back</button></div>`;
-    document.querySelector("#emsTreatmentBack").onclick=onBack;
+    container.innerHTML=embedded
+      ?`<div class="notice error">${esc(error.message)}</div>`
+      :`<div class="card stack"><div class="notice error">${esc(error.message)}</div><button class="btn secondary" id="emsTreatmentBack">Back</button></div>`;
+    if(!embedded)document.querySelector("#emsTreatmentBack").onclick=onBack;
   }
 }
 
@@ -757,6 +759,15 @@ export async function renderEmsAdmin(container,ctx,onRefresh){
 
 
 export async function loadFieldEmsState(eventId,unitId,incidentId){
+  const {data:emsDepartments,error:emsDepartmentsErr}=await supabase.from("event_departments")
+    .select("id")
+    .eq("event_id",eventId)
+    .eq("active",true)
+    .eq("ems_enabled",true)
+    .limit(1);
+  if(emsDepartmentsErr)throw emsDepartmentsErr;
+  if(!emsDepartments?.length)return null;
+
   const {data:config,error:configErr}=await supabase.from("ems_unit_config").select("*").eq("unit_id",unitId).maybeSingle();
   if(configErr)throw configErr;
   if(!config?.active)return null;

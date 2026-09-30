@@ -593,6 +593,10 @@ function emsEnabledDepartmentIds(){
   );
 }
 
+function eventHasEmsEnabled(){
+  return emsEnabledDepartmentIds().size>0;
+}
+
 function dispatchHasEmsEnabled(){
   const emsDepartments=emsEnabledDepartmentIds();
   return (S.dispatchDepartmentIds||[]).some(id=>emsDepartments.has(id));
@@ -606,16 +610,29 @@ function guestLogisticsEnabledDepartmentIds(){
   );
 }
 
+function eventHasGuestLogisticsEnabled(){
+  return guestLogisticsEnabledDepartmentIds().size>0;
+}
+
 function dispatchHasGuestLogisticsEnabled(){
   const logisticsDepartments=guestLogisticsEnabledDepartmentIds();
   return (S.dispatchDepartmentIds||[]).some(id=>logisticsDepartments.has(id));
 }
 
-function activeLogisticsMovementForUnit(unitId){
-  return (S.guestLogisticsMovements||[]).find(m=>
-    m.assigned_unit_id===unitId
-    &&["EN_ROUTE_PICKUP","AT_PICKUP","PASSENGER_ONBOARD","EN_ROUTE_DESTINATION"].includes(m.status)
-  )||null;
+const LOGISTICS_UNDERWAY_STATUSES=new Set(["EN_ROUTE_PICKUP","AT_PICKUP","PASSENGER_ONBOARD","EN_ROUTE_DESTINATION"]);
+
+function logisticsMovementsForUnit(unitId){
+  return (S.guestLogisticsMovements||[])
+    .filter(m=>m.assigned_unit_id===unitId)
+    .sort((a,b)=>{
+      const underwayDiff=Number(LOGISTICS_UNDERWAY_STATUSES.has(b.status))-Number(LOGISTICS_UNDERWAY_STATUSES.has(a.status));
+      if(underwayDiff)return underwayDiff;
+      return new Date(a.scheduled_at||0).getTime()-new Date(b.scheduled_at||0).getTime();
+    });
+}
+
+function underwayLogisticsMovementForUnit(unitId){
+  return logisticsMovementsForUnit(unitId).find(m=>LOGISTICS_UNDERWAY_STATUSES.has(m.status))||null;
 }
 
 function dispatchWalkInTreatmentAreas(){
@@ -1335,14 +1352,15 @@ async function loadCommandDisplayOps(){
     zonesRes,
     unitLocationsRes,
     operationalPeriodsRes,
-    treatmentAreasRes
+    treatmentAreasRes,
+    guestLogisticsMovementsRes
   ]=await Promise.all([
     supabase.from("events")
       .select("id,name,event_code,active")
       .eq("id",S.eventId)
       .single(),
     supabase.from("event_departments")
-      .select("id,event_id,name,short_name,sort_order,active")
+      .select("id,event_id,name,short_name,sort_order,active,ems_enabled,guest_logistics_enabled")
       .eq("event_id",S.eventId)
       .eq("active",true)
       .order("sort_order"),
@@ -1378,7 +1396,13 @@ async function loadCommandDisplayOps(){
       .select("id,event_id,name,status,active")
       .eq("event_id",S.eventId)
       .eq("active",true)
-      .order("name")
+      .order("name"),
+    supabase.from("guest_logistics_movements")
+      .select("id,event_id,department_id,movement_number,movement_type,guest_name,status,scheduled_at,assigned_unit_id,origin,destination")
+      .eq("event_id",S.eventId)
+      .not("status","in","(COMPLETE,NO_SHOW,CANCELLED)")
+      .not("assigned_unit_id","is",null)
+      .order("scheduled_at")
   ]);
 
   const baseResults={
@@ -1390,7 +1414,8 @@ async function loadCommandDisplayOps(){
     zones:zonesRes,
     unitLocations:unitLocationsRes,
     operationalPeriods:operationalPeriodsRes,
-    treatmentAreas:treatmentAreasRes
+    treatmentAreas:treatmentAreasRes,
+    guestLogisticsMovements:guestLogisticsMovementsRes
   };
 
   const failed=Object.entries(baseResults).filter(([,result])=>result.error);
@@ -1438,6 +1463,7 @@ async function loadCommandDisplayOps(){
   S.operationalPeriods=operationalPeriodsRes.data||[];
   S.activeOperationalPeriod=S.operationalPeriods.find(op=>op.status==="ACTIVE")||null;
   S.treatmentAreas=treatmentAreasRes.data||[];
+  S.guestLogisticsMovements=guestLogisticsMovementsRes.data||[];
 
   const preferred=S.mapLayers.find(layer=>layer.id===S.commandActiveMapLayerId);
   const fallback=S.mapLayers.find(layer=>layer.is_default)||S.mapLayers[0]||null;
@@ -1483,7 +1509,7 @@ async function loadEventOps(){
     supabase.from("unit_locations").select("*").eq("event_id",S.eventId),
     supabase.from("operational_periods").select("*").eq("event_id",S.eventId).order("created_at"),
     supabase.from("event_dispositions").select("*").eq("event_id",S.eventId).eq("active",true).order("scope").order("sort_order").order("label"),
-    supabase.from("guest_logistics_movements").select("id,event_id,department_id,movement_number,guest_name,status,scheduled_at,assigned_unit_id").eq("event_id",S.eventId).not("status","in","(COMPLETE,NO_SHOW,CANCELLED)").order("scheduled_at"),
+    supabase.from("guest_logistics_movements").select("id,event_id,department_id,movement_number,movement_type,guest_name,status,scheduled_at,assigned_unit_id,origin,destination").eq("event_id",S.eventId).not("status","in","(COMPLETE,NO_SHOW,CANCELLED)").order("scheduled_at"),
     supabase.from("ems_unit_config").select("*"),
     supabase.from("ems_treatment_areas").select("*").eq("event_id",S.eventId).eq("active",true).order("name")
   ]);
@@ -2102,10 +2128,10 @@ async function dispatchPage(){
           <strong>Operational Periods</strong>
           <span>${S.activeOperationalPeriod?`${esc(S.activeOperationalPeriod.name)} · ${esc(S.activeOperationalPeriod.incident_prefix)}`:"No active Operational Period"}</span>
         </button>
-        <button class="topbar-menu-item" id="emsOpsBtn">
+        ${eventHasEmsEnabled()?`<button class="topbar-menu-item" id="emsOpsBtn">
           <strong>EMS Operations</strong>
           <span>Patient flow and treatment resources</span>
-        </button>
+        </button>`:""}
         <button class="topbar-menu-item ${dispatchHasGuestLogisticsEnabled()?"":"hidden"}" id="guestLogisticsBtn">
           <strong>Guest Logistics</strong>
           <span>Prescheduled transportation and driver dispatch</span>
@@ -2140,7 +2166,7 @@ async function dispatchPage(){
   document.querySelector("#commandDisplayBtn").onclick=()=>commandDisplayPage();
   document.querySelector("#layoutButton").onclick=()=>{closeDispatchMenu();renderDispatchLayoutModal();};
   document.querySelector("#operationalPeriodsBtn").onclick=()=>{closeDispatchMenu();eventAdmin("periods");};
-  document.querySelector("#emsOpsBtn").onclick=()=>{closeDispatchMenu();renderEmsOps(app,{eventId:S.eventId,event:S.event,header,onBack:()=>dispatchPage(),onAdmin:()=>eventAdmin("ems")});};
+  document.querySelector("#emsOpsBtn")?.addEventListener("click",()=>{closeDispatchMenu();renderEmsOps(app,{eventId:S.eventId,event:S.event,header,onBack:()=>dispatchPage(),onAdmin:()=>eventAdmin("ems")});});
   document.querySelector("#guestLogisticsBtn")?.addEventListener("click",()=>{closeDispatchMenu();guestLogisticsPage();});
   document.querySelector("#unitStaffingBtn").onclick=()=>{closeDispatchMenu();unitStaffingPage();};
   document.querySelector("#adminBtn").onclick=()=>{closeDispatchMenu();eventAdmin();};
@@ -2400,16 +2426,20 @@ function unitList(){
     <div class="section-title">${esc(department)}</div>
     ${units.map(u=>{
       const active=activeAssignmentForUnit(u.id);
-      const logistics=activeLogisticsMovementForUnit(u.id);
-      return `<button class="unit unit-button" data-unit-detail="${u.id}">
+      const moves=logisticsMovementsForUnit(u.id);
+      return `<button class="unit unit-button ${moves.length?"unit-has-moves":""}" data-unit-detail="${u.id}">
         <div class="row">
           <strong>${esc(u.name)}</strong>
           <span class="badge status-${esc(u.status)}" data-dispatch-unit-status="${u.id}">${esc(u.status.replaceAll("_"," "))}</span>
         </div>
-        <div class="small muted">${active
-          ?`Assigned: ${esc(active.incident.incident_number)} · ${esc(active.incident.call_type)}`
-          :logistics
-            ?`Guest Move: ${esc(logistics.movement_number)} · ${esc(logistics.guest_name)}`
+        ${moves.length?`<div class="unit-task-primary">
+          <div class="small task-priority-label">PRIMARY · ${moves.length} MOVE${moves.length===1?"":"S"}</div>
+          ${moves.map(m=>`<div class="small unit-task-move-line"><strong>${esc(m.movement_number)}</strong> · ${esc(m.guest_name||"Guest")} · <span>${esc(String(m.status||"").replaceAll("_"," "))}</span>${m.origin||m.destination?` · ${esc([m.origin,m.destination].filter(Boolean).join(" → "))}`:""}</div>`).join("")}
+        </div>`:""}
+        <div class="small ${active?"":"muted"}">${active
+          ?`${moves.length?"SECONDARY CAD · ":"Assigned: "}${esc(active.incident.incident_number)} · ${esc(active.incident.call_type)}`
+          :moves.length
+            ?"No secondary CAD assignment"
             :"Unassigned"}</div>
         ${unitTransportDestinationLabel(u)?`<div class="small transport-destination-readout">Transport → ${esc(unitTransportDestinationLabel(u))}</div>`:""}
         <div class="small unit-gps-readout ${unitLocation(u.id)?`gps-${locationFreshness(unitLocation(u.id))}`:"muted"}" data-unit-gps="${u.id}">${unitLocation(u.id)?`${locationAgeLabel(unitLocation(u.id))}${unitLocation(u.id).accuracy_m!=null?` · ±${Math.round(unitLocation(u.id).accuracy_m)}m`:""}`:(S.event?.field_location_enabled?"GPS not shared":"GPS disabled")}</div>
@@ -2766,6 +2796,7 @@ function unitTransportDestinationLabel(unit){
 }
 
 function transportDestinationEditorHtml(unit){
+  if(!eventHasEmsEnabled())return "";
   const ambulance=isAmbulanceUnit(unit);
   const visible=unit.status==="TRANSPORTING"?"":"hidden";
   return `<div class="transport-destination-editor ${visible}" id="unitTransportDestinationPanel">
@@ -3220,8 +3251,8 @@ async function selectIncident(id){
 
   const assignedLinks=(current.incident_units||[]).filter(x=>!x.cleared_at);
   const assignedIds=new Set(assignedLinks.map(x=>x.unit_id));
-  const latestTransfer=extra.handoffs.find(h=>h.status==="COMPLETED")||null;
   const deps=incidentDepartmentNames(current);
+  const isEmsIncident=incidentHasEmsDepartment(current);
 
   content.innerHTML=`<div class="incident-modal-header">
     <div>
@@ -3238,7 +3269,6 @@ async function selectIncident(id){
 
   <div class="incident-modal-actions">
     <button class="btn" id="editIncident">Edit Call Details</button>
-    <button class="btn secondary" id="emsPatientFlow">EMS Patient Flow</button>
     ${current.map_x!=null&&current.map_y!=null&&current.map_layer_id?`<button class="btn secondary" id="showIncidentMap">Show on Map</button>`:""}
     <button class="btn danger" id="closeIncident">Close Incident</button>
   </div>
@@ -3272,12 +3302,14 @@ async function selectIncident(id){
           ${assignedLinks.map(link=>{
             const u=S.units.find(x=>x.id===link.unit_id);
             if(!u)return "";
+            const moves=logisticsMovementsForUnit(u.id);
             return `<div class="assignment-unit-row">
               <div>
                 <strong>${esc(u.event_departments?.short_name||"")} · ${esc(u.name)}</strong><br>
                 <span class="badge status-${esc(u.status)}" data-dispatch-unit-status="${u.id}">${esc(String(u.status||"").replaceAll("_"," "))}</span>
                 <span class="assignment-ack-badge ${link.acknowledged_at?"acknowledged":"pending"}" title="${link.acknowledged_at?`Acknowledged ${dateTime24(link.acknowledged_at,{seconds:true})}`:"Awaiting Field Unit acknowledgement"}">${link.acknowledged_at?`ACK ${time24(link.acknowledged_at)}`:"AWAITING ACK"}</span>
                 <span class="small ${unitLocation(u.id)?`gps-${locationFreshness(unitLocation(u.id))}`:"muted"}" data-unit-gps="${u.id}">${unitLocation(u.id)?`${locationAgeLabel(unitLocation(u.id))}${unitLocation(u.id).accuracy_m!=null?` · ±${Math.round(unitLocation(u.id).accuracy_m)}m`:""}`:(S.event?.field_location_enabled?"GPS not shared":"GPS disabled")}</span>
+                ${moves.length?`<div class="assignment-secondary-moves"><span class="small task-priority-label">PRIMARY MOVE${moves.length===1?"":"S"}</span>${moves.map(m=>`<span class="badge">${esc(m.movement_number)}</span>`).join("")}</div>`:""}
               </div>
               <div class="assignment-unit-actions">
                 ${unitTransportDestinationLabel(u)?`<span class="small transport-destination-readout">→ ${esc(unitTransportDestinationLabel(u))}</span>`:""}
@@ -3293,23 +3325,17 @@ async function selectIncident(id){
             <option value="">Assign another unit…</option>
             ${S.units.filter(u=>!assignedIds.has(u.id)).map(u=>{
               const active=activeAssignmentForUnit(u.id);
-              return `<option value="${u.id}" ${active?"disabled":""}>${esc(u.event_departments?.short_name||"")} · ${esc(u.name)} · ${esc(u.status)}${active?` · ${esc(active.incident.incident_number)}`:""}</option>`;
+              const moves=logisticsMovementsForUnit(u.id);
+              return `<option value="${u.id}" ${active?"disabled":""}>${esc(u.event_departments?.short_name||"")} · ${esc(u.name)} · ${esc(u.status)}${moves.length?` · ${moves.length} MOVE${moves.length===1?"":"S"}`:""}${active?` · ${esc(active.incident.incident_number)}`:""}</option>`;
             }).join("")}
           </select>
           <button class="btn" id="dispatchUnit">Assign Unit</button>
         </div>
       </section>
 
-      <section class="incident-info-section">
-        <div class="row"><div class="section-title">EMS / Patient Flow</div>${extra.encounter?`<span class="badge">${esc(String(extra.encounter.current_status||"").replaceAll("_"," "))}</span>`:""}</div>
-        ${extra.encounter?`
-          <div class="incident-ems-summary">
-            <div><span class="small muted">Current custody</span><strong>${esc(emsCustodyName(extra.encounter,extra.areas))}</strong></div>
-            ${latestTransfer?`<div><span class="small muted">Most recent handoff</span><strong>${esc(handoffResourceName({unitId:latestTransfer.from_unit_id,areaId:latestTransfer.from_treatment_area_id},extra.areas))} → ${esc(handoffResourceName({unitId:latestTransfer.to_unit_id,areaId:latestTransfer.to_treatment_area_id},extra.areas))}</strong></div>`:""}
-            ${extra.encounter.transport_destination?`<div><span class="small muted">Destination</span><strong>${esc(extra.encounter.transport_destination)}</strong></div>`:""}
-          </div>
-        `:`<div class="small muted">No EMS custody has been recorded for this incident.</div>`}
-      </section>
+      ${isEmsIncident?`<section class="incident-info-section incident-ems-inline-section">
+        <div id="incidentEmsFlowInline"><div class="small muted">Loading EMS patient-flow controls…</div></div>
+      </section>`:""}
     </div>
 
     <aside class="incident-command-side">
@@ -3325,13 +3351,12 @@ async function selectIncident(id){
   document.querySelector("#closeIncidentModal").onclick=()=>closeIncidentModal();
   document.querySelector("#editIncident").onclick=()=>editIncidentForm(current.id);
 
-  document.querySelector("#emsPatientFlow").onclick=()=>{
-    S.incidentModalMode="ems";
+  if(isEmsIncident){
     renderDispatchIncidentTreatmentPanel(
-      document.querySelector("#incidentModalContent"),
-      {eventId:S.eventId,incidentId:current.id,onBack:()=>selectIncident(current.id)}
+      document.querySelector("#incidentEmsFlowInline"),
+      {eventId:S.eventId,incidentId:current.id,onBack:()=>selectIncident(current.id),embedded:true}
     );
-  };
+  }
 
   document.querySelector("#showIncidentMap")?.addEventListener("click",async()=>{
     if(S.dispatchLayout?.mapVisible===false){
@@ -3537,7 +3562,9 @@ function selectUnit(unitId){
   if(!u)return;
 
   const active=activeAssignmentForUnit(unitId);
-  const logistics=activeLogisticsMovementForUnit(unitId);
+  const moves=logisticsMovementsForUnit(unitId);
+  const primaryMove=moves[0]||null;
+  const underwayMove=underwayLogisticsMovementForUnit(unitId);
   const location=unitLocation(unitId);
   const layerId=unitLocationLayerId(u);
   const layer=layerId?S.mapLayers.find(l=>l.id===layerId):null;
@@ -3555,10 +3582,10 @@ function selectUnit(unitId){
         <h2 id="incidentModalTitle">${esc(u.name)}</h2>
         <span class="badge status-${esc(u.status)}" data-dispatch-unit-status="${u.id}" data-unit-current-status="${u.id}">${esc(u.status.replaceAll("_"," "))}</span>
       </div>
-      <div class="incident-modal-nature">${active
-        ?`Committed to ${esc(active.incident.incident_number)}`
-        :logistics
-          ?`Guest Logistics · ${esc(logistics.movement_number)} · ${esc(logistics.guest_name)}`
+      <div class="incident-modal-nature">${primaryMove
+        ?`Primary: ${esc(primaryMove.movement_number)}${moves.length>1?` +${moves.length-1} MOVE${moves.length-1===1?"":"S"}`:""}${active?` · Secondary CAD: ${esc(active.incident.incident_number)}`:""}`
+        :active
+          ?`Committed to ${esc(active.incident.incident_number)}`
           :"Available for assignment"}${unitTransportDestinationLabel(u)?` · Transporting to ${esc(unitTransportDestinationLabel(u))}`:""}</div>
     </div>
     <button class="incident-modal-close" id="closeIncidentModal" aria-label="Close unit controls">×</button>
@@ -3566,19 +3593,29 @@ function selectUnit(unitId){
 
   <div class="unit-command-modal" data-unit-detail-id="${u.id}">
     <section class="unit-command-main stack">
+      ${moves.length?`<div class="incident-info-section unit-move-section">
+        <div class="row"><div class="section-title">Primary Assignment · Guest Logistics</div><span class="badge">${moves.length} MOVE${moves.length===1?"":"S"}</span></div>
+        <div class="unit-move-stack">
+          ${moves.map(m=>`<div class="unit-move-row ${LOGISTICS_UNDERWAY_STATUSES.has(m.status)?"underway":""}">
+            <div><strong>${esc(m.movement_number)} · ${esc(m.guest_name||"Guest")}</strong><div class="small muted">${esc([m.origin,m.destination].filter(Boolean).join(" → ")||"Route not entered")}</div></div>
+            <span class="badge">${esc(String(m.status||"").replaceAll("_"," "))}</span>
+          </div>`).join("")}
+        </div>
+        <button class="btn secondary block" id="openUnitGuestLogistics">Open Guest Logistics</button>
+      </div>`:""}
+
       <div class="incident-info-section">
         <div class="section-title">Unit Status</div>
-        ${logistics?`
+        ${underwayMove?`
           <div class="notice">
-            <strong>Status controlled by Guest Logistics.</strong><br>
-            ${esc(logistics.movement_number)} · ${esc(logistics.guest_name)}. Use the Guest Logistics movement workflow to update this driver's status.
+            <strong>Status controlled by the active MOVE.</strong><br>
+            ${esc(underwayMove.movement_number)} · ${esc(underwayMove.guest_name||"Guest")}. Use the Guest Logistics movement workflow to update this unit's primary status.
           </div>
-          <button class="btn secondary block" id="openUnitGuestLogistics">Open Guest Logistics</button>
         `:`
           ${unitStatusButtonsHtml(u,active)}
           ${transportDestinationEditorHtml(u)}
         `}
-        ${!logistics&&active&&!isAmbulanceUnit(u)&&u.status==="TRANSPORTING"&&u.current_transport_treatment_area_id?`
+        ${eventHasEmsEnabled()&&!underwayMove&&active&&!isAmbulanceUnit(u)&&u.status==="TRANSPORTING"&&u.current_transport_treatment_area_id?`
           <div class="treatment-arrival-action">
             <div>
               <div class="section-title">Treatment Area Arrival</div>
@@ -3591,23 +3628,18 @@ function selectUnit(unitId){
       </div>
 
       <div class="incident-info-section">
-        <div class="row"><div class="section-title">CAD Assignment</div>${active?`<span class="badge">COMMITTED</span>`:`<span class="badge">UNASSIGNED</span>`}</div>
+        <div class="row"><div class="section-title">${moves.length?"Secondary CAD Assignment":"CAD Assignment"}</div>${active?`<span class="badge">COMMITTED</span>`:`<span class="badge">UNASSIGNED</span>`}</div>
         ${active?`
           <div class="unit-current-assignment">
             <strong>${esc(active.incident.incident_number)} · ${esc(active.incident.call_type)}</strong>
-            <div class="small muted">${esc(active.incident.landmark||"")}</div>
+            <div class="small muted">${esc(active.incident.landmark||"")}${moves.length?" · This CAD ticket is secondary to the unit's assigned MOVE(s).":""}</div>
           </div>
           <div class="grid2">
             <button class="btn" id="openAssignedIncident">Open Incident</button>
             <button class="btn danger" id="removeAssignment">Clear Unit from Incident</button>
           </div>
-        `:logistics?`
-          <div class="unit-current-assignment">
-            <strong>${esc(logistics.movement_number)} · ${esc(logistics.guest_name)}</strong>
-            <div class="small muted">This unit cannot be committed to a CAD incident until the guest movement is complete, cancelled, or reassigned.</div>
-          </div>
-          <button class="btn secondary block" id="openUnitGuestLogisticsAssignment">Open Guest Logistics</button>
         `:`
+          ${moves.length?`<div class="notice"><strong>MOVE assignment remains primary.</strong><br>A CAD ticket assigned here will be kept as the unit's secondary assignment.</div>`:""}
           <div>
             <label>Assign to incident</label>
             <select id="unitIncident">
@@ -3652,7 +3684,6 @@ function selectUnit(unitId){
 
   document.querySelector("#closeIncidentModal").onclick=()=>closeIncidentModal();
   document.querySelector("#openUnitGuestLogistics")?.addEventListener("click",()=>{closeIncidentModal();guestLogisticsPage();});
-  document.querySelector("#openUnitGuestLogisticsAssignment")?.addEventListener("click",()=>{closeIncidentModal();guestLogisticsPage();});
 
   document.querySelectorAll(`[data-dispatch-status-option="${u.id}"]`).forEach(btn=>btn.onclick=async()=>{
     const status=btn.dataset.status;
@@ -4376,6 +4407,36 @@ function commandFilteredIncidents(){
 function commandFilteredUnits(){
   return S.units.filter(u=>S.commandDepartmentIds.includes(u.department_id));
 }
+function commandFilteredMovements(){
+  return (S.guestLogisticsMovements||[])
+    .filter(m=>{
+      if(!m.assigned_unit_id)return false;
+      const unit=S.units.find(u=>u.id===m.assigned_unit_id);
+      return !!unit&&S.commandDepartmentIds.includes(unit.department_id);
+    })
+    .sort((a,b)=>{
+      const underwayDiff=Number(LOGISTICS_UNDERWAY_STATUSES.has(b.status))-Number(LOGISTICS_UNDERWAY_STATUSES.has(a.status));
+      if(underwayDiff)return underwayDiff;
+      return new Date(a.scheduled_at||0).getTime()-new Date(b.scheduled_at||0).getTime();
+    });
+}
+function commandMoveCardsHtml(){
+  const movements=commandFilteredMovements();
+  if(!movements.length)return "";
+  return `<section class="command-move-board">
+    <div class="command-move-board-head"><div><div class="section-title">GUEST LOGISTICS · PRIMARY UNIT TASKS</div><strong>Assigned MOVEs</strong></div><span class="badge">${movements.length}</span></div>
+    <div class="command-move-grid">${movements.map(m=>{
+      const unit=S.units.find(u=>u.id===m.assigned_unit_id);
+      const cad=unit?activeAssignmentForUnit(unit.id):null;
+      return `<article class="command-move-card ${LOGISTICS_UNDERWAY_STATUSES.has(m.status)?"underway":""}">
+        <div class="row"><strong>${esc(m.movement_number)}</strong><span class="badge">${esc(String(m.status||"").replaceAll("_"," "))}</span></div>
+        <div class="command-move-guest">${esc(m.guest_name||"Guest")}</div>
+        <div class="small command-move-route">${esc([m.origin,m.destination].filter(Boolean).join(" → ")||"Route not entered")}</div>
+        <div class="small"><strong>${esc(unit?.name||"Unassigned unit")}</strong>${cad?` · Secondary CAD ${esc(cad.incident.incident_number)}`:""}</div>
+      </article>`;
+    }).join("")}</div>
+  </section>`;
+}
 function commandPriorityClass(priority){
   const key=String(priority||"").toLowerCase();
   if(key==="critical")return "command-priority-critical";
@@ -4393,7 +4454,8 @@ function commandCallCardsHtml(){
       .map(link=>{
         const unit=S.units.find(u=>u.id===link.unit_id);
         if(!unit)return "";
-        return `<span class="command-unit-chip"><strong>${esc(unit.name)}</strong> · ${esc(String(unit.status||"").replaceAll("_"," "))}${unitTransportDestinationLabel(unit)?` → ${esc(unitTransportDestinationLabel(unit))}`:""}</span>`;
+        const moves=logisticsMovementsForUnit(unit.id);
+        return `<span class="command-unit-chip"><strong>${esc(unit.name)}</strong> · ${esc(String(unit.status||"").replaceAll("_"," "))}${moves.length?` · PRIMARY ${esc(moves.map(m=>m.movement_number).join(", "))}`:""}${unitTransportDestinationLabel(unit)?` → ${esc(unitTransportDestinationLabel(unit))}`:""}</span>`;
       }).filter(Boolean).join("");
 
     return `<div class="command-call-card ${commandPriorityClass(i.priority)}">
@@ -4529,6 +4591,7 @@ function commandTreatmentCenterClass(summary){
 }
 
 function commandTreatmentCentersHtml(){
+  if(!eventHasEmsEnabled())return "";
   const rows=S.commandTreatmentSummaries||[];
   if(!rows.length)return "";
 
@@ -4579,6 +4642,10 @@ function renderCommandTreatmentCenters(){
 }
 
 async function loadCommandTreatmentSummary(){
+  if(!eventHasEmsEnabled()){
+    S.commandTreatmentSummaries=[];
+    return S.commandTreatmentSummaries;
+  }
   const {data,error}=await supabase.rpc("command_treatment_center_summary",{p_event_id:S.eventId});
   if(error)throw error;
   S.commandTreatmentSummaries=data||[];
@@ -4603,9 +4670,12 @@ function renderCommandDisplayLayout(){
 
   content.className=`command-display-content mode-${S.commandDisplayMode}`;
   content.innerHTML=`
+    ${commandMoveCardsHtml()}
     ${showCalls?`<section class="command-call-board"><div id="commandCallList">${commandCallCardsHtml()}</div></section>`:""}
     ${showMap?`<section class="command-map-board"><div id="commandMap"></div><div class="command-map-legend"><span><i class="legend-call"></i> Active Call</span><span><i class="legend-unit"></i> Live Unit GPS</span></div></section>`:""}
   `;
+  const moveCount=document.querySelector("#commandMoveCount");
+  if(moveCount)moveCount.textContent=String(commandFilteredMovements().length);
   renderCommandCallPanel();
   if(showMap)setupCommandDisplayMap();
 }
@@ -4641,8 +4711,10 @@ async function refreshCommandDisplayStructure(){
 
   const opName=document.querySelector("#commandOpName");
   const opPrefix=document.querySelector("#commandOpPrefix");
+  const moveCount=document.querySelector("#commandMoveCount");
   if(opName)opName.textContent=S.activeOperationalPeriod?.name||"NONE";
   if(opPrefix)opPrefix.textContent=S.activeOperationalPeriod?.incident_prefix||"";
+  if(moveCount)moveCount.textContent=String(commandFilteredMovements().length);
 
   bindCommandDisplayControls();
   renderCommandDisplayLayout();
@@ -4670,6 +4742,7 @@ function subscribeCommandDisplay(){
   const ch=supabase.channel(`command-display-${S.eventId}-${Date.now()}`)
     .on("postgres_changes",{event:"*",schema:"public",table:"incidents",filter:`event_id=eq.${S.eventId}`},scheduleCommandDisplayRefresh)
     .on("postgres_changes",{event:"*",schema:"public",table:"operational_periods",filter:`event_id=eq.${S.eventId}`},scheduleCommandDisplayRefresh)
+    .on("postgres_changes",{event:"*",schema:"public",table:"guest_logistics_movements",filter:`event_id=eq.${S.eventId}`},scheduleCommandDisplayRefresh)
     .on("postgres_changes",{event:"*",schema:"public",table:"incident_units"},scheduleCommandDisplayRefresh)
     .on("postgres_changes",{event:"UPDATE",schema:"public",table:"units",filter:`event_id=eq.${S.eventId}`},payload=>{
       const unit=S.units.find(u=>u.id===payload.new?.id);
@@ -4752,6 +4825,7 @@ async function commandDisplayPage({publicAccess=S.mode==="command"}={}){
       </div>
       <div class="command-display-metrics">
         <div><span>ACTIVE CALLS</span><strong id="commandCallCount">${commandFilteredIncidents().length}</strong></div>
+        ${eventHasGuestLogisticsEnabled()?`<div><span>ASSIGNED MOVES</span><strong id="commandMoveCount">${commandFilteredMovements().length}</strong></div>`:""}
         <div><span>OPERATIONAL PERIOD</span><strong id="commandOpName">${esc(S.activeOperationalPeriod?.name||"NONE")}</strong><small id="commandOpPrefix">${esc(S.activeOperationalPeriod?.incident_prefix||"")}</small></div>
         <div><span>TIME</span><strong id="commandClock"></strong></div>
       </div>
@@ -4843,7 +4917,7 @@ function adminUnitListHtml(){
         <div class="row start">
           <strong>${esc(u.name)}</strong>
           <span class="badge status-${esc(u.status)}">${esc(statusLabel(u.status))}</span>
-          ${ems?`<span class="badge">${esc(ems.ems_role==="ambulance"?"EMS Ambulance":ems.ems_role==="field_team"?"EMS Field Team":"EMS Command")}</span>`:""}
+          ${eventHasEmsEnabled()&&ems?`<span class="badge">${esc(ems.ems_role==="ambulance"?"EMS Ambulance":ems.ems_role==="field_team"?"EMS Field Team":"EMS Command")}</span>`:""}
         </div>
         <div class="small muted">${esc(dep?.name||"No department")}${u.home_landmark?` · Home / Staging: ${esc(u.home_landmark)}`:""}</div>
       </div>
@@ -4892,7 +4966,7 @@ function renderUnitDetailsEditor(unitId){
 
     <div class="notice">
       <strong>Department changes are protected.</strong><br>
-      CommCenter will allow a rename or staging-location change while the unit is operating, but it will refuse to move the unit to another department while it has an active Field session, CAD assignment, EMS patient custody, or open Guest Logistics movement.
+      CommCenter will allow a rename or staging-location change while the unit is operating, but it will refuse to move the unit to another department while it has an active Field session, CAD assignment${eventHasEmsEnabled()?", EMS patient custody":""}, or open Guest Logistics movement.
     </div>
 
     <div class="row end">
@@ -4978,13 +5052,13 @@ async function renderArchivedResourcesModal(){
       </div>`).join("")||`<div class="small muted">No archived units.</div>`}
     </section>
 
-    <section class="incident-info-section">
+    ${eventHasEmsEnabled()?`<section class="incident-info-section">
       <div class="section-title">EMS Treatment Areas</div>
       ${areas.map(a=>`<div class="archived-resource-row">
         <div><strong>${esc(a.name)}</strong><div class="small muted">${esc(a.status||"")}</div></div>
         <button class="btn secondary compact" data-restore-treatment-area="${a.id}">Restore</button>
       </div>`).join("")||`<div class="small muted">No archived treatment areas.</div>`}
-    </section>
+    </section>`:""}
   </div>
 
   <div class="incident-modal-footer">
@@ -5503,7 +5577,8 @@ function renderFieldLayoutAdmin(){
   let draggingId=null;
 
   const render=()=>{
-    const enabledCount=draft.blocks.filter(block=>block.enabled).length;
+    const visibleBlocks=draft.blocks.filter(block=>eventHasEmsEnabled()||!["ems_patient_flow","transport_destination"].includes(block.id));
+    const enabledCount=visibleBlocks.filter(block=>block.enabled).length;
 
     host.innerHTML=`<div class="stack field-layout-admin">
       <div class="card">
@@ -5536,7 +5611,7 @@ function renderFieldLayoutAdmin(){
           </div>
 
           <div id="fieldLayoutSortList" class="field-layout-sort-list">
-            ${draft.blocks.map((block,index)=>{
+            ${visibleBlocks.map((block,index)=>{
               const meta=fieldLayoutBlockMeta(block.id);
               if(!meta)return "";
               return `<article class="field-layout-sort-card ${block.enabled?"":"disabled"}" draggable="true" data-field-layout-block="${block.id}">
@@ -5554,7 +5629,7 @@ function renderFieldLayoutAdmin(){
                     :`<label class="field-layout-visible-toggle"><input type="checkbox" data-field-layout-enabled="${block.id}" ${block.enabled?"checked":""}> Visible</label>`}
                   <div class="nav">
                     <button class="btn secondary compact" data-field-layout-up="${block.id}" ${index===0?"disabled":""} aria-label="Move ${esc(meta.label)} up">↑</button>
-                    <button class="btn secondary compact" data-field-layout-down="${block.id}" ${index===draft.blocks.length-1?"disabled":""} aria-label="Move ${esc(meta.label)} down">↓</button>
+                    <button class="btn secondary compact" data-field-layout-down="${block.id}" ${index===visibleBlocks.length-1?"disabled":""} aria-label="Move ${esc(meta.label)} down">↓</button>
                   </div>
                 </div>
               </article>`;
@@ -5569,7 +5644,7 @@ function renderFieldLayoutAdmin(){
           <div class="field-layout-phone-preview">
             <div class="field-layout-preview-topbar">CommCenter Pro <span>Field Unit</span></div>
             <div class="field-layout-preview-body">
-              ${draft.blocks.filter(block=>block.enabled).map((block,index)=>{
+              ${visibleBlocks.filter(block=>block.enabled).map((block,index)=>{
                 const meta=fieldLayoutBlockMeta(block.id);
                 return `<div class="field-layout-preview-block ${meta?.required?"required":""}">
                   <span>${index+1}</span>
@@ -5578,18 +5653,22 @@ function renderFieldLayoutAdmin(){
               }).join("")}
             </div>
           </div>
-          <div class="small muted">The actual Field screen continues to hide context-specific blocks when they do not apply. For example, EMS Patient Flow is empty on a non-EMS unit and Transport Destination appears only when relevant.</div>
+          <div class="small muted">The actual Field screen continues to hide context-specific blocks when they do not apply. EMS-specific blocks only exist when this event has an EMS-enabled department.</div>
         </section>
       </div>
     </div>`;
 
     const moveBlock=(id,delta)=>{
+      const visible=draft.blocks.filter(block=>eventHasEmsEnabled()||!["ems_patient_flow","transport_destination"].includes(block.id));
+      const visibleIndex=visible.findIndex(block=>block.id===id);
+      const targetVisible=visibleIndex+delta;
+      if(visibleIndex<0||targetVisible<0||targetVisible>=visible.length)return;
+      const otherId=visible[targetVisible].id;
       const index=draft.blocks.findIndex(block=>block.id===id);
-      const target=index+delta;
-      if(index<0||target<0||target>=draft.blocks.length)return;
+      const target=draft.blocks.findIndex(block=>block.id===otherId);
+      if(index<0||target<0)return;
       const next=[...draft.blocks];
-      const [item]=next.splice(index,1);
-      next.splice(target,0,item);
+      [next[index],next[target]]=[next[target],next[index]];
       draft={...draft,blocks:next};
       render();
     };
@@ -5899,13 +5978,15 @@ function renderTreatmentLayoutAdmin(){
 async function eventAdmin(initialTab="setup"){
   closeIncidentModal();
   await loadEventOps();
+  const emsConfigured=eventHasEmsEnabled();
+  if(!emsConfigured&&["ems","treatment-layout"].includes(initialTab))initialTab="setup";
   app.innerHTML=`<div class="shell">${header(`${esc(S.event?.name||"Event")} · Event Admin`)}
     <div class="admin-layout">
       <aside class="admin-menu">
         <button class="${initialTab==="setup"?"active":""}" id="setupTab">Setup</button>
         <button class="${initialTab==="field-layout"?"active":""}" id="fieldLayoutTab">Field Unit Layout</button>
         <button class="${initialTab==="periods"?"active":""}" id="periodsTab">Operational Periods</button>
-        <button class="${initialTab==="ems"?"active":""}" id="emsTab">EMS Setup</button>
+        ${emsConfigured?`<button class="${initialTab==="ems"?"active":""}" id="emsTab">EMS Setup</button>`:""}
         <button class="${initialTab==="logistics"?"active":""}" id="logisticsTab">Guest Logistics</button>
         <button class="${initialTab==="staffing"?"active":""}" id="staffingTab">Unit Staffing</button>
         <button id="mapTab">Map Builder</button>
@@ -5939,7 +6020,7 @@ async function eventAdmin(initialTab="setup"){
   document.querySelector("#setupTab").onclick=()=>{markAdminTab("setupTab");renderEventSetup();};
   document.querySelector("#fieldLayoutTab").onclick=()=>{markAdminTab("fieldLayoutTab");renderFieldLayoutAdmin();};
   document.querySelector("#periodsTab").onclick=()=>{markAdminTab("periodsTab");renderOperationalPeriodsAdmin();};
-  document.querySelector("#emsTab").onclick=showEmsAdmin;
+  document.querySelector("#emsTab")?.addEventListener("click",showEmsAdmin);
   document.querySelector("#logisticsTab").onclick=()=>{markAdminTab("logisticsTab");renderGuestLogisticsAdmin();};
   document.querySelector("#staffingTab").onclick=()=>{markAdminTab("staffingTab");renderUnitStaffingAdmin();};
 
@@ -6193,7 +6274,7 @@ function renderEventSetup(){
       ems_enabled:document.querySelector("#newDeptEmsEnabled").checked,
       guest_logistics_enabled:document.querySelector("#newDeptGuestLogisticsEnabled").checked
     });
-    if(error)alert(error.message);else{await loadEventOps();renderEventSetup();}
+    if(error)alert(error.message);else await eventAdmin("setup");
   };
   document.querySelector("#addUnit").onclick=async()=>{
     const departmentId=document.querySelector("#unitDept").value;
@@ -6334,8 +6415,7 @@ function renderDepartmentStatusEditor(departmentId){
 
     if(error)return alert(error.message);
 
-    await loadEventOps();
-    renderEventSetup();
+    await eventAdmin("setup");
   };
 
   host.scrollIntoView({behavior:"smooth",block:"nearest"});
@@ -6451,6 +6531,7 @@ function reportIncidentRecordModal(row,activityRows,statusRows){
 
   const callActivity=activityRows.filter(x=>x.incident_id===row.incident_id);
   const callStatuses=statusRows.filter(x=>x.incident_id===row.incident_id);
+  const hasEms=eventHasEmsEnabled();
 
   content.innerHTML=`<div class="incident-modal-header">
     <div>
@@ -6502,7 +6583,7 @@ function reportIncidentRecordModal(row,activityRows,statusRows){
         </div>
       </div>
 
-      <div class="incident-info-section">
+      ${hasEms?`<div class="incident-info-section">
         <div class="section-title">EMS / Patient Flow</div>
         <div class="report-kv-grid">
           <span>Walk-In</span><strong>${row.walk_in?"Yes":"No"}</strong>
@@ -6513,7 +6594,7 @@ function reportIncidentRecordModal(row,activityRows,statusRows){
           <span>Transport Completed</span><strong>${esc(reportDateTime(row.transport_completed_at))}</strong>
           <span>EMS Disposition</span><strong>${esc(row.ems_final_disposition?dispositionLabel("EMS",row.ems_final_disposition):(row.latest_ems_status?String(row.latest_ems_status).replaceAll("_"," "):""))}</strong>
         </div>
-      </div>
+      </div>`:""}
     </section>
 
     <section class="incident-info-section">
@@ -6572,6 +6653,7 @@ function reportIncidentRecordModal(row,activityRows,statusRows){
 
 async function reportsPage(){
   closeIncidentModal();
+  const hasEms=eventHasEmsEnabled();
 
   const [summaryRes,activityRes,statusRes,incidentPeriodRes,periodRes]=await Promise.all([
     supabase.from("dispatch_log").select("*").eq("event_id",S.eventId).order("received_time"),
@@ -6609,7 +6691,7 @@ async function reportsPage(){
       <div class="row report-heading">
         <div>
           <h2>Detailed Dispatch Log</h2>
-          <div class="small muted">Complete incident summary, EMS flow, unit response, status history, and CAD activity.</div>
+          <div class="small muted">${hasEms?"Complete incident summary, EMS flow, unit response, status history, and CAD activity.":"Complete incident summary, unit response, status history, and CAD activity."}</div>
         </div>
         <div class="nav">
           <button class="btn secondary" id="backCad">Back to CAD</button>
@@ -6628,8 +6710,8 @@ async function reportsPage(){
         <div class="card"><div class="metric" id="reportMetricTotal">0</div><div class="small muted">Total Incidents</div></div>
         <div class="card"><div class="metric" id="reportMetricOpen">0</div><div class="small muted">Open</div></div>
         <div class="card"><div class="metric" id="reportMetricClosed">0</div><div class="small muted">Closed</div></div>
-        <div class="card"><div class="metric" id="reportMetricTransports">0</div><div class="small muted">EMS Transports</div></div>
-        <div class="card"><div class="metric" id="reportMetricWalkins">0</div><div class="small muted">Walk-Ins</div></div>
+        ${hasEms?`<div class="card"><div class="metric" id="reportMetricTransports">0</div><div class="small muted">EMS Transports</div></div>
+        <div class="card"><div class="metric" id="reportMetricWalkins">0</div><div class="small muted">Walk-Ins</div></div>`:""}
       </div>
 
       <div class="card report-controls">
@@ -6647,7 +6729,7 @@ async function reportsPage(){
               </option>
             `).join("")}
           </select>
-          <input id="reportSearch" placeholder="Search incident, nature, location, unit, treatment area, destination, or disposition">
+          <input id="reportSearch" placeholder="${hasEms?"Search incident, nature, location, unit, treatment area, destination, or disposition":"Search incident, nature, location, unit, or disposition"}">
         </div>
       </div>
 
@@ -6655,7 +6737,7 @@ async function reportsPage(){
         <div class="table-wrap report-table-wrap"><table class="dispatch-log-table">
           <thead><tr>
             <th>Incident</th><th>Operational Period</th><th>Received</th><th>Status</th><th>Departments</th><th>Nature / Priority</th>
-            <th>Location</th><th>Units</th><th>En Route</th><th>On Scene</th><th>EMS / Transport</th>
+            <th>Location</th><th>Units</th><th>En Route</th><th>On Scene</th>${hasEms?`<th>EMS / Transport</th>`:""}
             <th>Disposition</th><th>Closed</th><th>Duration</th><th></th>
           </tr></thead>
           <tbody id="reportSummaryBody"></tbody>
@@ -6710,16 +6792,18 @@ async function reportsPage(){
     {label:"On Scene to Transport Seconds",value:"onscene_to_transport_seconds"},
     {label:"Unit Status Change Count",value:"unit_status_change_count"},
     {label:"Unit Status History",value:"unit_status_history"},
-    {label:"Walk-In",value:r=>r.walk_in?"Yes":"No"},
-    {label:"Treatment Areas",value:"treatment_areas"},
-    {label:"Ambulances",value:"ambulances"},
-    {label:"EMS Started",value:"ems_started_at"},
-    {label:"EMS Status",value:"latest_ems_status"},
-    {label:"Transport Destination",value:"transport_destination"},
-    {label:"Transport Started",value:"transport_started_at"},
-    {label:"Transport Completed",value:"transport_completed_at"},
-    {label:"EMS Final Disposition",value:r=>r.ems_final_disposition?dispositionLabel("EMS",r.ems_final_disposition):""},
-    {label:"EMS Closed",value:"ems_closed_at"},
+    ...(hasEms?[
+      {label:"Walk-In",value:r=>r.walk_in?"Yes":"No"},
+      {label:"Treatment Areas",value:"treatment_areas"},
+      {label:"Ambulances",value:"ambulances"},
+      {label:"EMS Started",value:"ems_started_at"},
+      {label:"EMS Status",value:"latest_ems_status"},
+      {label:"Transport Destination",value:"transport_destination"},
+      {label:"Transport Started",value:"transport_started_at"},
+      {label:"Transport Completed",value:"transport_completed_at"},
+      {label:"EMS Final Disposition",value:r=>r.ems_final_disposition?dispositionLabel("EMS",r.ems_final_disposition):""},
+      {label:"EMS Closed",value:"ems_closed_at"}
+    ]:[]),
     {label:"General Call Disposition",value:r=>r.disposition?dispositionLabel("GENERAL",r.disposition):""},
     {label:"CAD Activity Count",value:"activity_count"},
     {label:"Last CAD Activity",value:"last_activity_at"},
@@ -6741,7 +6825,7 @@ async function reportsPage(){
     {label:"Status From",value:"status_from"},
     {label:"Status To",value:"status_to"},
     {label:"Destination",value:"destination"},
-    {label:"Treatment Area",value:"treatment_area_name"},
+    ...(hasEms?[{label:"Treatment Area",value:"treatment_area_name"}]:[]),
     {label:"Disposition",value:"activity_disposition"},
     {label:"Reason",value:"reason"},
     {label:"Detail JSON",value:"detail"},
@@ -6761,7 +6845,7 @@ async function reportsPage(){
     {label:"Old Status",value:"old_status"},
     {label:"New Status",value:"new_status"},
     {label:"Transport Destination",value:"transport_destination_text"},
-    {label:"Treatment Area Destination",value:"transport_treatment_area"},
+    ...(hasEms?[{label:"Treatment Area Destination",value:"transport_treatment_area"}]:[]),
     {label:"Actor Type",value:"actor_kind"},
     {label:"Actor User ID",value:"actor_user_id"},
     {label:"Status Log ID",value:"status_log_id"},
@@ -6796,11 +6880,13 @@ async function reportsPage(){
     document.querySelector("#reportMetricTotal").textContent=metricRows.length;
     document.querySelector("#reportMetricOpen").textContent=metricRows.filter(r=>r.incident_status!=="CLOSED").length;
     document.querySelector("#reportMetricClosed").textContent=metricRows.filter(r=>r.incident_status==="CLOSED").length;
-    document.querySelector("#reportMetricTransports").textContent=metricRows.filter(r=>r.ems_final_disposition==="TRANSPORTED"||r.transport_started_at).length;
-    document.querySelector("#reportMetricWalkins").textContent=metricRows.filter(r=>r.walk_in).length;
+    if(hasEms){
+      document.querySelector("#reportMetricTransports").textContent=metricRows.filter(r=>r.ems_final_disposition==="TRANSPORTED"||r.transport_started_at).length;
+      document.querySelector("#reportMetricWalkins").textContent=metricRows.filter(r=>r.walk_in).length;
+    }
 
     document.querySelector("#reportSummaryBody").innerHTML=summaryRows.map(r=>`<tr>
-      <td><strong>${esc(r.incident_number)}</strong>${r.walk_in?`<br><span class="badge">WALK-IN</span>`:""}</td>
+      <td><strong>${esc(r.incident_number)}</strong>${hasEms&&r.walk_in?`<br><span class="badge">WALK-IN</span>`:""}</td>
       <td>${esc(r.operational_period_name||"Legacy")}${r.operational_period_prefix?`<br><span class="small mono muted">${esc(r.operational_period_prefix)}</span>`:""}</td>
       <td>${esc(reportDateTime(r.received_time))}</td>
       <td><span class="badge">${esc(r.incident_status)}</span></td>
@@ -6810,12 +6896,12 @@ async function reportsPage(){
       <td>${esc(r.units||"")}</td>
       <td>${esc(reportDateTime(r.first_enroute))}${r.dispatch_to_enroute_seconds!=null?`<br><span class="small muted">+${esc(reportDuration(r.dispatch_to_enroute_seconds))}</span>`:""}</td>
       <td>${esc(reportDateTime(r.first_onscene))}${r.received_to_onscene_seconds!=null?`<br><span class="small muted">+${esc(reportDuration(r.received_to_onscene_seconds))}</span>`:""}</td>
-      <td>${esc(reportEmsSummary(r))}</td>
-      <td>${esc(r.disposition?dispositionLabel("GENERAL",r.disposition):(r.ems_final_disposition?dispositionLabel("EMS",r.ems_final_disposition):""))}</td>
+      ${hasEms?`<td>${esc(reportEmsSummary(r))}</td>`:""}
+      <td>${esc(r.disposition?dispositionLabel("GENERAL",r.disposition):(hasEms&&r.ems_final_disposition?dispositionLabel("EMS",r.ems_final_disposition):""))}</td>
       <td>${esc(reportDateTime(r.closed_at))}</td>
       <td>${esc(reportDuration(r.total_duration_seconds))}</td>
       <td><button class="btn secondary compact" data-report-record="${r.incident_id}">View Record</button></td>
-    </tr>`).join("")||`<tr><td colspan="15" class="muted">No matching incidents.</td></tr>`;
+    </tr>`).join("")||`<tr><td colspan="${hasEms?15:14}" class="muted">No matching incidents.</td></tr>`;
 
     const activityRows=activities.filter(r=>matchesPeriod(r)&&matches(r,needle));
     document.querySelector("#reportActivityBody").innerHTML=activityRows.map(r=>`<tr>
@@ -7436,18 +7522,26 @@ async function fieldUnitCad(){
   if(incident?.map_layer_id){fieldLayer=(await supabase.from("event_map_layers").select("id,name,level_code").eq("id",incident.map_layer_id).maybeSingle()).data||null;}
   if(incident?.zone_id){fieldZone=(await supabase.from("event_zones").select("id,name").eq("id",incident.zone_id).maybeSingle()).data||null;}
   const statuses=fs.units?.event_departments?.status_profile||["AVAILABLE","RESPONDING","ON_SCENE","CLEAR"];
-  const [{data:fieldMapLayers},{data:fieldZones},{data:fieldTreatmentAreas}]=await Promise.all([
+  const [{data:fieldMapLayers},{data:fieldZones},{data:fieldEmsDepartments}]=await Promise.all([
     supabase.from("event_map_layers").select("id,name,level_code,is_default").eq("event_id",S.eventId).eq("active",true).eq("status","published").order("sort_order"),
     supabase.from("event_zones").select("id,map_layer_id,name").eq("event_id",S.eventId).eq("active",true).order("sort_order"),
-    supabase.from("ems_treatment_areas").select("id,name,status,accepting_patients").eq("event_id",S.eventId).eq("active",true).order("name")
+    supabase.from("event_departments").select("id").eq("event_id",S.eventId).eq("active",true).eq("ems_enabled",true).limit(1)
   ]);
+  const fieldHasEms=!!fieldEmsDepartments?.length;
+  let fieldTreatmentAreas=[];
+  if(fieldHasEms){
+    const treatmentAreaResult=await supabase.from("ems_treatment_areas").select("id,name,status,accepting_patients").eq("event_id",S.eventId).eq("active",true).order("name");
+    if(treatmentAreaResult.error)console.error("Field treatment areas failed to load",treatmentAreaResult.error);
+    fieldTreatmentAreas=treatmentAreaResult.data||[];
+  }
   let emsState=null;
-  try{emsState=await loadFieldEmsState(S.eventId,fs.unit_id,incident?.id||null);}catch(err){console.error("Field EMS panel failed to load",err);}
+  if(fieldHasEms){
+    try{emsState=await loadFieldEmsState(S.eventId,fs.unit_id,incident?.id||null);}catch(err){console.error("Field EMS panel failed to load",err);}
+  }
 
   let logisticsState=null;
   try{
     logisticsState=await loadFieldLogisticsState(S.eventId,fs.unit_id);
-    if(logisticsState)logisticsState.blockedByCad=!!incident;
   }catch(err){console.error("Field Guest Logistics panel failed to load",err);}
 
   const fieldIsAmbulance=!!(emsState?.config?.active&&(emsState.config.ems_role==="ambulance"||emsState.config.transport_capable));
@@ -7471,9 +7565,10 @@ async function fieldUnitCad(){
     </div>`,
 
     current_call:incident?`<div class="card assignment ${assignmentNeedsAck?"field-assignment-card-pending":""}">
+      ${logisticsState?.movements?.length?`<div class="small task-priority-label field-secondary-cad-label">SECONDARY CAD ASSIGNMENT</div>`:""}
       ${assignmentNeedsAck?`<div class="field-new-assignment" role="alert" aria-live="assertive">
         <div>
-          <div class="field-new-assignment-kicker">NEW ASSIGNMENT</div>
+          <div class="field-new-assignment-kicker">${logisticsState?.movements?.length?"NEW SECONDARY CAD ASSIGNMENT":"NEW ASSIGNMENT"}</div>
           <strong>${esc(incident.incident_number)} · ${esc(incident.call_type)}</strong>
           <div class="small">Assigned ${a?.assigned_at?dateTime24(a.assigned_at,{seconds:true}):"just now"}. Acknowledge receipt of this call.</div>
         </div>
@@ -7486,7 +7581,7 @@ async function fieldUnitCad(){
       <p>${esc(incident.notes||"")}</p>
       ${fieldLayer&&incident.map_x!=null&&incident.map_y!=null?`<button class="btn secondary block" id="viewFieldMap">View Call &amp; My Location</button>`:""}
       <div id="fieldMapHolder"></div>
-    </div>`:logisticsState?.underway?`<div class="card"><strong>No CAD incident assignment</strong><p class="muted">This unit is currently committed to the Guest Logistics movement below.</p></div>`:`<div class="card"><strong>No current CAD assignment</strong><p class="muted">${logisticsState?.current?"A future Guest Logistics movement is preassigned below; the unit remains available until that movement begins.":"Remain available for dispatch."}</p></div>`,
+    </div>`:logisticsState?.movements?.length?`<div class="card"><div class="small task-priority-label">SECONDARY CAD ASSIGNMENT</div><strong>No CAD incident assigned</strong><p class="muted">The MOVE assignment(s) above remain this unit's primary task.</p></div>`:`<div class="card"><strong>No current CAD assignment</strong><p class="muted">Remain available for dispatch.</p></div>`,
 
     guest_logistics:fieldLogisticsPanelHtml(logisticsState),
 
@@ -7516,14 +7611,14 @@ async function fieldUnitCad(){
       </div>
     </div>`:"",
 
-    ems_patient_flow:fieldEmsPanelHtml(emsState,incident),
+    ems_patient_flow:fieldHasEms?fieldEmsPanelHtml(emsState,incident):"",
 
     status_controls:logisticsState?.underway?"":`<div class="field-status-layout-block">
       <div class="section-title">Unit Status</div>
       <div class="status-buttons">${statuses.map(status=>`<button class="btn field-status-button ${fieldStatusColorClass(status)} ${status===fs.units?.status?"field-status-active":""}" data-status="${esc(status)}" aria-pressed="${status===fs.units?.status?"true":"false"}">${esc(status.replaceAll("_"," "))}</button>`).join("")}</div>
     </div>`,
 
-    transport_destination:logisticsState?.underway?"":`<div class="card transport-destination-editor ${fs.units?.status==="TRANSPORTING"?"":"hidden"}" id="fieldTransportDestinationPanel">
+    transport_destination:!fieldHasEms||logisticsState?.underway?"":`<div class="card transport-destination-editor ${fs.units?.status==="TRANSPORTING"?"":"hidden"}" id="fieldTransportDestinationPanel">
       <div class="section-title">Transport Destination</div>
       ${emsState?.config?.active&&(emsState.config.ems_role==="ambulance"||emsState.config.transport_capable)?`
         <label>Destination facility</label>
@@ -7574,8 +7669,15 @@ async function fieldUnitCad(){
     </div>`
   };
 
-  const fieldLayoutHtml=fieldLayout.blocks
-    .filter(block=>block.enabled)
+  const enabledFieldBlocks=fieldLayout.blocks.filter(block=>block.enabled&&(fieldHasEms||!['ems_patient_flow','transport_destination'].includes(block.id)));
+  if(logisticsState?.movements?.length){
+    enabledFieldBlocks.sort((a,b)=>{
+      if(a.id==="guest_logistics"&&b.id==="current_call")return -1;
+      if(a.id==="current_call"&&b.id==="guest_logistics")return 1;
+      return 0;
+    });
+  }
+  const fieldLayoutHtml=enabledFieldBlocks
     .map(block=>fieldBlocks[block.id]||"")
     .join("");
 
