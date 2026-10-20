@@ -1,4 +1,5 @@
-import QRCode from "qrcode";
+// qrcode is only needed by the Treatment Area Station; load it on demand.
+const loadQRCode=async()=>(await import("qrcode")).default;
 import { supabase } from "./supabase.js";
 
 const esc=(v="")=>String(v).replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m]));
@@ -179,14 +180,15 @@ async function ensureEmsOpsRealtime(app,ctx){
 }
 
 async function getUnitsAndConfigs(eventId){
-  const [unitsRes,configRes]=await Promise.all([
-    supabase.from("units").select("id,event_id,department_id,name,status,active").eq("event_id",eventId).eq("active",true).order("name"),
-    supabase.from("ems_unit_config").select("*")
-  ]);
+  // Embed the 1:1 EMS config so the roster is one event-scoped query instead
+  // of an unfiltered scan of every organization's unit configs.
+  const unitsRes=await supabase.from("units").select("id,event_id,department_id,name,status,active,ems_unit_config(*)").eq("event_id",eventId).eq("active",true).order("name");
   if(unitsRes.error)throw unitsRes.error;
-  if(configRes.error)throw configRes.error;
-  const configs=configRes.data||[];
-  return (unitsRes.data||[]).map(u=>({...u,ems_config:configs.find(c=>c.unit_id===u.id)||null}));
+  return (unitsRes.data||[]).map(u=>{
+    const c=Array.isArray(u.ems_unit_config)?u.ems_unit_config[0]:u.ems_unit_config;
+    const {ems_unit_config,...rest}=u;
+    return {...rest,ems_config:c?{...c,unit_id:c.unit_id||u.id}:null};
+  });
 }
 
 function resourceName({unitId,areaId,units,areas}){
@@ -758,27 +760,54 @@ export async function renderEmsAdmin(container,ctx,onRefresh){
    ============================================================ */
 
 
-export async function loadFieldEmsState(eventId,unitId,incidentId){
-  const {data:emsDepartments,error:emsDepartmentsErr}=await supabase.from("event_departments")
-    .select("id")
-    .eq("event_id",eventId)
-    .eq("active",true)
-    .eq("ems_enabled",true)
-    .limit(1);
-  if(emsDepartmentsErr)throw emsDepartmentsErr;
-  if(!emsDepartments?.length)return null;
+const fieldEmsRefCache={eventId:null,loadedAt:0,promise:null,data:null};
+const FIELD_EMS_REF_TTL_MS=120000;
 
-  const {data:config,error:configErr}=await supabase.from("ems_unit_config").select("*").eq("unit_id",unitId).maybeSingle();
-  if(configErr)throw configErr;
-  if(!config?.active)return null;
+// Unit roster/EMS config and EMS dispositions change rarely during an
+// Operational Period; cache them so every field render does not re-pull them.
+async function loadFieldEmsReference(eventId){
+  const fresh=fieldEmsRefCache.eventId===eventId&&fieldEmsRefCache.data&&(Date.now()-fieldEmsRefCache.loadedAt)<FIELD_EMS_REF_TTL_MS;
+  if(fresh)return fieldEmsRefCache.data;
+  if(fieldEmsRefCache.promise&&fieldEmsRefCache.eventId===eventId)return fieldEmsRefCache.promise;
+  fieldEmsRefCache.eventId=eventId;
+  fieldEmsRefCache.promise=(async()=>{
+    const [dispRes,units]=await Promise.all([
+      supabase.from("event_dispositions").select("code,label,sort_order").eq("event_id",eventId).eq("scope","EMS").eq("active",true).order("sort_order").order("label"),
+      getUnitsAndConfigs(eventId)
+    ]);
+    if(dispRes.error)throw dispRes.error;
+    const data={dispositions:dispRes.data||[],units};
+    fieldEmsRefCache.data=data;
+    fieldEmsRefCache.loadedAt=Date.now();
+    fieldEmsRefCache.promise=null;
+    return data;
+  })().catch(err=>{fieldEmsRefCache.promise=null;fieldEmsRefCache.data=null;throw err;});
+  return fieldEmsRefCache.promise;
+}
 
-  const [encRes,areasRes,dispRes,units]=await Promise.all([
+export async function loadFieldEmsState(eventId,unitId,incidentId,known={}){
+  if(known.hasEms!==true){
+    const {data:emsDepartments,error:emsDepartmentsErr}=await supabase.from("event_departments")
+      .select("id")
+      .eq("event_id",eventId)
+      .eq("active",true)
+      .eq("ems_enabled",true)
+      .limit(1);
+    if(emsDepartmentsErr)throw emsDepartmentsErr;
+    if(!emsDepartments?.length)return null;
+  }
+
+  const [encRes,areasRes,ref]=await Promise.all([
     supabase.from("ems_encounters").select("*").eq("current_unit_id",unitId).neq("current_status","CLOSED").order("created_at"),
-    supabase.from("ems_treatment_areas").select("*").eq("event_id",eventId).eq("active",true).order("name"),
-    supabase.from("event_dispositions").select("code,label,sort_order").eq("event_id",eventId).eq("scope","EMS").eq("active",true).order("sort_order").order("label"),
-    getUnitsAndConfigs(eventId)
+    known.areas?Promise.resolve({data:known.areas,error:null}):supabase.from("ems_treatment_areas").select("*").eq("event_id",eventId).eq("active",true).order("name"),
+    loadFieldEmsReference(eventId)
   ]);
-  for(const r of [encRes,areasRes,dispRes])if(r.error)throw r.error;
+  for(const r of [encRes,areasRes])if(r.error)throw r.error;
+
+  const units=ref.units;
+  const config=units.find(u=>u.id===unitId)?.ems_config||null;
+  if(!config?.active)return null;
+  const dispRes={data:ref.dispositions};
 
   const current=encRes.data||[];
   const areas=areasRes.data||[];
@@ -1109,7 +1138,7 @@ async function treatmentDashboard(app,ts,{header,onExit}){
     let fieldReportQrDataUrl="";
     if(reportQrVisible){
       try{
-        fieldReportQrDataUrl=await QRCode.toDataURL(fieldReportUrl,{
+        fieldReportQrDataUrl=await (await loadQRCode()).toDataURL(fieldReportUrl,{
           width:260,
           margin:2,
           errorCorrectionLevel:"M",

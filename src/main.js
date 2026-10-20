@@ -1,7 +1,9 @@
 import "./style.css";
 import L from "leaflet";
 import { supabase } from "./supabase.js";
-import { renderMapBuilder } from "./mapBuilder.js";
+// Map Builder (and the PDF.js engine it depends on) is loaded on demand so
+// dispatch and field devices never download it.
+const renderMapBuilder=async(...args)=>(await import("./mapBuilder.js")).renderMapBuilder(...args);
 import { pixelToGeo, pixelToLeaflet, leafletToPixel, geoToPixel, distanceMeters } from "./georef.js";
 import { saveOfflineEvent, getOfflineEvent } from "./offlineStore.js";
 import { renderEmsOps, renderEmsAdmin, renderTreatmentAreaFlow, loadFieldEmsState, fieldEmsPanelHtml, bindFieldEmsPanel, renderDispatchIncidentTreatmentPanel, TREATMENT_LAYOUT_BLOCKS, defaultTreatmentLayoutConfig, normalizeTreatmentLayoutConfig } from "./ems.js";
@@ -63,8 +65,115 @@ const S={
   fieldAssignmentFocusHandler:null,
   mapPickMode:null,
   pendingIncidentDraft:null,
-  fieldReportSessionOwned:false
+  fieldReportSessionOwned:false,
+  dispatchHeartbeatTimer:null,
+  dispatchStructureRefreshTimer:null,
+  dispatchStructureRefreshInFlight:false,
+  dispatchStructureRefreshPending:false,
+  dispatchUnitSyncTimer:null,
+  fieldRealtimeKey:null,
+  fieldRealtimeStatus:null,
+  fieldHeartbeatTimer:null,
+  fieldMapOpenIncidentId:null
 };
+
+/* ---------------- PERFORMANCE INFRASTRUCTURE ----------------
+   Lookup indexes, change-aware DOM updates, coalesced reloads and cached
+   signed storage URLs. All CAD rendering paths use these instead of
+   repeated linear scans and unconditional innerHTML rebuilds. */
+
+const IDX={
+  dirty:true,
+  refs:{},
+  unitsById:new Map(),incidentsById:new Map(),assignmentByUnit:new Map(),
+  movementsByUnit:new Map(),locationsByUnit:new Map(),layersById:new Map(),
+  zonesById:new Map(),departmentsById:new Map(),periodsById:new Map(),
+  emsConfigByUnit:new Map(),treatmentAreasById:new Map(),poisById:new Map()
+};
+
+function markIndexesDirty(){IDX.dirty=true;}
+
+function idx(){
+  const r=IDX.refs;
+  if(
+    IDX.dirty||
+    r.units!==S.units||r.unitsLen!==S.units.length||
+    r.incidents!==S.incidents||r.incidentsLen!==S.incidents.length||
+    r.movements!==S.guestLogisticsMovements||r.movementsLen!==(S.guestLogisticsMovements||[]).length||
+    r.locations!==S.unitLocations||r.locationsLen!==(S.unitLocations||[]).length
+  )rebuildIndexes();
+  return IDX;
+}
+
+function rebuildIndexes(){
+  const byId=(list,key="id")=>new Map((list||[]).map(x=>[x[key],x]));
+  IDX.unitsById=byId(S.units);
+  IDX.incidentsById=byId(S.incidents);
+  IDX.layersById=byId(S.mapLayers);
+  IDX.zonesById=byId(S.zones);
+  IDX.departmentsById=byId(S.departments);
+  IDX.periodsById=byId(S.operationalPeriods);
+  IDX.treatmentAreasById=byId(S.treatmentAreas);
+  IDX.poisById=byId(S.pois);
+  IDX.locationsByUnit=byId(S.unitLocations,"unit_id");
+
+  IDX.emsConfigByUnit=new Map();
+  for(const c of S.emsUnitConfigs||[])if(c?.unit_id&&c.active)IDX.emsConfigByUnit.set(c.unit_id,c);
+
+  // First open (not cleared) assignment per unit, in incident board order.
+  IDX.assignmentByUnit=new Map();
+  for(const incident of S.incidents||[]){
+    for(const link of incident.incident_units||[]){
+      if(link.cleared_at||IDX.assignmentByUnit.has(link.unit_id))continue;
+      IDX.assignmentByUnit.set(link.unit_id,{incident,link});
+    }
+  }
+
+  IDX.movementsByUnit=new Map();
+  for(const m of S.guestLogisticsMovements||[]){
+    if(!m.assigned_unit_id)continue;
+    let list=IDX.movementsByUnit.get(m.assigned_unit_id);
+    if(!list){list=[];IDX.movementsByUnit.set(m.assigned_unit_id,list);}
+    list.push(m);
+  }
+  for(const list of IDX.movementsByUnit.values()){
+    list.sort((a,b)=>{
+      const underwayDiff=Number(LOGISTICS_UNDERWAY_STATUSES.has(b.status))-Number(LOGISTICS_UNDERWAY_STATUSES.has(a.status));
+      if(underwayDiff)return underwayDiff;
+      return new Date(a.scheduled_at||0).getTime()-new Date(b.scheduled_at||0).getTime();
+    });
+  }
+
+  IDX.refs={
+    units:S.units,unitsLen:S.units.length,
+    incidents:S.incidents,incidentsLen:S.incidents.length,
+    movements:S.guestLogisticsMovements,movementsLen:(S.guestLogisticsMovements||[]).length,
+    locations:S.unitLocations,locationsLen:(S.unitLocations||[]).length
+  };
+  IDX.dirty=false;
+}
+
+// Replace a container's HTML only when it actually changed. Returns true when
+// the DOM was touched. Scroll position of the container is preserved.
+function setHtmlIfChanged(host,html){
+  if(!host)return false;
+  if(host.__ccHtml===html)return false;
+  const scrollTop=host.scrollTop;
+  host.innerHTML=html;
+  host.__ccHtml=html;
+  if(scrollTop)host.scrollTop=scrollTop;
+  return true;
+}
+
+function debounce(fn,wait){
+  let timer=null;
+  return (...args)=>{
+    if(timer)clearTimeout(timer);
+    timer=setTimeout(()=>{timer=null;fn(...args);},wait);
+  };
+}
+
+const signedUrlCache=new Map();
 
 const esc=(v="")=>String(v).replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m]));
 
@@ -170,10 +279,10 @@ function fieldLayoutBlockMeta(id){
 }
 
 
-function formatElapsed(startIso){
+function formatElapsed(startIso,now=Date.now()){
   const start=new Date(startIso).getTime();
   if(!Number.isFinite(start))return "--:--";
-  const total=Math.max(0,Math.floor((Date.now()-start)/1000));
+  const total=Math.max(0,Math.floor((now-start)/1000));
   const days=Math.floor(total/86400);
   const hours=Math.floor((total%86400)/3600);
   const minutes=Math.floor((total%3600)/60);
@@ -185,9 +294,14 @@ function formatElapsed(startIso){
 }
 
 function updateCallTimers(){
-  document.querySelectorAll("[data-call-start]").forEach(el=>{
-    el.textContent=formatElapsed(el.dataset.callStart);
-  });
+  if(document.visibilityState!=="visible")return;
+  const nodes=document.querySelectorAll("[data-call-start]");
+  if(!nodes.length)return;
+  const now=Date.now();
+  for(const el of nodes){
+    const text=formatElapsed(el.dataset.callStart,now);
+    if(el.textContent!==text)el.textContent=text;
+  }
 }
 
 function ensureCallTimerTicker(){
@@ -700,13 +814,7 @@ function dispatchHasGuestLogisticsEnabled(){
 const LOGISTICS_UNDERWAY_STATUSES=new Set(["EN_ROUTE_PICKUP","AT_PICKUP","PASSENGER_ONBOARD","EN_ROUTE_DESTINATION"]);
 
 function logisticsMovementsForUnit(unitId){
-  return (S.guestLogisticsMovements||[])
-    .filter(m=>m.assigned_unit_id===unitId)
-    .sort((a,b)=>{
-      const underwayDiff=Number(LOGISTICS_UNDERWAY_STATUSES.has(b.status))-Number(LOGISTICS_UNDERWAY_STATUSES.has(a.status));
-      if(underwayDiff)return underwayDiff;
-      return new Date(a.scheduled_at||0).getTime()-new Date(b.scheduled_at||0).getTime();
-    });
+  return idx().movementsByUnit.get(unitId)||[];
 }
 
 function underwayLogisticsMovementForUnit(unitId){
@@ -1549,7 +1657,7 @@ async function loadCommandDisplayOps(){
 }
 
 async function loadEventOps(){
-  const [
+  let [
     eventRes,
     depsRes,
     unitsRes,
@@ -1559,17 +1667,15 @@ async function loadEventOps(){
     mapLayersRes,
     zonesRes,
     accessPointsRes,
-    accessNodesRes,
     unitLocationsRes,
     operationalPeriodsRes,
     dispositionsRes,
     guestLogisticsMovementsRes,
-    emsUnitConfigsRes,
     treatmentAreasRes
   ] = await Promise.all([
     supabase.from("events").select("*").eq("id",S.eventId).single(),
     supabase.from("event_departments").select("*").eq("event_id",S.eventId).eq("active",true).order("sort_order"),
-    supabase.from("units").select("*,event_departments(name,short_name)").eq("event_id",S.eventId).eq("active",true).order("name"),
+    supabase.from("units").select("*,event_departments(name,short_name),ems_unit_config(*)").eq("event_id",S.eventId).eq("active",true).order("name"),
     // Keep the incident query deliberately simple. Related department/unit
     // records are loaded separately below so a relationship/embed error
     // can never make the entire incident list disappear.
@@ -1582,15 +1688,38 @@ async function loadEventOps(){
     supabase.from("event_maps").select("*").eq("event_id",S.eventId).maybeSingle(),
     supabase.from("event_map_layers").select("*").eq("event_id",S.eventId).eq("active",true).order("sort_order"),
     supabase.from("event_zones").select("*").eq("event_id",S.eventId).eq("active",true).order("sort_order"),
-    supabase.from("venue_access_points").select("*").eq("event_id",S.eventId).eq("active",true).order("name"),
-    supabase.from("venue_access_point_nodes").select("*"),
+    supabase.from("venue_access_points").select("*,venue_access_point_nodes(*)").eq("event_id",S.eventId).eq("active",true).order("name"),
     supabase.from("unit_locations").select("*").eq("event_id",S.eventId),
     supabase.from("operational_periods").select("*").eq("event_id",S.eventId).order("created_at"),
     supabase.from("event_dispositions").select("*").eq("event_id",S.eventId).eq("active",true).order("scope").order("sort_order").order("label"),
     supabase.from("guest_logistics_movements").select("id,event_id,department_id,movement_number,movement_type,guest_name,guest_group,status,scheduled_at,assigned_unit_id,assigned_at,driver_acknowledged_at,updated_at,origin,destination,airline,flight_number,airport,terminal").eq("event_id",S.eventId).not("status","in","(COMPLETE,NO_SHOW,CANCELLED)").order("scheduled_at"),
-    supabase.from("ems_unit_config").select("*"),
     supabase.from("ems_treatment_areas").select("*").eq("event_id",S.eventId).eq("active",true).order("name")
   ]);
+
+  // Embedded relationships keep every query scoped to this event. If a
+  // deployment's PostgREST schema cache cannot resolve an embed, fall back to
+  // the legacy separate queries rather than failing the whole board.
+  if(unitsRes.error&&/relationship|embed/i.test(unitsRes.error.message||"")){
+    const [plainUnits,configs]=await Promise.all([
+      supabase.from("units").select("*,event_departments(name,short_name)").eq("event_id",S.eventId).eq("active",true).order("name"),
+      supabase.from("ems_unit_config").select("*")
+    ]);
+    unitsRes=plainUnits;
+    if(!plainUnits.error){
+      const byUnit=new Map((configs.data||[]).map(c=>[c.unit_id,c]));
+      for(const u of plainUnits.data||[])u.ems_unit_config=byUnit.get(u.id)||null;
+    }
+  }
+  if(accessPointsRes.error&&/relationship|embed/i.test(accessPointsRes.error.message||"")){
+    const [plainAps,nodes]=await Promise.all([
+      supabase.from("venue_access_points").select("*").eq("event_id",S.eventId).eq("active",true).order("name"),
+      supabase.from("venue_access_point_nodes").select("*")
+    ]);
+    accessPointsRes=plainAps;
+    if(!plainAps.error){
+      for(const ap of plainAps.data||[])ap.venue_access_point_nodes=(nodes.data||[]).filter(n=>n.access_point_id===ap.id);
+    }
+  }
 
   const baseResults = {
     event: eventRes,
@@ -1602,12 +1731,10 @@ async function loadEventOps(){
     mapLayers: mapLayersRes,
     zones: zonesRes,
     accessPoints: accessPointsRes,
-    accessNodes: accessNodesRes,
     unitLocations: unitLocationsRes,
     operationalPeriods: operationalPeriodsRes,
     dispositions: dispositionsRes,
     guestLogisticsMovements: guestLogisticsMovementsRes,
-    emsUnitConfigs: emsUnitConfigsRes,
     treatmentAreas: treatmentAreasRes
   };
 
@@ -1640,13 +1767,22 @@ async function loadEventOps(){
       console.error("CommCenter Pro incident unit load error", unitLinksRes.error);
     }
 
-    const deptLinks = deptLinksRes.data || [];
-    const unitLinks = unitLinksRes.data || [];
+    const groupBy=(rows,key)=>{
+      const map=new Map();
+      for(const row of rows||[]){
+        let list=map.get(row[key]);
+        if(!list){list=[];map.set(row[key],list);}
+        list.push(row);
+      }
+      return map;
+    };
+    const deptLinks=groupBy(deptLinksRes.data,"incident_id");
+    const unitLinks=groupBy(unitLinksRes.data,"incident_id");
 
     incidents = incidents.map(i=>({
       ...i,
-      incident_departments: deptLinks.filter(x=>x.incident_id===i.id),
-      incident_units: unitLinks.filter(x=>x.incident_id===i.id)
+      incident_departments: deptLinks.get(i.id)||[],
+      incident_units: unitLinks.get(i.id)||[]
     }));
   }
 
@@ -1677,19 +1813,22 @@ async function loadEventOps(){
   S.activeOperationalPeriod=S.operationalPeriods.find(op=>op.status==="ACTIVE")||null;
   S.dispositions=dispositionsRes.data||[];
   S.guestLogisticsMovements=guestLogisticsMovementsRes.data||[];
-  S.emsUnitConfigs=emsUnitConfigsRes.data||[];
+  S.emsUnitConfigs=S.units.map(u=>{
+    const c=Array.isArray(u.ems_unit_config)?u.ems_unit_config[0]:u.ems_unit_config;
+    return c?{...c,unit_id:c.unit_id||u.id}:null;
+  }).filter(Boolean);
   S.treatmentAreas=treatmentAreasRes.data||[];
-  const apIds=new Set(S.accessPoints.map(a=>a.id));
-  S.accessNodes=(accessNodesRes.data||[]).filter(n=>apIds.has(n.access_point_id));
+  S.accessNodes=S.accessPoints.flatMap(a=>(a.venue_access_point_nodes||[]).map(n=>({...n,access_point_id:n.access_point_id||a.id})));
   const preferred=S.mapLayers.find(l=>l.id===S.activeMapLayerId);
   const fallback=S.mapLayers.find(l=>l.is_default&&l.status==="published")||S.mapLayers.find(l=>l.status==="published")||S.mapLayers[0]||null;
   S.activeMapLayerId=(preferred||fallback)?.id||null;
+  markIndexesDirty();
   loadDispatchScope();
 }
 
-function activeMapLayer(){return S.mapLayers.find(l=>l.id===S.activeMapLayerId)||null;}
-function zoneName(id){return S.zones.find(z=>z.id===id)?.name||"";}
-function layerName(id){return S.mapLayers.find(l=>l.id===id)?.name||"";}
+function activeMapLayer(){return idx().layersById.get(S.activeMapLayerId)||null;}
+function zoneName(id){return idx().zonesById.get(id)?.name||"";}
+function layerName(id){return idx().layersById.get(id)?.name||"";}
 
 function dispositionOptions(scope){
   return (S.dispositions||[])
@@ -1710,7 +1849,7 @@ function incidentHasEmsDepartment(incident){
 }
 
 function operationalPeriodById(id){
-  return (S.operationalPeriods||[]).find(op=>op.id===id)||null;
+  return idx().periodsById.get(id)||null;
 }
 
 function operationalPeriodName(id){
@@ -2115,8 +2254,12 @@ async function handleRealtimePoiInsert(payload){
 
 async function storageSigned(path,seconds=3600){
   if(!path)return null;
+  const cached=signedUrlCache.get(path);
+  if(cached&&cached.expiresAt>Date.now())return cached.url;
   const {data,error}=await supabase.storage.from("event-assets").createSignedUrl(path,seconds);
   if(error)throw error;
+  // Refresh well before expiry so a cached URL never fails mid-session.
+  signedUrlCache.set(path,{url:data.signedUrl,expiresAt:Date.now()+Math.max(60,seconds-300)*1000});
   return data.signedUrl;
 }
 
@@ -2345,7 +2488,7 @@ function locationFreshness(location){
 }
 
 function unitLocation(unitId){
-  return S.unitLocations.find(l=>l.unit_id===unitId)||null;
+  return idx().locationsByUnit.get(unitId)||null;
 }
 
 function unitLocationLayerId(unit){
@@ -2374,52 +2517,77 @@ function removeUnitLocationMarker(unitId){
 
 function renderUnitLocationMarker(unitId){
   if(!S.map)return;
-  removeUnitLocationMarker(unitId);
 
-  const unit=S.units.find(u=>u.id===unitId);
+  const unit=idx().unitsById.get(unitId);
   const location=unitLocation(unitId);
   const layer=activeMapLayer();
-  if(!unit||!location||!layer?.georef_coefficients)return;
+  if(!unit||!location||!layer?.georef_coefficients){removeUnitLocationMarker(unitId);return;}
 
   const freshness=locationFreshness(location);
-  if(freshness==="expired")return;
+  if(freshness==="expired"){removeUnitLocationMarker(unitId);return;}
 
   const locationLayerId=unitLocationLayerId(unit);
-  if(locationLayerId!==layer.id)return;
+  if(locationLayerId!==layer.id){removeUnitLocationMarker(unitId);return;}
 
   let pixel;
   try{
     pixel=geoToPixel(Number(location.latitude),Number(location.longitude),layer.georef_coefficients);
   }catch{
+    removeUnitLocationMarker(unitId);
     return;
   }
 
   // Do not pin a device far outside the actual venue image.
   if(pixel.x < -50 || pixel.y < -50 || pixel.x > Number(layer.image_width)+50 || pixel.y > Number(layer.image_height)+50){
+    removeUnitLocationMarker(unitId);
     return;
   }
 
-  const marker=L.circleMarker(
-    pixelToLeaflet(pixel.x,pixel.y,layer.image_height),
-    {
-      radius:9,
-      weight:3,
-      fillOpacity:freshness==="live"?.9:.45,
-      opacity:freshness==="live"?1:.55,
-      className:`unit-gps-marker unit-gps-${freshness}`
-    }
-  ).addTo(S.map);
+  const latlng=pixelToLeaflet(pixel.x,pixel.y,layer.image_height);
+  const style={
+    fillOpacity:freshness==="live"?.9:.45,
+    opacity:freshness==="live"?1:.55,
+    className:`unit-gps-marker unit-gps-${freshness}`
+  };
+  const tooltip=unitLocationTooltip(unit,location);
+  const existing=S.unitLocationMarkers.get(unitId);
 
-  marker.bindTooltip(unitLocationTooltip(unit,location),{direction:"top",offset:[0,-8]});
-  S.unitLocationMarkers.set(unitId,{marker});
+  if(existing?.marker){
+    // Patch the existing Leaflet layer instead of destroying and recreating it
+    // on every GPS tick; className changes require a path re-render.
+    existing.marker.setLatLng(latlng);
+    if(existing.freshness!==freshness){
+      const path=existing.marker.getElement?.();
+      if(path){
+        path.classList.remove(`unit-gps-${existing.freshness}`);
+        path.classList.add(`unit-gps-${freshness}`);
+      }
+      existing.marker.setStyle(style);
+      existing.freshness=freshness;
+    }
+    if(existing.tooltip!==tooltip){
+      existing.marker.setTooltipContent(tooltip);
+      existing.tooltip=tooltip;
+    }
+    return;
+  }
+
+  const marker=L.circleMarker(latlng,{radius:9,weight:3,...style}).addTo(S.map);
+  marker.bindTooltip(tooltip,{direction:"top",offset:[0,-8]});
+  S.unitLocationMarkers.set(unitId,{marker,freshness,tooltip});
 }
 
 function renderAllUnitLocationMarkers(){
-  S.unitLocationMarkers.forEach((_,unitId)=>removeUnitLocationMarker(unitId));
-  S.unitLocationMarkers.clear();
+  const wanted=new Set();
   for(const location of S.unitLocations){
-    const unit=S.units.find(u=>u.id===location.unit_id);
-    if(unit&&unitInDispatchScope(unit))renderUnitLocationMarker(location.unit_id);
+    const unit=idx().unitsById.get(location.unit_id);
+    if(unit&&unitInDispatchScope(unit)){
+      wanted.add(location.unit_id);
+      renderUnitLocationMarker(location.unit_id);
+    }
+  }
+  for(const unitId of [...S.unitLocationMarkers.keys()]){
+    if(!wanted.has(unitId))removeUnitLocationMarker(unitId);
   }
 }
 
@@ -2431,16 +2599,18 @@ function updateDispatcherUnitLocation(payload){
     const unitId=old?.unit_id;
     if(!unitId)return;
     S.unitLocations=S.unitLocations.filter(l=>l.unit_id!==unitId);
+    markIndexesDirty();
     removeUnitLocationMarker(unitId);
     updateUnitLocationBoardRow(unitId);
     return;
   }
 
-  if(!row?.unit_id || !S.units.some(u=>u.id===row.unit_id))return;
+  if(!row?.unit_id || !idx().unitsById.has(row.unit_id))return;
   const index=S.unitLocations.findIndex(l=>l.unit_id===row.unit_id);
   if(index>=0)S.unitLocations[index]=row;
   else S.unitLocations.push(row);
-  const unit=S.units.find(u=>u.id===row.unit_id);
+  markIndexesDirty();
+  const unit=idx().unitsById.get(row.unit_id);
   if(unit&&unitInDispatchScope(unit))renderUnitLocationMarker(row.unit_id);
   else removeUnitLocationMarker(row.unit_id);
   updateUnitLocationBoardRow(row.unit_id);
@@ -2456,17 +2626,22 @@ function updateUnitLocationBoardRow(unitId){
     return;
   }
   const freshness=locationFreshness(location);
-  el.textContent=`${locationAgeLabel(location)}${location.accuracy_m!=null?` · ±${Math.round(location.accuracy_m)}m`:""}`;
-  el.className=`small unit-gps-readout gps-${freshness}`;
+  const text=`${locationAgeLabel(location)}${location.accuracy_m!=null?` · ±${Math.round(location.accuracy_m)}m`:""}`;
+  if(el.textContent!==text)el.textContent=text;
+  const cls=`small unit-gps-readout gps-${freshness}`;
+  if(el.className!==cls)el.className=cls;
 }
 
 function refreshLocationAges(){
-  for(const unit of S.units){
+  if(document.visibilityState!=="visible")return;
+  // Only units that have a GPS row can change; the in-place marker update is
+  // a no-op when nothing moved.
+  for(const location of S.unitLocations){
+    const unit=idx().unitsById.get(location.unit_id);
+    if(!unit)continue;
     updateUnitLocationBoardRow(unit.id);
-    const location=unitLocation(unit.id);
-    if(location){
-      const freshness=locationFreshness(location);
-      if(freshness==="expired"||!unitInDispatchScope(unit))removeUnitLocationMarker(unit.id);
+    if(S.map){
+      if(locationFreshness(location)==="expired"||!unitInDispatchScope(unit))removeUnitLocationMarker(unit.id);
       else renderUnitLocationMarker(unit.id);
     }
   }
@@ -2479,11 +2654,7 @@ function ensureLocationAgeTicker(){
 }
 
 function activeAssignmentForUnit(unitId){
-  for(const incident of S.incidents){
-    const link=(incident.incident_units||[]).find(x=>x.unit_id===unitId && !x.cleared_at);
-    if(link)return {incident,link};
-  }
-  return null;
+  return idx().assignmentByUnit.get(unitId)||null;
 }
 
 function cadAssignmentStatus(active,unit=null){
@@ -2522,7 +2693,9 @@ function unitList(){
     ${units.map(u=>{
       const active=activeAssignmentForUnit(u.id);
       const moves=logisticsMovementsForUnit(u.id);
-      const cadStatus=dispatchCadStatusForUnit(u);
+      const cadStatus=active?cadAssignmentStatus(active,u):(u.status||"AVAILABLE");
+      const loc=unitLocation(u.id);
+      const transportLabel=unitTransportDestinationLabel(u);
       return `<button class="unit unit-button ${moves.length?"unit-has-moves":""}" data-unit-detail="${u.id}">
         <div class="row">
           <strong>${esc(u.name)}</strong>
@@ -2537,8 +2710,8 @@ function unitList(){
           :moves.length
             ?"No secondary CAD assignment"
             :"Unassigned"}</div>
-        ${unitTransportDestinationLabel(u)?`<div class="small transport-destination-readout">Transport → ${esc(unitTransportDestinationLabel(u))}</div>`:""}
-        <div class="small unit-gps-readout ${unitLocation(u.id)?`gps-${locationFreshness(unitLocation(u.id))}`:"muted"}" data-unit-gps="${u.id}">${unitLocation(u.id)?`${locationAgeLabel(unitLocation(u.id))}${unitLocation(u.id).accuracy_m!=null?` · ±${Math.round(unitLocation(u.id).accuracy_m)}m`:""}`:(S.event?.field_location_enabled?"GPS not shared":"GPS disabled")}</div>
+        ${transportLabel?`<div class="small transport-destination-readout">Transport → ${esc(transportLabel)}</div>`:""}
+        <div class="small unit-gps-readout ${loc?`gps-${locationFreshness(loc)}`:"muted"}" data-unit-gps="${u.id}">${loc?`${locationAgeLabel(loc)}${loc.accuracy_m!=null?` · ±${Math.round(loc.accuracy_m)}m`:""}`:(S.event?.field_location_enabled?"GPS not shared":"GPS disabled")}</div>
       </button>`;
     }).join("")}
   `).join("")||`<div class="small muted">No units configured.</div>`;
@@ -2873,15 +3046,24 @@ function incidentTimelineHtml(rows){
   `).join("")||`<div class="small muted">No CAD activity has been recorded yet.</div>`;
 }
 
+let dispatchClicksDelegated=false;
 function bindIncidentClicks(){
-  document.querySelectorAll("[data-incident]").forEach(b=>b.onclick=()=>selectIncident(b.dataset.incident));
-  document.querySelectorAll("[data-unit-detail]").forEach(b=>b.onclick=()=>selectUnit(b.dataset.unitDetail));
+  // Board rows are re-rendered constantly; a single delegated listener on the
+  // app root replaces per-row handler rebinding after every refresh.
+  if(dispatchClicksDelegated)return;
+  dispatchClicksDelegated=true;
+  app.addEventListener("click",event=>{
+    const incidentRow=event.target.closest("#incidentList [data-incident]");
+    if(incidentRow){selectIncident(incidentRow.dataset.incident);return;}
+    const unitRow=event.target.closest("#unitList [data-unit-detail]");
+    if(unitRow)selectUnit(unitRow.dataset.unitDetail);
+  });
 }
 
 const UNIT_AVAILABILITY_STATUSES=new Set(["AVAILABLE","OUT_OF_SERVICE"]);
 
 function departmentStatusProfileForUnit(unit){
-  const dep=S.departments.find(d=>d.id===unit.department_id);
+  const dep=idx().departmentsById.get(unit.department_id);
   return [...new Set(Array.isArray(dep?.status_profile)?dep.status_profile:[])];
 }
 
@@ -2899,7 +3081,7 @@ function unitAvailabilityOptions(unit){
 
 
 function unitEmsConfig(unitId){
-  return S.emsUnitConfigs.find(c=>c.unit_id===unitId&&c.active)||null;
+  return idx().emsConfigByUnit.get(unitId)||null;
 }
 
 function isAmbulanceUnit(unit){
@@ -2908,7 +3090,7 @@ function isAmbulanceUnit(unit){
 }
 
 function treatmentAreaName(id){
-  return S.treatmentAreas.find(a=>a.id===id)?.name||"";
+  return idx().treatmentAreasById.get(id)?.name||"";
 }
 
 function unitTransportDestinationLabel(unit){
@@ -3458,21 +3640,28 @@ async function openCloseIncidentDispositionModal(incident,{hasEms=false}={}){
   };
 }
 
-async function selectIncident(id){
-  const i=S.incidents.find(x=>x.id===id);
+async function selectIncident(id,{silent=false}={}){
+  const i=idx().incidentsById.get(id);
   if(!i)return;
 
+  const content=openIncidentModalShell();
+  // A background refresh of an already-open incident keeps the current view on
+  // screen while fresh data loads; only a fresh open shows the loading state.
+  const alreadyOpen=S.openIncidentId===id&&S.incidentModalMode==="overview";
   S.openIncidentId=id;
   S.openUnitId=null;
   S.incidentModalMode="overview";
-
-  const content=openIncidentModalShell();
-  content.innerHTML=`<div class="incident-modal-loading">Loading ${esc(i.incident_number)}…</div>`;
+  if(!(silent&&alreadyOpen)){
+    content.__ccHtml=null;
+    content.innerHTML=`<div class="incident-modal-loading">Loading ${esc(i.incident_number)}…</div>`;
+  }
 
   const extra=await loadIncidentCommandData(id,i.guest_logistics_movement_id||null);
 
-  // Incident may have been closed while detail was loading.
-  const current=S.incidents.find(x=>x.id===id);
+  // The dispatcher may have opened something else, or the incident may have
+  // been closed, while detail was loading.
+  const current=idx().incidentsById.get(id);
+  if(S.openIncidentId!==id||S.incidentModalMode!=="overview")return;
   if(!current){
     closeIncidentModal();
     return;
@@ -3483,7 +3672,7 @@ async function selectIncident(id){
   const deps=incidentDepartmentNames(current);
   const isEmsIncident=incidentHasEmsDepartment(current);
 
-  content.innerHTML=`<div class="incident-modal-header">
+  const incidentModalHtml=`<div class="incident-modal-header">
     <div>
       <div class="incident-modal-eyebrow">ACTIVE INCIDENT</div>
       <div class="incident-modal-title-row">
@@ -3544,7 +3733,7 @@ async function selectIncident(id){
         <div class="row"><div class="section-title">Assigned Units</div><span class="badge">${assignedLinks.length}</span></div>
         <div class="incident-assigned-units">
           ${assignedLinks.map(link=>{
-            const u=S.units.find(x=>x.id===link.unit_id);
+            const u=idx().unitsById.get(link.unit_id);
             if(!u)return "";
             const moves=logisticsMovementsForUnit(u.id);
             return `<div class="assignment-unit-row">
@@ -3590,6 +3779,11 @@ async function selectIncident(id){
       </section>
     </aside>
   </div>`;
+
+  // Nothing visible changed: keep the existing DOM (and its handlers) intact.
+  if(silent&&alreadyOpen&&content.__ccHtml===incidentModalHtml)return;
+  content.innerHTML=incidentModalHtml;
+  content.__ccHtml=incidentModalHtml;
 
   ensureCallTimerTicker();
 
@@ -3707,8 +3901,9 @@ function renderDispatchIncidentMarkers(){
     return;
   }
 
+  const incidentsById=idx().incidentsById;
   const rows=dispatchMapIncidentRows().filter(i=>{
-    const local=S.incidents.find(x=>x.id===i.id)||i;
+    const local=incidentsById.get(i.id)||i;
     return i.status!=="CLOSED"
       && incidentInDispatchScope(local)
       && (!i.map_layer_id||i.map_layer_id===layer.id)
@@ -3734,7 +3929,7 @@ function renderDispatchIncidentMarkers(){
         .addTo(S.map)
         .bindTooltip(incident.incident_number||"Incident");
       marker.on("click",()=>{
-        if(S.incidents.some(i=>i.id===incident.id))selectIncident(incident.id);
+        if(idx().incidentsById.has(incident.id))selectIncident(incident.id);
       });
       S.incidentMarkers.set(incident.id,marker);
     }else{
@@ -3744,14 +3939,23 @@ function renderDispatchIncidentMarkers(){
   }
 }
 
+function refreshDispatchUnitBoard(){
+  const unitHost=document.querySelector("#unitList");
+  if(!unitHost)return false;
+  const changed=setHtmlIfChanged(unitHost,unitList());
+  if(changed)refreshLocationAges();
+  return changed;
+}
+
 function refreshDispatchBoards(){
   const incidentHost=document.querySelector("#incidentList");
   const unitHost=document.querySelector("#unitList");
-  if(incidentHost)incidentHost.innerHTML=incidentList();
-  if(unitHost)unitHost.innerHTML=unitList();
+  const incidentsChanged=setHtmlIfChanged(incidentHost,incidentList());
+  const unitsChanged=setHtmlIfChanged(unitHost,unitList());
+  if(incidentsChanged)updateCallTimers();
   updateOperationalPeriodDispatchUi();
   bindIncidentClicks();
-  refreshLocationAges();
+  if(unitsChanged)refreshLocationAges();
   // Leaflet layers are not part of the DOM-based board render. Explicitly
   // reconcile incident markers so a closed/moved call is removed immediately
   // without rebuilding the entire map or forcing a page refresh.
@@ -3810,9 +4014,10 @@ function unitStatusButtonsHtml(u,active,taskStatus=u.status){
     :"Only availability states are available until this unit is assigned to an active CAD ticket."}</div>`;
 }
 
-function selectUnit(unitId){
-  const u=S.units.find(x=>x.id===unitId);
+function selectUnit(unitId,{silent=false}={}){
+  const u=idx().unitsById.get(unitId);
   if(!u)return;
+  const alreadyOpen=S.openUnitId===unitId&&S.incidentModalMode==="unit";
 
   const active=activeAssignmentForUnit(unitId);
   const moves=logisticsMovementsForUnit(unitId);
@@ -3829,7 +4034,7 @@ function selectUnit(unitId){
   S.incidentModalMode="unit";
 
   const content=openIncidentModalShell();
-  content.innerHTML=`<div class="incident-modal-header">
+  const unitModalHtml=`<div class="incident-modal-header">
     <div>
       <div class="incident-modal-eyebrow">${esc(u.event_departments?.name||"UNIT")}</div>
       <div class="incident-modal-title-row">
@@ -3940,6 +4145,12 @@ function selectUnit(unitId){
       </div>
     </aside>
   </div>`;
+
+  // Background refreshes keep the dispatcher's in-progress input (destination
+  // text, post selection) when nothing visible changed.
+  if(silent&&alreadyOpen&&content.__ccHtml===unitModalHtml)return;
+  content.innerHTML=unitModalHtml;
+  content.__ccHtml=unitModalHtml;
 
   document.querySelector("#closeIncidentModal").onclick=()=>closeIncidentModal();
   document.querySelector("#openUnitGuestLogistics")?.addEventListener("click",()=>{closeIncidentModal();guestLogisticsPage();});
@@ -4803,7 +5014,7 @@ function commandMoveCardsHtml(){
   return `<section class="command-move-board">
     <div class="command-move-board-head"><div><div class="section-title">GUEST LOGISTICS · PRIMARY UNIT TASKS</div><strong>Assigned MOVEs</strong></div><span class="badge">${movements.length}</span></div>
     <div class="command-move-grid">${movements.map(m=>{
-      const unit=S.units.find(u=>u.id===m.assigned_unit_id);
+      const unit=idx().unitsById.get(m.assigned_unit_id);
       const cad=unit?activeAssignmentForUnit(unit.id):null;
       return `<article class="command-move-card ${LOGISTICS_UNDERWAY_STATUSES.has(m.status)?"underway":""}">
         <div class="row"><strong>${esc(m.movement_number)}</strong><span class="badge">${esc(String(m.status||"").replaceAll("_"," "))}</span></div>
@@ -4857,11 +5068,21 @@ function commandCallCardsHtml(){
   }).join("")||`<div class="command-empty">No active calls for the selected department filter.</div>`;
 }
 function renderCommandCallPanel(){
-  const host=document.querySelector("#commandCallList");
-  if(host)host.innerHTML=commandCallCardsHtml();
+  const changed=setHtmlIfChanged(document.querySelector("#commandCallList"),commandCallCardsHtml());
+  setHtmlIfChanged(document.querySelector("#commandMoveCards"),commandMoveCardsHtml());
   const count=document.querySelector("#commandCallCount");
   if(count)count.textContent=String(commandFilteredIncidents().length);
-  updateCallTimers();
+  const moveCount=document.querySelector("#commandMoveCount");
+  if(moveCount)moveCount.textContent=String(commandFilteredMovements().length);
+  if(changed)updateCallTimers();
+}
+
+// Data-only refresh: patch boards and markers, keep the Leaflet map alive.
+function renderCommandDisplayData(){
+  renderCommandCallPanel();
+  renderCommandIncidentMarkers();
+  renderCommandUnitMarkers();
+  renderCommandTreatmentCenters();
 }
 function commandMapLayer(){
   return S.mapLayers.find(l=>l.id===S.commandActiveMapLayerId&&l.status==="published")||null;
@@ -5014,7 +5235,7 @@ function renderCommandTreatmentCenters(){
   const host=document.querySelector("#commandTreatmentCenters");
   if(!host)return;
   const html=commandTreatmentCentersHtml();
-  host.innerHTML=html;
+  setHtmlIfChanged(host,html);
   host.classList.toggle("hidden",!html);
 }
 
@@ -5047,7 +5268,7 @@ function renderCommandDisplayLayout(){
 
   content.className=`command-display-content mode-${S.commandDisplayMode}`;
   content.innerHTML=`
-    ${commandMoveCardsHtml()}
+    <div id="commandMoveCards" style="display:contents">${commandMoveCardsHtml()}</div>
     ${showCalls?`<section class="command-call-board"><div id="commandCallList">${commandCallCardsHtml()}</div></section>`:""}
     ${showMap?`<section class="command-map-board"><div id="commandMap"></div><div class="command-map-legend"><span><i class="legend-call"></i> Active Call</span><span><i class="legend-unit"></i> Live Unit GPS</span></div></section>`:""}
   `;
@@ -5084,17 +5305,23 @@ async function refreshCommandDisplayStructure(){
     : S.mapLayers.find(l=>l.is_default&&l.status==="published")?.id||S.mapLayers.find(l=>l.status==="published")?.id||null;
 
   const filterHost=document.querySelector("#commandDepartmentFilters");
-  if(filterHost)filterHost.innerHTML=commandDisplayDepartmentControls();
+  if(filterHost&&setHtmlIfChanged(filterHost,commandDisplayDepartmentControls()))bindCommandDisplayControls();
 
   const opName=document.querySelector("#commandOpName");
   const opPrefix=document.querySelector("#commandOpPrefix");
-  const moveCount=document.querySelector("#commandMoveCount");
   if(opName)opName.textContent=S.activeOperationalPeriod?.name||"NONE";
   if(opPrefix)opPrefix.textContent=S.activeOperationalPeriod?.incident_prefix||"";
-  if(moveCount)moveCount.textContent=String(commandFilteredMovements().length);
 
-  bindCommandDisplayControls();
-  renderCommandDisplayLayout();
+  // Rebuild the layout (and the map) only when the layer actually changed or
+  // the map is missing; otherwise patch the data in place. A TV display must
+  // not flash a blank map every time a unit changes status.
+  const showMap=S.commandDisplayMode==="map"||S.commandDisplayMode==="split";
+  const mapMissing=showMap&&!S.commandMap&&!!commandMapLayer()?.rendered_image_path;
+  if(previousLayer!==S.commandActiveMapLayerId||mapMissing){
+    renderCommandDisplayLayout();
+  }else{
+    renderCommandDisplayData();
+  }
 }
 function scheduleCommandDisplayRefresh(){
   if(S.commandRefreshTimer)clearTimeout(S.commandRefreshTimer);
@@ -5113,6 +5340,7 @@ function updateCommandDisplayUnitLocation(payload){
     const index=S.unitLocations.findIndex(l=>l.unit_id===row.unit_id);
     if(index>=0)S.unitLocations[index]=row;else S.unitLocations.push(row);
   }
+  markIndexesDirty();
   renderCommandUnitMarkers();
 }
 function subscribeCommandDisplay(){
@@ -5122,7 +5350,7 @@ function subscribeCommandDisplay(){
     .on("postgres_changes",{event:"*",schema:"public",table:"guest_logistics_movements",filter:`event_id=eq.${S.eventId}`},scheduleCommandDisplayRefresh)
     .on("postgres_changes",{event:"*",schema:"public",table:"incident_units"},scheduleCommandDisplayRefresh)
     .on("postgres_changes",{event:"UPDATE",schema:"public",table:"units",filter:`event_id=eq.${S.eventId}`},payload=>{
-      const unit=S.units.find(u=>u.id===payload.new?.id);
+      const unit=idx().unitsById.get(payload.new?.id);
       if(unit&&payload.new?.status)unit.status=payload.new.status;
       renderCommandCallPanel();
       renderCommandUnitMarkers();
@@ -5268,7 +5496,7 @@ async function commandDisplayPage({publicAccess=S.mode==="command"}={}){
   if(S.commandClockInterval)clearInterval(S.commandClockInterval);
   S.commandClockInterval=setInterval(updateCommandClock,1000);
   if(S.commandTreatmentRefreshInterval)clearInterval(S.commandTreatmentRefreshInterval);
-  S.commandTreatmentRefreshInterval=setInterval(refreshCommandTreatmentSummary,5000);
+  S.commandTreatmentRefreshInterval=setInterval(()=>{if(document.visibilityState==="visible")refreshCommandTreatmentSummary();},10000);
   ensureCallTimerTicker();
   ensureLocationAgeTicker();
   subscribeCommandDisplay();
@@ -7962,9 +8190,26 @@ async function syncFieldAssignment(unitId){
   }
 }
 
+// Field devices are usually on cellular. Realtime is the fast path; this
+// heartbeat is the self-healing path and relaxes while the channel is healthy.
+const FIELD_HEARTBEAT_LIVE_MS=6000;
+const FIELD_HEARTBEAT_DEGRADED_MS=2500;
+
+function scheduleFieldHeartbeat(unitId){
+  if(S.fieldHeartbeatTimer){clearTimeout(S.fieldHeartbeatTimer);S.fieldHeartbeatTimer=null;}
+  if(!document.querySelector(".field-shell"))return;
+  const wait=S.fieldRealtimeStatus==="SUBSCRIBED"?FIELD_HEARTBEAT_LIVE_MS:FIELD_HEARTBEAT_DEGRADED_MS;
+  S.fieldHeartbeatTimer=setTimeout(async()=>{
+    S.fieldHeartbeatTimer=null;
+    if(!document.querySelector(".field-shell"))return;
+    if(document.visibilityState==="visible")await syncFieldAssignment(unitId);
+    scheduleFieldHeartbeat(unitId);
+  },wait);
+}
+
 function startFieldAssignmentFallback(unitId){
-  if(S.fieldAssignmentSyncInterval)clearInterval(S.fieldAssignmentSyncInterval);
-  S.fieldAssignmentSyncInterval=setInterval(()=>syncFieldAssignment(unitId),1500);
+  if(S.fieldAssignmentSyncInterval){clearInterval(S.fieldAssignmentSyncInterval);S.fieldAssignmentSyncInterval=null;}
+  scheduleFieldHeartbeat(unitId);
 
   if(S.fieldAssignmentVisibilityHandler){
     document.removeEventListener("visibilitychange",S.fieldAssignmentVisibilityHandler);
@@ -7974,15 +8219,53 @@ function startFieldAssignmentFallback(unitId){
   }
 
   S.fieldAssignmentVisibilityHandler=()=>{
-    if(document.visibilityState==="visible")syncFieldAssignment(unitId);
+    if(document.visibilityState==="visible"){syncFieldAssignment(unitId);scheduleFieldHeartbeat(unitId);}
   };
-  S.fieldAssignmentFocusHandler=()=>syncFieldAssignment(unitId);
+  S.fieldAssignmentFocusHandler=()=>{syncFieldAssignment(unitId);scheduleFieldHeartbeat(unitId);};
 
   document.addEventListener("visibilitychange",S.fieldAssignmentVisibilityHandler);
   window.addEventListener("focus",S.fieldAssignmentFocusHandler);
 }
 
+// Event-level reference data (map layers, zones, treatment areas, EMS flags,
+// unit roster) changes rarely. Cache it per event so a status tap or a Realtime
+// event re-fetches only the session, assignment, encounters and MOVEs.
+const fieldStaticCache={eventId:null,loadedAt:0,data:null,promise:null};
+const FIELD_STATIC_TTL_MS=120000;
+
+function invalidateFieldStaticCache(){fieldStaticCache.eventId=null;fieldStaticCache.data=null;fieldStaticCache.promise=null;}
+
+async function loadFieldStaticData(eventId){
+  const fresh=fieldStaticCache.eventId===eventId&&fieldStaticCache.data&&(Date.now()-fieldStaticCache.loadedAt)<FIELD_STATIC_TTL_MS;
+  if(fresh)return fieldStaticCache.data;
+  if(fieldStaticCache.promise&&fieldStaticCache.eventId===eventId)return fieldStaticCache.promise;
+
+  fieldStaticCache.eventId=eventId;
+  fieldStaticCache.promise=(async()=>{
+    const [layersRes,zonesRes,emsDepRes,areasRes]=await Promise.all([
+      supabase.from("event_map_layers").select("id,name,level_code,is_default").eq("event_id",eventId).eq("active",true).eq("status","published").order("sort_order"),
+      supabase.from("event_zones").select("id,map_layer_id,name").eq("event_id",eventId).eq("active",true).order("sort_order"),
+      supabase.from("event_departments").select("id").eq("event_id",eventId).eq("active",true).eq("ems_enabled",true).limit(1),
+      supabase.from("ems_treatment_areas").select("id,name,status,accepting_patients").eq("event_id",eventId).eq("active",true).order("name")
+    ]);
+    for(const r of [layersRes,zonesRes,emsDepRes])if(r.error)throw r.error;
+    if(areasRes.error)console.error("Field treatment areas failed to load",areasRes.error);
+    const data={
+      layers:layersRes.data||[],
+      zones:zonesRes.data||[],
+      hasEms:!!emsDepRes.data?.length,
+      treatmentAreas:areasRes.data||[]
+    };
+    fieldStaticCache.data=data;
+    fieldStaticCache.loadedAt=Date.now();
+    fieldStaticCache.promise=null;
+    return data;
+  })().catch(err=>{fieldStaticCache.promise=null;fieldStaticCache.data=null;throw err;});
+  return fieldStaticCache.promise;
+}
+
 async function fieldUnitCad(){
+  const mapWasOpen=S.fieldMapOpenIncidentId;
   clearFieldUnitMap();
   const {data:fs,error}=await supabase.from("field_sessions")
     .select("*,events(name,field_location_enabled,venue_type,field_layout_config),operational_periods(name,incident_prefix,status),units(name,status,event_id,current_map_layer_id,current_zone_id,current_transport_destination_text,current_transport_treatment_area_id,event_departments(name,status_profile))")
@@ -7994,37 +8277,38 @@ async function fieldUnitCad(){
     return fieldJoin({message:"Your previous Field Unit session is no longer active. Re-enter the event for the current Operational Period."});
   }
   S.fieldSession=fs;S.eventId=fs.event_id;
-  const {data:a}=await supabase.from("incident_units").select("*,incidents(*)")
-    .eq("unit_id",fs.unit_id).is("cleared_at",null).order("assigned_at",{ascending:false}).limit(1).maybeSingle();
+
+  // Everything that depends only on the session runs in parallel. Reference
+  // data comes from the per-event cache and usually costs no network at all.
+  let staticData;
+  const [assignmentRes,staticRes,logisticsRes]=await Promise.allSettled([
+    supabase.from("incident_units").select("*,incidents(*)")
+      .eq("unit_id",fs.unit_id).is("cleared_at",null).order("assigned_at",{ascending:false}).limit(1).maybeSingle(),
+    loadFieldStaticData(S.eventId),
+    loadFieldLogisticsState(S.eventId,fs.unit_id)
+  ]);
+  const a=assignmentRes.status==="fulfilled"?assignmentRes.value?.data:null;
+  if(staticRes.status==="fulfilled")staticData=staticRes.value;
+  else{console.error("Field reference data failed to load",staticRes.reason);staticData={layers:[],zones:[],hasEms:false,treatmentAreas:[]};}
+  let logisticsState=null;
+  if(logisticsRes.status==="fulfilled")logisticsState=logisticsRes.value;
+  else console.error("Field Guest Logistics panel failed to load",logisticsRes.reason);
+
   const incident=a?.incidents;
   const assignmentNeedsAck=!!(a&&incident&&!a.acknowledged_at);
   S.fieldAssignmentSignature=fieldAssignmentSignature(a);
-  let fieldLayer=null,fieldZone=null;
-  if(incident?.map_layer_id){fieldLayer=(await supabase.from("event_map_layers").select("id,name,level_code").eq("id",incident.map_layer_id).maybeSingle()).data||null;}
-  if(incident?.zone_id){fieldZone=(await supabase.from("event_zones").select("id,name").eq("id",incident.zone_id).maybeSingle()).data||null;}
+  const fieldMapLayers=staticData.layers;
+  const fieldZones=staticData.zones;
+  const fieldLayer=incident?.map_layer_id?(fieldMapLayers.find(l=>l.id===incident.map_layer_id)||null):null;
+  const fieldZone=incident?.zone_id?(fieldZones.find(z=>z.id===incident.zone_id)||null):null;
   const statusProfile=fs.units?.event_departments?.status_profile||STANDARD_CAD_DEPARTMENT_STATUSES;
   const statuses=statusProfile.filter(status=>status!=="OUT_OF_SERVICE");
-  const [{data:fieldMapLayers},{data:fieldZones},{data:fieldEmsDepartments}]=await Promise.all([
-    supabase.from("event_map_layers").select("id,name,level_code,is_default").eq("event_id",S.eventId).eq("active",true).eq("status","published").order("sort_order"),
-    supabase.from("event_zones").select("id,map_layer_id,name").eq("event_id",S.eventId).eq("active",true).order("sort_order"),
-    supabase.from("event_departments").select("id").eq("event_id",S.eventId).eq("active",true).eq("ems_enabled",true).limit(1)
-  ]);
-  const fieldHasEms=!!fieldEmsDepartments?.length;
-  let fieldTreatmentAreas=[];
-  if(fieldHasEms){
-    const treatmentAreaResult=await supabase.from("ems_treatment_areas").select("id,name,status,accepting_patients").eq("event_id",S.eventId).eq("active",true).order("name");
-    if(treatmentAreaResult.error)console.error("Field treatment areas failed to load",treatmentAreaResult.error);
-    fieldTreatmentAreas=treatmentAreaResult.data||[];
-  }
+  const fieldHasEms=staticData.hasEms;
+  const fieldTreatmentAreas=fieldHasEms?staticData.treatmentAreas:[];
   let emsState=null;
   if(fieldHasEms){
-    try{emsState=await loadFieldEmsState(S.eventId,fs.unit_id,incident?.id||null);}catch(err){console.error("Field EMS panel failed to load",err);}
+    try{emsState=await loadFieldEmsState(S.eventId,fs.unit_id,incident?.id||null,{hasEms:true,areas:fieldTreatmentAreas});}catch(err){console.error("Field EMS panel failed to load",err);}
   }
-
-  let logisticsState=null;
-  try{
-    logisticsState=await loadFieldLogisticsState(S.eventId,fs.unit_id);
-  }catch(err){console.error("Field Guest Logistics panel failed to load",err);}
 
   const moveNeedsAck=!!logisticsState?.movements?.some(m=>!m.driver_acknowledged_at);
   const moveSignature=(logisticsState?.movements||[]).map(m=>[m.id,m.status,m.assigned_at,m.driver_acknowledged_at,m.updated_at].join("|")).join(";");
@@ -8319,6 +8603,8 @@ async function fieldUnitCad(){
   document.querySelector("#changeUnit")?.addEventListener("click",async()=>{await stopFieldLocationSharing(fs.unit_id,{notifyServer:true});S.fieldLocalLocation=null;clearFieldUnitMap();await supabase.rpc("field_release_unit",{p_field_session_id:fs.id});fieldUnitPicker();});
   document.querySelector("#leaveEvent")?.addEventListener("click",leaveField);
   if(incident)document.querySelector("#viewFieldMap")?.addEventListener("click",()=>showFieldMap(incident,fs));
+  // A refresh must not take the crew's open call map away from them.
+  if(incident&&mapWasOpen===incident.id&&document.querySelector("#viewFieldMap"))showFieldMap(incident,fs);
   subscribeField(fs.unit_id,fs.id);
 }
 
@@ -8850,6 +9136,7 @@ async function showFieldMap(incident,fs){
 
   S.fieldMapLayer=m;
   S.fieldMapIncident=incident;
+  S.fieldMapOpenIncidentId=incident.id;
   S.fieldMapUnit={
     id:fs?.unit_id||S.fieldSession?.unit_id||null,
     name:fs?.units?.name||S.fieldSession?.units?.name||"Your unit",
@@ -8887,6 +9174,7 @@ async function showFieldMap(incident,fs){
 
   document.querySelector("#fieldMapClose")?.addEventListener("click",()=>{
     clearFieldUnitMap();
+    S.fieldMapOpenIncidentId=null;
     holder.innerHTML="";
   });
 
@@ -8952,23 +9240,58 @@ async function refreshDispatchStructure(){
     return;
   }
 
-  const reopenIncidentId=S.openIncidentId;
-  const reopenUnitId=S.openUnitId;
-  await loadEventOps();
-  refreshDispatchBoards();
-
-  if(reopenUnitId&&S.units.some(u=>u.id===reopenUnitId)){
-    selectUnit(reopenUnitId);
-  }else if(reopenIncidentId&&S.incidents.some(i=>i.id===reopenIncidentId)){
-    selectIncident(reopenIncidentId);
-  }else if(reopenIncidentId||reopenUnitId){
-    closeIncidentModal();
+  if(S.dispatchStructureRefreshInFlight){
+    // A reload is already running; run exactly one more when it finishes so
+    // bursts of Realtime events never stack up concurrent 18-query reloads.
+    S.dispatchStructureRefreshPending=true;
+    return;
   }
+  S.dispatchStructureRefreshInFlight=true;
+  try{
+    const reopenIncidentId=S.openIncidentId;
+    const reopenUnitId=S.openUnitId;
+    await loadEventOps();
+    if(!document.querySelector("#dispatchWorkspace"))return;
+    refreshDispatchBoards();
+
+    // Only the overview/unit views are re-rendered from fresh data. Workflow
+    // modals (close disposition, transport outcome, walk-in, etc.) hold
+    // dispatcher input and are left alone.
+    const mode=S.incidentModalMode;
+    if(mode==="unit"&&reopenUnitId&&S.openUnitId===reopenUnitId){
+      if(idx().unitsById.has(reopenUnitId))selectUnit(reopenUnitId,{silent:true});
+      else closeIncidentModal();
+    }else if(mode==="overview"&&reopenIncidentId&&S.openIncidentId===reopenIncidentId){
+      if(idx().incidentsById.has(reopenIncidentId))selectIncident(reopenIncidentId,{silent:true});
+      else closeIncidentModal();
+    }
+  }catch(error){
+    console.warn("Dispatch structural refresh failed",error);
+    updateDispatchSyncIndicator({ok:false,message:error.message});
+  }finally{
+    S.dispatchStructureRefreshInFlight=false;
+    if(S.dispatchStructureRefreshPending){
+      S.dispatchStructureRefreshPending=false;
+      scheduleDispatchStructureRefresh();
+    }
+  }
+}
+
+// Realtime events arrive in bursts (an assignment writes incidents,
+// incident_units, units and unit_status_log within milliseconds). Collapse
+// them into one structural reload.
+function scheduleDispatchStructureRefresh(){
+  if(!document.querySelector("#dispatchWorkspace"))return;
+  if(S.dispatchStructureRefreshTimer)clearTimeout(S.dispatchStructureRefreshTimer);
+  S.dispatchStructureRefreshTimer=setTimeout(()=>{
+    S.dispatchStructureRefreshTimer=null;
+    refreshDispatchStructure();
+  },200);
 }
 
 function mergeDispatcherUnitRow(row){
   if(!row?.id)return false;
-  const unit=S.units.find(u=>u.id===row.id);
+  const unit=idx().unitsById.get(row.id);
   if(!unit)return false;
 
   let changed=false;
@@ -9032,12 +9355,7 @@ async function syncDispatcherUnitStatuses(){
       if(mergeDispatcherUnitRow(row))changed=true;
     }
 
-    if(changed){
-      const unitHost=document.querySelector("#unitList");
-      if(unitHost)unitHost.innerHTML=unitList();
-      bindIncidentClicks();
-      refreshLocationAges();
-    }
+    if(changed)refreshDispatchUnitBoard();
 
     S.dispatchLastSyncAt=new Date().toISOString();
     updateDispatchSyncIndicator({ok:true});
@@ -9064,12 +9382,12 @@ function dispatchTaskSnapshotSignature(rows){
 
 function refreshOpenDispatchTaskView(){
   if(S.incidentModalMode==="edit"&&document.querySelector("[data-incident-modal-mode='edit']"))return;
-  if(S.incidentModalMode==="unit"&&S.openUnitId&&S.units.some(u=>u.id===S.openUnitId)){
-    selectUnit(S.openUnitId);
+  if(S.incidentModalMode==="unit"&&S.openUnitId&&idx().unitsById.has(S.openUnitId)){
+    selectUnit(S.openUnitId,{silent:true});
     return;
   }
-  if(S.openIncidentId&&S.incidents.some(i=>i.id===S.openIncidentId)){
-    selectIncident(S.openIncidentId).catch(error=>console.warn("Incident task view refresh failed",error));
+  if(S.incidentModalMode==="overview"&&S.openIncidentId&&idx().incidentsById.has(S.openIncidentId)){
+    selectIncident(S.openIncidentId,{silent:true}).catch(error=>console.warn("Incident task view refresh failed",error));
   }
 }
 
@@ -9113,7 +9431,7 @@ function mergeDispatcherTaskSnapshot(rows){
       continue;
     }
     if((movement.status||"")!==(row.status||"")){movement.status=row.status;changed=true;}
-    if((movement.assigned_unit_id||null)!==(row.unit_id||null)){movement.assigned_unit_id=row.unit_id||null;changed=true;}
+    if((movement.assigned_unit_id||null)!==(row.unit_id||null)){movement.assigned_unit_id=row.unit_id||null;changed=true;markIndexesDirty();}
     if((movement.assigned_at||null)!==(row.assigned_at||null)){movement.assigned_at=row.assigned_at||null;changed=true;}
     if((movement.driver_acknowledged_at||null)!==(row.acknowledged_at||null)){movement.driver_acknowledged_at=row.acknowledged_at||null;changed=true;}
     if((movement.updated_at||null)!==(row.updated_at||null)){movement.updated_at=row.updated_at||null;changed=true;}
@@ -9151,7 +9469,7 @@ async function syncDispatcherTaskState(){
       // structural reload, but the status fields above were still reconciled
       // first so the visible board is never left stale while that reload runs.
       const editing=S.incidentModalMode==="edit"&&document.querySelector("[data-incident-modal-mode='edit']");
-      await refreshDispatchStructure();
+      if(!editing)await refreshDispatchStructure();
       // An open editor deliberately defers structural reloads. Do not bless the
       // new signature yet; the watchdog will retry until the structure is merged.
       if(editing){
@@ -9175,7 +9493,7 @@ async function syncDispatcherTaskState(){
 function applyDispatcherIncidentUnitRealtime(payload){
   const row=payload?.new||payload?.old;
   if(!row?.incident_id||!row?.unit_id)return;
-  const incident=S.incidents.find(i=>i.id===row.incident_id);
+  const incident=idx().incidentsById.get(row.incident_id);
   const link=incident?.incident_units?.find(item=>item.unit_id===row.unit_id&&!item.cleared_at);
 
   if(payload.eventType==="UPDATE"&&incident&&link&&!row.cleared_at){
@@ -9185,13 +9503,11 @@ function applyDispatcherIncidentUnitRealtime(payload){
     link.assigned_at=row.assigned_at||link.assigned_at;
     refreshDispatchBoards();
     refreshOpenDispatchTaskView();
-    syncDispatcherTaskState();
     return;
   }
 
   // INSERT, DELETE, clear/unassign, or an unknown assignment changes structure.
-  refreshDispatchStructure();
-  syncDispatcherTaskState();
+  scheduleDispatchStructureRefresh();
 }
 
 function applyDispatcherMovementRealtime(payload){
@@ -9209,11 +9525,11 @@ function applyDispatcherMovementRealtime(payload){
     // a background structural refresh follows to load every optional field.
     S.guestLogisticsMovements.push(row);
   }
+  markIndexesDirty();
 
   refreshDispatchBoards();
   refreshOpenDispatchTaskView();
-  if(index<0&&payload.eventType!=="DELETE"&&!terminal)refreshDispatchStructure();
-  syncDispatcherTaskState();
+  if(index<0&&payload.eventType!=="DELETE"&&!terminal)scheduleDispatchStructureRefresh();
 }
 
 function incidentSnapshotSignature(row){
@@ -9262,7 +9578,7 @@ async function syncDispatcherIncidentState(){
           footer.insertAdjacentHTML("afterbegin",`<div class="notice" id="incidentExternalUpdate">Other CAD data changed while you are editing. The active-call board and map are continuing to synchronize; your unsaved fields are preserved.</div>`);
         }
       }else{
-        await refreshDispatchStructure();
+        scheduleDispatchStructureRefresh();
       }
     }
   }catch(error){
@@ -9273,30 +9589,51 @@ async function syncDispatcherIncidentState(){
   }
 }
 
+// Realtime is the fast path. The database heartbeat is the authoritative
+// self-healing path, so its cadence adapts: relaxed while the Realtime
+// channel is healthy, tight while it is degraded, paused while hidden.
+const DISPATCH_HEARTBEAT_LIVE_MS=10000;
+const DISPATCH_HEARTBEAT_DEGRADED_MS=3000;
+
+async function runDispatchHeartbeat(){
+  await Promise.all([
+    syncDispatcherUnitStatuses(),
+    syncDispatcherTaskState(),
+    syncDispatcherIncidentState()
+  ]);
+}
+
+function scheduleDispatchHeartbeat(delay){
+  if(S.dispatchHeartbeatTimer){clearTimeout(S.dispatchHeartbeatTimer);S.dispatchHeartbeatTimer=null;}
+  if(!document.querySelector("#dispatchWorkspace"))return;
+  const wait=delay??(S.dispatchRealtimeStatus==="SUBSCRIBED"?DISPATCH_HEARTBEAT_LIVE_MS:DISPATCH_HEARTBEAT_DEGRADED_MS);
+  S.dispatchHeartbeatTimer=setTimeout(async()=>{
+    S.dispatchHeartbeatTimer=null;
+    if(!document.querySelector("#dispatchWorkspace"))return;
+    if(document.visibilityState==="visible"){
+      try{await runDispatchHeartbeat();}catch{}
+    }
+    scheduleDispatchHeartbeat();
+  },wait);
+}
+
+// Every status RPC writes unit_status_log; a burst of inserts should produce a
+// single reconciliation, not one RPC per row.
+const syncDispatcherUnitStatusesSoon=debounce(()=>syncDispatcherUnitStatuses(),400);
+
 function startDispatcherUnitStatusFallback(){
-  if(S.dispatchUnitSyncInterval)clearInterval(S.dispatchUnitSyncInterval);
-  // One authoritative snapshot per second is deliberately small (unit state
-  // only) and makes Dispatch self-healing even if Realtime is unavailable.
-  S.dispatchUnitSyncInterval=setInterval(()=>{
-    syncDispatcherUnitStatuses();
-    syncDispatcherTaskState();
-    syncDispatcherIncidentState();
-  },1000);
+  if(S.dispatchUnitSyncInterval){clearInterval(S.dispatchUnitSyncInterval);S.dispatchUnitSyncInterval=null;}
+  scheduleDispatchHeartbeat();
 
   if(S.dispatchVisibilityHandler)document.removeEventListener("visibilitychange",S.dispatchVisibilityHandler);
   if(S.dispatchFocusHandler)window.removeEventListener("focus",S.dispatchFocusHandler);
-  S.dispatchVisibilityHandler=()=>{
-    if(document.visibilityState==="visible"){
-      syncDispatcherUnitStatuses();
-      syncDispatcherTaskState();
-      syncDispatcherIncidentState();
-    }
+  const resync=()=>{
+    if(document.visibilityState!=="visible")return;
+    runDispatchHeartbeat().catch(()=>{});
+    scheduleDispatchHeartbeat();
   };
-  S.dispatchFocusHandler=()=>{
-    syncDispatcherUnitStatuses();
-    syncDispatcherTaskState();
-    syncDispatcherIncidentState();
-  };
+  S.dispatchVisibilityHandler=resync;
+  S.dispatchFocusHandler=resync;
   document.addEventListener("visibilitychange",S.dispatchVisibilityHandler);
   window.addEventListener("focus",S.dispatchFocusHandler);
 }
@@ -9305,27 +9642,21 @@ function subscribeDispatch(){
   const ch=supabase.channel(`event-${S.eventId}-${Date.now()}`)
     // Primary live path: merge the complete unit row into local CAD state.
     .on("postgres_changes",{event:"UPDATE",schema:"public",table:"units",filter:`event_id=eq.${S.eventId}`},payload=>{
-      const changed=mergeDispatcherUnitRow(payload.new);
-      if(changed){
-        const unitHost=document.querySelector("#unitList");
-        if(unitHost)unitHost.innerHTML=unitList();
-        bindIncidentClicks();
-        refreshLocationAges();
-      }
+      if(mergeDispatcherUnitRow(payload.new))refreshDispatchUnitBoard();
     })
     // Secondary realtime signal: every normal status RPC writes the status log.
-    // If the units-table event is delayed/missed, immediately reconcile from DB.
+    // If the units-table event is delayed/missed, reconcile from DB (debounced).
     .on("postgres_changes",{event:"INSERT",schema:"public",table:"unit_status_log",filter:`event_id=eq.${S.eventId}`},()=>{
-      syncDispatcherUnitStatuses();
+      syncDispatcherUnitStatusesSoon();
     })
     // Structural changes refresh the call/unit boards while preserving an open
     // incident modal. If the call editor has unsaved changes, the refresh is
-    // deferred rather than destroying dispatcher input.
+    // deferred rather than destroying dispatcher input. The structural reload
+    // also refreshes the incident map snapshot, so no separate RPC is needed.
     .on("postgres_changes",{event:"*",schema:"public",table:"incidents",filter:`event_id=eq.${S.eventId}`},()=>{
-      syncDispatcherIncidentState();
-      refreshDispatchStructure();
+      scheduleDispatchStructureRefresh();
     })
-    .on("postgres_changes",{event:"*",schema:"public",table:"operational_periods",filter:`event_id=eq.${S.eventId}`},()=>refreshDispatchStructure())
+    .on("postgres_changes",{event:"*",schema:"public",table:"operational_periods",filter:`event_id=eq.${S.eventId}`},()=>scheduleDispatchStructureRefresh())
     .on("postgres_changes",{event:"*",schema:"public",table:"guest_logistics_movements",filter:`event_id=eq.${S.eventId}`},payload=>applyDispatcherMovementRealtime(payload))
     .on("postgres_changes",{event:"*",schema:"public",table:"incident_units"},payload=>applyDispatcherIncidentUnitRealtime(payload))
     // GPS changes update only the unit's map marker/readout.
@@ -9335,15 +9666,13 @@ function subscribeDispatch(){
       S.dispatchRealtimeStatus=status;
       if(status==="SUBSCRIBED"){
         updateDispatchSyncIndicator({ok:true});
-        syncDispatcherUnitStatuses();
-        syncDispatcherTaskState();
-        syncDispatcherIncidentState();
+        runDispatchHeartbeat().catch(()=>{});
+        scheduleDispatchHeartbeat();
       }else if(status==="CHANNEL_ERROR"||status==="TIMED_OUT"||status==="CLOSED"){
         console.warn(`Dispatch realtime channel status: ${status}. Authoritative database heartbeat remains active.`);
         updateDispatchSyncIndicator({ok:true,message:`Realtime ${status}; database heartbeat is still active.`});
-        syncDispatcherUnitStatuses();
-        syncDispatcherTaskState();
-        syncDispatcherIncidentState();
+        runDispatchHeartbeat().catch(()=>{});
+        scheduleDispatchHeartbeat();
       }
     });
 
@@ -9389,16 +9718,25 @@ function subscribeFieldSessionLifecycle(sessionId){
   S.realtime.push(ch);
 }
 
+// Field re-renders happen on every status change. The websocket channel is
+// keyed on (unit, session) and survives those renders instead of being torn
+// down and re-joined each time.
+const fieldUnitCadSoon=debounce(()=>{if(document.querySelector(".field-shell"))fieldUnitCad();},150);
+
 function subscribeField(unitId,sessionId){
-  // A field CAD screen should stay visually stable while a crew changes status.
-  // Replace any previous field subscriptions, then update only the status badge
-  // for unit row changes. Assignment/unassignment still performs a full refresh.
+  const key=`${unitId}:${sessionId}:${S.eventId}`;
+  if(S.fieldRealtimeKey===key&&S.realtime.length){
+    startFieldAssignmentFallback(unitId);
+    return;
+  }
   S.realtime.forEach(ch=>supabase.removeChannel(ch));
   S.realtime=[];
+  S.fieldRealtimeKey=key;
+  S.fieldRealtimeStatus=null;
 
   const ch=supabase.channel(`unit-${unitId}-${Date.now()}`)
     .on("postgres_changes",{event:"UPDATE",schema:"public",table:"field_sessions",filter:`id=eq.${sessionId}`},payload=>handleFieldSessionLifecycleUpdate(payload))
-    .on("postgres_changes",{event:"UPDATE",schema:"public",table:"events",filter:`id=eq.${S.eventId}`},()=>fieldUnitCad())
+    .on("postgres_changes",{event:"UPDATE",schema:"public",table:"events",filter:`id=eq.${S.eventId}`},()=>{invalidateFieldStaticCache();fieldUnitCadSoon();})
     .on("postgres_changes",{event:"UPDATE",schema:"public",table:"units",filter:`id=eq.${unitId}`},payload=>{
       const status=payload.new?.status;
       if(status){
@@ -9406,10 +9744,18 @@ function subscribeField(unitId,sessionId){
         updateFieldUnitStatusUI(status);
       }
     })
-    .on("postgres_changes",{event:"*",schema:"public",table:"incident_units",filter:`unit_id=eq.${unitId}`},()=>fieldUnitCad())
-    .on("postgres_changes",{event:"*",schema:"public",table:"ems_encounters",filter:`event_id=eq.${S.eventId}`},()=>fieldUnitCad())
-    .on("postgres_changes",{event:"*",schema:"public",table:"guest_logistics_movements",filter:`event_id=eq.${S.eventId}`},()=>fieldUnitCad())
-    .subscribe();
+    .on("postgres_changes",{event:"*",schema:"public",table:"incident_units",filter:`unit_id=eq.${unitId}`},()=>fieldUnitCadSoon())
+    .on("postgres_changes",{event:"*",schema:"public",table:"ems_encounters",filter:`event_id=eq.${S.eventId}`},()=>fieldUnitCadSoon())
+    .on("postgres_changes",{event:"*",schema:"public",table:"guest_logistics_movements",filter:`event_id=eq.${S.eventId}`},payload=>{
+      // Only this unit's MOVEs affect the field screen.
+      const row=payload?.new||payload?.old;
+      if(!row||row.assigned_unit_id===unitId||payload?.old?.assigned_unit_id===unitId)fieldUnitCadSoon();
+    })
+    .subscribe(status=>{
+      S.fieldRealtimeStatus=status;
+      if(status==="SUBSCRIBED")syncFieldAssignment(unitId);
+      scheduleFieldHeartbeat(unitId);
+    });
 
   S.realtime.push(ch);
   startFieldAssignmentFallback(unitId);
@@ -9437,6 +9783,12 @@ function cleanupRealtime(){
   if(S.commandClockInterval){clearInterval(S.commandClockInterval);S.commandClockInterval=null;}
   if(S.commandTreatmentRefreshInterval){clearInterval(S.commandTreatmentRefreshInterval);S.commandTreatmentRefreshInterval=null;}
   if(S.dispatchUnitSyncInterval){clearInterval(S.dispatchUnitSyncInterval);S.dispatchUnitSyncInterval=null;}
+  if(S.dispatchHeartbeatTimer){clearTimeout(S.dispatchHeartbeatTimer);S.dispatchHeartbeatTimer=null;}
+  if(S.dispatchStructureRefreshTimer){clearTimeout(S.dispatchStructureRefreshTimer);S.dispatchStructureRefreshTimer=null;}
+  S.dispatchStructureRefreshPending=false;
+  if(S.fieldHeartbeatTimer){clearTimeout(S.fieldHeartbeatTimer);S.fieldHeartbeatTimer=null;}
+  S.fieldRealtimeKey=null;
+  S.fieldRealtimeStatus=null;
   if(S.dispatchVisibilityHandler){document.removeEventListener("visibilitychange",S.dispatchVisibilityHandler);S.dispatchVisibilityHandler=null;}
   if(S.dispatchFocusHandler){window.removeEventListener("focus",S.dispatchFocusHandler);S.dispatchFocusHandler=null;}
   S.dispatchUnitSyncInFlight=false;

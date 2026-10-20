@@ -193,7 +193,7 @@ th{background:#f9fafb}
 }
 html,body,#app{background:var(--cc-bg);color:var(--cc-text)}
 body{background:radial-gradient(circle at 50% 0,#10243a 0,#07111d 38%,#050c15 100%) fixed}
-.topbar{background:#07111df2;border-bottom:1px solid var(--cc-line);box-shadow:0 8px 24px rgba(0,0,0,.22);backdrop-filter:blur(12px)}
+.topbar{background:#07111df6;border-bottom:1px solid var(--cc-line);box-shadow:0 8px 24px rgba(0,0,0,.22)}
 .brand{font-size:18px}.brand::before{content:"◈";color:var(--cc-blue);margin-right:9px}.brand small{color:var(--cc-muted);opacity:1}
 .wrap,.admin-content{color:var(--cc-text)}
 .card,.choice,.incident,.unit,.poi-row,.cp-row,.ems-resource-card,.ems-admin-row,.handoff-card,.patient-card,.incoming-handoff,.treatment-patient-card,.assignment-unit-row,.create-unit-option{
@@ -4896,23 +4896,26 @@ body.field-assignment-alert .topbar{
   animation:cc-field-assignment-topbar-pulse 1.05s ease-in-out infinite;
 }
 
+/* v0.16.0 — alert pulses animate opacity only so the phone compositor handles
+   them without repainting the whole screen every frame. */
 @keyframes cc-field-assignment-pulse{
-  0%,100%{
-    opacity:.28;
-    border-color:rgba(239,68,68,.55);
-    background:rgba(220,38,38,.025);
-  }
-  50%{
-    opacity:1;
-    border-color:rgba(248,113,113,1);
-    background:rgba(220,38,38,.12);
-  }
+  0%,100%{opacity:.3;}
+  50%{opacity:1;}
 }
 
 @keyframes cc-field-assignment-topbar-pulse{
-  0%,100%{box-shadow:inset 0 0 0 rgba(239,68,68,0);}
-  50%{box-shadow:inset 0 -10px 36px rgba(239,68,68,.48);}
+  0%,100%{opacity:0;}
+  50%{opacity:1;}
 }
+body.field-assignment-alert .topbar{position:relative;animation:none;}
+body.field-assignment-alert .topbar::after,
+body.field-move-alert:not(.field-assignment-alert) .topbar::after{
+  content:"";position:absolute;inset:0;pointer-events:none;
+  box-shadow:inset 0 -10px 36px rgba(239,68,68,.48);
+  animation:cc-field-assignment-topbar-pulse 1.05s ease-in-out infinite;
+  will-change:opacity;
+}
+body.field-move-alert:not(.field-assignment-alert) .topbar::after{box-shadow:inset 0 -10px 36px rgba(250,204,21,.48);}
 
 .field-assignment-card-pending{
   border-color:#ef4444!important;
@@ -5201,16 +5204,24 @@ body.field-dual-task-alert::after{
   animation:cc-field-dual-task-pulse 1.1s ease-in-out infinite!important;
 }
 @keyframes cc-field-move-pulse{
-  0%,100%{opacity:.3;border-color:rgba(250,204,21,.55);background:rgba(234,179,8,.025)}
-  50%{opacity:1;border-color:rgba(253,224,71,1);background:rgba(234,179,8,.14)}
+  0%,100%{opacity:.3}
+  50%{opacity:1}
 }
 @keyframes cc-field-move-topbar-pulse{
-  0%,100%{box-shadow:inset 0 0 0 rgba(250,204,21,0)}
-  50%{box-shadow:inset 0 -10px 36px rgba(250,204,21,.48)}
+  0%,100%{opacity:0}
+  50%{opacity:1}
 }
 @keyframes cc-field-dual-task-pulse{
-  0%,100%{opacity:.72;border-color:#ef4444;box-shadow:inset 0 0 52px rgba(239,68,68,.62),inset 0 0 120px rgba(127,29,29,.22)}
-  50%{opacity:1;border-color:#facc15;box-shadow:inset 0 0 52px rgba(250,204,21,.66),inset 0 0 120px rgba(161,98,7,.24)}
+  0%,100%{opacity:.75}
+  50%{opacity:1}
+}
+body.field-move-alert:not(.field-assignment-alert) .topbar{position:relative;animation:none;}
+/* Dual alert: a red base layer plus a yellow layer pulsing in anti-phase. */
+.field-task-alert-overlay{will-change:opacity;}
+.field-task-alert-overlay.field-task-alert-dual::before{
+  content:"";position:absolute;inset:-8px;border:8px solid #facc15;
+  box-shadow:inset 0 0 52px rgba(250,204,21,.66),inset 0 0 120px rgba(161,98,7,.24);
+  animation:cc-field-move-pulse 1.1s ease-in-out infinite;animation-delay:-.55s;
 }
 .field-move-card-pending{
   border-color:#facc15!important;
