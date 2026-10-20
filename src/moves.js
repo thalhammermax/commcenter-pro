@@ -184,8 +184,8 @@ function moveFormHtml(ctx,move,defaultDepartmentId){
     <div><label>Contact email</label><input id="mvEmail" value="${esc(move?.contact_email||"")}"></div>
     <div><label>Driver notes</label><textarea id="mvNotes" rows="3">${esc(move?.notes||"")}</textarea></div>
     ${move?"":`<div class="grid2">
-      <div><label>Activate on board</label><select id="mvLead">${[30,60,90,120].map(n=>`<option value="${n}" ${n===60?"selected":""}>${n} min before pickup</option>`).join("")}</select></div>
       <div><label>Assign driver now (optional)</label><select id="mvDriver"><option value="">No driver yet</option>${drivers.map(u=>`<option value="${u.id}">${esc(u.name)}</option>`).join("")}</select></div>
+      <div class="small muted" style="align-self:end">Becomes an active ticket ${esc(ctx.event?.move_activation_lead_minutes||60)} min before pickup (Event Admin → Guest Logistics).</div>
     </div>`}
   </div>`;
 }
@@ -199,7 +199,7 @@ function readMoveForm(){
     scheduled_at:scheduled&&!Number.isNaN(scheduled.getTime())?scheduled.toISOString():null,
     priority:v("mvPriority")||"Standard",
     notes:v("mvNotes")||null,
-    lead:Number(v("mvLead")||60),
+    lead:null,
     assign_unit_id:v("mvDriver")||null,
     guest:{
       movement_type:v("mvType")||"OTHER",guest_name:v("mvGuest"),guest_group:v("mvGroup")||null,
@@ -235,7 +235,7 @@ export function moveFormModal(ctx,{move=null,departmentId=null,onSaved}={}){
     button.disabled=true;button.textContent="Saving…";
     const res=move
       ?await supabase.rpc("update_move_incident",{p_incident_id:move.id,p_scheduled_at:f.scheduled_at,p_guest:f.guest,p_notes:f.notes,p_priority:f.priority,p_department_id:f.department_id})
-      :await supabase.rpc("create_move_incident",{p_event_id:ctx.eventId,p_department_id:f.department_id,p_scheduled_at:f.scheduled_at,p_guest:f.guest,p_notes:f.notes,p_priority:f.priority,p_activate_lead_minutes:f.lead,p_assign_unit_id:f.assign_unit_id});
+      :await supabase.rpc("create_move_incident",{p_event_id:ctx.eventId,p_department_id:f.department_id,p_scheduled_at:f.scheduled_at,p_guest:f.guest,p_notes:f.notes,p_priority:f.priority,p_assign_unit_id:f.assign_unit_id});
     if(res.error){button.disabled=false;button.textContent=move?"Save Changes":"Create MOVE";return alert(res.error.message);}
     ctx.closeModal();
     await onSaved?.(move?move.id:res.data);
@@ -420,7 +420,7 @@ export async function renderGuestLogistics(app,ctx){
   app.innerHTML=`<div class="shell">${ctx.header(`${esc(ctx.event?.name||"Event")} · Guest Logistics`)}
     <div class="wrap stack logistics-page">
       <div class="row">
-        <div><div class="section-title">Guest Logistics</div><strong>Scheduled and active MOVE tickets</strong><div class="small muted">A MOVE becomes an active ticket on the Dispatch board about an hour before pickup. Open a ticket to assign a driver, change status or close it.</div></div>
+        <div><div class="section-title">Guest Logistics</div><strong>Scheduled and active MOVE tickets</strong><div class="small muted">A MOVE becomes an active ticket on the Dispatch board ${esc(ctx.event?.move_activation_lead_minutes||60)} minutes before pickup (set in Event Admin → Guest Logistics). Open a ticket to assign a driver, change status or close it.</div></div>
         <div class="row" style="gap:8px"><button class="btn" id="newMove">+ New MOVE</button><button class="btn secondary" id="importMoves">Import CSV</button><button class="btn secondary" id="exportMoves">Export</button><button class="btn secondary" id="backGuestLogistics">Back to Dispatch</button></div>
       </div>
       <div class="command-display-metrics logistics-metrics">
@@ -481,6 +481,8 @@ export async function loadFieldLogisticsState(eventId,unitId){
 function fieldMoveActions(move){
   return moveStatusActions(move).filter(([s])=>s!=="CANCELLED");
 }
+
+export function fieldMoveTaskCardHtml(move,state){return fieldMovementTaskHtml(move,state,0);}
 
 function fieldMovementTaskHtml(move,state,index){
   const flight=[move.airline,move.flight_number].filter(Boolean).join(" ");

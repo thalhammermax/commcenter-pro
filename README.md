@@ -1,4 +1,4 @@
-# CommCenter Pro v0.19.0
+# CommCenter Pro v0.19.1
 
 CommCenter Pro is a cloud-hosted, multi-tenant, multi-department event operations CAD/PWA.
 
@@ -397,3 +397,8 @@ Guest Logistics MOVEs are now CAD incidents of kind `MOVE`, created from a dedic
 ## v0.19.0 — Per-Unit Task Queue
 
 The CAD-vs-MOVE primary/secondary rule is gone. A unit can hold any number of tickets (CAD or MOVE) in an ordered queue: position 1 is the CURRENT task and drives the unit's status; the rest wait. New assignments append; Dispatch reorders with Make Current / ▲ / ▼; when the current ticket closes, the next becomes current and the driver must acknowledge it. See `UPGRADE-TO-0.19.0.md`.
+
+
+## v0.19.1 — One Ticket Type on Field + MOVE Activation Setting
+
+Field page shows a single Current Task card and a single Task Queue list for CAD and MOVE tickets alike. The minutes-before-pickup at which a scheduled MOVE becomes a ticket is now set in Event Admin → Guest Logistics. See `UPGRADE-TO-0.19.1.md`.

@@ -5511,3 +5511,5 @@ body.field-dual-task-alert::after{
 .field-queued-task-label{color:#cbd5e1;background:#1f2937;border:1px solid #475569;border-radius:6px;padding:4px 8px;display:inline-block;margin-bottom:6px}
 .card.assignment.field-task-queued{opacity:.85;border-style:dashed}
 .command-unit-chip.command-unit-queued{opacity:.75;border-style:dashed}
+.field-task-queue-card .field-logistics-queue{margin-top:10px}
+.field-move-current-card .field-logistics-task{border:0;padding:0;background:transparent}

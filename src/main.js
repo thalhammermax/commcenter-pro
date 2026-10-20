@@ -8,7 +8,7 @@ import { pixelToGeo, pixelToLeaflet, leafletToPixel, geoToPixel, distanceMeters 
 import { saveOfflineEvent, getOfflineEvent } from "./offlineStore.js";
 import { renderEmsOps, renderEmsAdmin, renderTreatmentAreaFlow, loadFieldEmsState, fieldEmsPanelHtml, bindFieldEmsPanel, renderDispatchIncidentTreatmentPanel, TREATMENT_LAYOUT_BLOCKS, defaultTreatmentLayoutConfig, normalizeTreatmentLayoutConfig } from "./ems.js";
 import { loadVenueChoices, applyVenueVersionToEvent, saveEventToVenueLibrary, renderVenueLibrary } from "./venueLibrary.js";
-import { renderGuestLogistics, loadFieldLogisticsState, fieldLogisticsPanelHtml, bindFieldLogisticsPanel, movementRisk, movementStatusLabel, movementStatusClass, movementTypeLabel, moveFromIncident, moveStatusActions, setMoveStatus, moveFormModal } from "./moves.js";
+import { renderGuestLogistics, loadFieldLogisticsState, fieldLogisticsPanelHtml, bindFieldLogisticsPanel, fieldMoveTaskCardHtml, movementRisk, movementStatusLabel, movementStatusClass, movementTypeLabel, moveFromIncident, moveStatusActions, setMoveStatus, moveFormModal } from "./moves.js";
 import { renderUnitStaffing } from "./staffing.js";
 
 const app=document.querySelector("#app");
@@ -253,8 +253,8 @@ const FIELD_LAYOUT_BLOCKS=[
   {id:"unit_identity",label:"Unit Identity",description:"Unit name, current status badge, and Operational Period identity.",required:true},
   {id:"status_controls",label:"Status Options",description:"Department-configured unit status buttons.",required:true},
   {id:"run_times",label:"Run Times / Call Times",description:"Quick access to current and recent CAD timestamps for reports."},
-  {id:"current_call",label:"Current Call Information",description:"Current CAD assignment, location, notes, timer, and event-map access.",required:true},
-  {id:"guest_logistics",label:"Guest Logistics Movement",description:"Assigned special-guest transportation movement and driver controls.",required:true},
+  {id:"current_call",label:"Current Task",description:"The unit's current ticket (CAD call or MOVE): details, acknowledgement, timer, map access and driver controls.",required:true},
+  {id:"guest_logistics",label:"Task Queue",description:"Tickets queued behind the current task, in order, with acknowledgement.",required:true},
   {id:"ems_patient_flow",label:"EMS Patient Flow",description:"EMS custody, handoff, and patient-flow controls when applicable.",required:true},
   {id:"live_location",label:"Live Location / Venue Position",description:"GPS sharing plus venue level / zone controls when enabled."},
   {id:"transport_destination",label:"Transport Destination",description:"Ambulance facility or treatment-area destination controls while transporting.",required:true},
@@ -4565,7 +4565,7 @@ function guestDetailsSectionHtml(incident){
       <div><span class="small muted">Destination</span><strong>${esc(m.destination)}</strong></div>
       ${flight||m.airport?`<div><span class="small muted">Flight</span><strong>${esc(flight||"—")}${m.airport?` · ${esc(m.airport)}`:""}${m.terminal?` T${esc(m.terminal)}`:""}</strong></div>`:""}
       ${m.contact_phone?`<div><span class="small muted">Contact</span><strong><a href="tel:${esc(m.contact_phone)}">${esc(m.contact_phone)}</a></strong></div>`:""}
-      ${incident.status==="SCHEDULED"?`<div><span class="small muted">Activates</span><strong>${esc(time24(new Date(new Date(m.scheduled_at).getTime()-(incident.activate_lead_minutes||60)*60000)))} (${incident.activate_lead_minutes||60} min before)</strong></div>`:""}
+      ${incident.status==="SCHEDULED"?`<div><span class="small muted">Becomes a ticket</span><strong>${esc(time24(new Date(new Date(m.scheduled_at).getTime()-(incident.activate_lead_minutes||S.event?.move_activation_lead_minutes||60)*60000)))} (${incident.activate_lead_minutes||S.event?.move_activation_lead_minutes||60} min before pickup)</strong></div>`:""}
     </div>
   </section>`;
 }
@@ -6406,6 +6406,17 @@ function renderGuestLogisticsAdmin(){
     </div>
 
     <div class="card">
+      <div class="section-title">SCHEDULING</div>
+      <h3>When a scheduled MOVE becomes a ticket</h3>
+      <p class="muted">A MOVE entered in Guest Logistics is a scheduled ticket. This many minutes before its pickup time it activates and appears on the Dispatch board, Command Display and the assigned driver's queue exactly like any other ticket. Applies to every MOVE still waiting to activate.</p>
+      <div class="row" style="gap:10px;align-items:flex-end">
+        <div><label>Activate before pickup (minutes)</label><input id="moveLeadMinutes" type="number" min="5" max="1440" step="5" value="${esc(S.event?.move_activation_lead_minutes||60)}" style="width:140px"></div>
+        <button class="btn" id="saveMoveLead">Save</button>
+        <span class="small muted" id="moveLeadStatus"></span>
+      </div>
+    </div>
+
+    <div class="card">
       <div class="section-title">WORKFLOW</div>
       <h3>Scheduled Movement vs CAD Task</h3>
       <div class="grid2">
@@ -6422,6 +6433,16 @@ function renderGuestLogisticsAdmin(){
   </div>`;
 
   document.querySelector("#openGuestLogisticsAdminBoard")?.addEventListener("click",()=>guestLogisticsPage({allDepartments:true}));
+  document.querySelector("#saveMoveLead")?.addEventListener("click",async()=>{
+    const minutes=Number(document.querySelector("#moveLeadMinutes").value);
+    const status=document.querySelector("#moveLeadStatus");
+    if(!Number.isFinite(minutes)||minutes<5||minutes>1440)return alert("Enter a value between 5 and 1440 minutes.");
+    status.textContent="Saving…";
+    const {error}=await supabase.rpc("admin_set_move_activation_lead",{p_event_id:S.eventId,p_minutes:minutes});
+    if(error){status.textContent="";return alert(error.message);}
+    if(S.event)S.event.move_activation_lead_minutes=minutes;
+    status.textContent=`Saved · MOVEs activate ${minutes} min before pickup`;
+  });
   document.querySelector("#guestLogisticsSetupDepartments").onclick=()=>{
     document.querySelector("#setupTab")?.click();
   };
@@ -8600,8 +8621,8 @@ async function fieldUnitCad(){
     loadFieldLogisticsState(S.eventId,fs.unit_id)
   ]);
   const cadLinks=assignmentRes.status==="fulfilled"?(assignmentRes.value?.data||[]):[];
-  const a=cadLinks[0]||null;
-  const queuedCads=cadLinks.slice(1);
+  const a=cadLinks[0]?.is_primary?cadLinks[0]:null;
+  const queuedCads=cadLinks.filter(l=>l!==a);
   if(staticRes.status==="fulfilled")staticData=staticRes.value;
   else{console.error("Field reference data failed to load",staticRes.reason);staticData={layers:[],zones:[],hasEms:false,treatmentAreas:[]};}
   let logisticsState=null;
@@ -8636,6 +8657,41 @@ async function fieldUnitCad(){
   const cadIsQueued=!!incident&&!cadIsCurrent;
   const cadQueuePos=a?.queue_position||null;
   const cadIsPriority=false,priorityNeedsAck=false,cadIsSecondary=false;
+  // One ordered queue for the phone, whatever the ticket kind.
+  const queuedTasks=[
+    ...queuedCads.map(l=>({kind:"CAD",id:l.incidents.id,link:l,incident:l.incidents,pos:l.queue_position||999,when:l.assigned_at})),
+    ...(logisticsState?.movements||[]).filter(m=>m!==currentMove).map(m=>({kind:"MOVE",id:m.id,move:m,pos:m.incident_status==="OPEN"?(m.queue_position||999):1000+(m.queue_position||999),when:m.scheduled_at}))
+  ].sort((x,y)=>x.pos-y.pos||new Date(x.when||0)-new Date(y.when||0));
+  const queuedTaskRow=(t,i)=>{
+    const pos=i+2;
+    if(t.kind==="MOVE"){
+      const m=t.move;const risk=movementRisk(m);const pending=!m.driver_acknowledged_at;
+      return `<div class="field-logistics-queue-row ${pending?"field-move-card-pending":""}">
+        <div class="field-logistics-queue-time"><strong class="mono">#${pos}</strong><span class="small">${esc(time24(m.scheduled_at))}</span></div>
+        <div class="field-logistics-queue-main">
+          <div class="row start"><strong>${esc(m.movement_number)}</strong><span class="badge move-kind-badge">MOVE</span><span class="badge ${movementStatusClass(m.status)}">${esc(movementStatusLabel(m.status))}</span>${risk?`<span class="badge risk-badge risk-${risk.level}">${esc(risk.label)}</span>`:""}</div>
+          <div class="small">${esc(m.guest_name)}${m.guest_group?` · ${esc(m.guest_group)}`:""} · ${m.party_size} pax</div>
+          <div class="small muted">${esc(m.origin)} → ${esc(m.destination)}</div>
+        </div>
+        ${pending?`<button class="btn compact field-move-acknowledge-button" data-field-logistics-ack="${m.id}">ACK</button>`:""}
+      </div>`;
+    }
+    const l=t.link,i2=t.incident;const pending=!l.acknowledged_at;
+    return `<div class="field-logistics-queue-row ${pending?"field-move-card-pending":""}">
+      <div class="field-logistics-queue-time"><strong class="mono">#${pos}</strong><span class="small">${esc(time24(l.assigned_at))}</span></div>
+      <div class="field-logistics-queue-main">
+        <div class="row start"><strong>${esc(i2.incident_number)}</strong><span class="badge">${esc(i2.priority)}</span><span class="badge">${esc(String(l.cad_status||"ASSIGNED").replaceAll("_"," "))}</span></div>
+        <div class="small">${esc(i2.call_type)}</div>
+        <div class="small muted">${esc(i2.landmark||"")}</div>
+      </div>
+      ${pending?`<button class="btn compact field-move-acknowledge-button" data-field-cad-ack="${i2.id}">ACK</button>`:""}
+    </div>`;
+  };
+  const queueBlockHtml=queuedTasks.length?`<div class="card field-task-queue-card">
+    <div class="row"><div><div class="section-title">TASK QUEUE</div><strong>${queuedTasks.length} ticket${queuedTasks.length===1?"":"s"} after your current task</strong></div><span class="badge">QUEUED</span></div>
+    <div class="field-logistics-queue">${queuedTasks.map(queuedTaskRow).join("")}</div>
+    <div class="small muted">Dispatch controls the order. Status controls unlock when a ticket becomes your current task.</div>
+  </div>`:"";
   if(logisticsState){
     logisticsState.cadPriority=null;
     logisticsState.currentTask=currentMove?{kind:"MOVE",id:currentMove.id,number:currentMove.movement_number}:(cadIsCurrent?{kind:"CAD",id:incident.id,number:incident.incident_number}:null);
@@ -8674,11 +8730,11 @@ async function fieldUnitCad(){
       <div class="small field-operational-period-line">Operational Period: <strong>${esc(fs.operational_periods?.name||"Active")}</strong>${fs.operational_periods?.incident_prefix?` · <span class="mono">${esc(fs.operational_periods.incident_prefix)}</span>`:""}</div>
     </div>`,
 
-    current_call:incident?`<div class="card assignment ${assignmentNeedsAck?"field-assignment-card-pending":""} ${cadIsQueued?"field-task-queued":""}">
-      <div class="small task-priority-label ${cadIsCurrent?"field-current-task-label":"field-queued-task-label"}">${cadIsCurrent?"CURRENT TASK · CAD TICKET":`QUEUED #${cadQueuePos||"?"} · CAD TICKET${currentMove?` · current: ${esc(currentMove.movement_number)}`:""}`}</div>
+    current_call:incident&&cadIsCurrent?`<div class="card assignment ${assignmentNeedsAck?"field-assignment-card-pending":""}">
+      <div class="small task-priority-label field-current-task-label">CURRENT TASK</div>
       ${assignmentNeedsAck?`<div class="field-new-assignment" role="alert" aria-live="assertive">
         <div>
-          <div class="field-new-assignment-kicker">${cadIsCurrent?"NEW CURRENT ASSIGNMENT":"NEW QUEUED ASSIGNMENT"}</div>
+          <div class="field-new-assignment-kicker">NEW ASSIGNMENT</div>
           <strong>${esc(incident.incident_number)} · ${esc(incident.call_type)}</strong>
           <div class="small">Assigned ${a?.assigned_at?dateTime24(a.assigned_at,{seconds:true}):"just now"}. Acknowledge receipt of this call.</div>
         </div>
@@ -8691,10 +8747,11 @@ async function fieldUnitCad(){
       <p>${esc(incident.notes||"")}</p>
       ${fieldLayer&&incident.map_x!=null&&incident.map_y!=null?`<button class="btn secondary block" id="viewFieldMap">View Call &amp; My Location</button>`:""}
       <div id="fieldMapHolder"></div>
-      ${queuedCads.length?`<div class="field-logistics-queue"><div class="section-title">MORE CAD TICKETS QUEUED · ${queuedCads.length}</div>${queuedCads.map(l=>`<div class="field-logistics-queue-row ${l.acknowledged_at?"":"field-move-card-pending"}"><div class="field-logistics-queue-time"><strong class="mono">#${l.queue_position||"?"}</strong></div><div class="field-logistics-queue-main"><div class="row start"><strong>${esc(l.incidents.incident_number)}</strong><span class="badge">${esc(l.incidents.priority)}</span></div><div class="small">${esc(l.incidents.call_type)}</div><div class="small muted">${esc(l.incidents.landmark||"")}</div></div>${l.acknowledged_at?"":`<button class="btn compact field-move-acknowledge-button" data-field-cad-ack="${l.incidents.id}">ACK</button>`}</div>`).join("")}</div>`:""}
-    </div>`:hasMoves?"":`<div class="card"><strong>No current CAD assignment</strong><p class="muted">Remain available for dispatch.</p></div>`,
+    </div>`:currentMove?`<div class="card assignment field-move-current-card">
+      ${fieldMoveTaskCardHtml(currentMove,logisticsState)}
+    </div>`:queuedTasks.length?`<div class="card"><strong>No current task</strong><p class="muted">${queuedTasks.length} scheduled ticket${queuedTasks.length===1?"":"s"} waiting below. Remain available for dispatch.</p></div>`:`<div class="card"><strong>No current task</strong><p class="muted">Remain available for dispatch.</p></div>`,
 
-    guest_logistics:fieldLogisticsPanelHtml(logisticsState),
+    guest_logistics:queueBlockHtml,
 
     live_location:fs.events?.field_location_enabled?`<div class="card field-location-card">
       <div class="row">
@@ -8724,11 +8781,11 @@ async function fieldUnitCad(){
 
     ems_patient_flow:fieldHasEms?fieldEmsPanelHtml(emsState,incident):"",
 
-    status_controls:incident&&cadIsQueued?`<div class="field-status-layout-block card cad-task-status-card"><div class="row"><div class="section-title">CAD TICKET STATUS</div><span class="badge">QUEUED #${cadQueuePos||"?"}</span></div><div class="small muted">${esc(incident.incident_number)} is queued behind your current task. Status controls unlock when Dispatch makes it current or your current task closes.</div></div>`:incident?`<div class="field-status-layout-block card cad-task-status-card">
-      <div class="row"><div class="section-title">CAD TICKET STATUS</div><span class="badge cad-task-status-badge">${esc(String(cadTaskStatus||"ASSIGNED").replaceAll("_"," "))}</span></div>
+    status_controls:incident&&cadIsCurrent?`<div class="field-status-layout-block card cad-task-status-card">
+      <div class="row"><div class="section-title">TICKET STATUS</div><span class="badge cad-task-status-badge">${esc(String(cadTaskStatus||"ASSIGNED").replaceAll("_"," "))}</span></div>
       <div class="status-buttons">${statuses.map(status=>`<button class="btn field-status-button ${fieldStatusColorClass(status)} ${status===cadTaskStatus?"field-status-active":""}" data-cad-status="${esc(status)}" aria-pressed="${status===cadTaskStatus?"true":"false"}">${esc(status.replaceAll("_"," "))}</button>`).join("")}</div>
       <div class="small muted">Available / Clear / Complete closes ${esc(incident.incident_number)} and releases all units still committed to the ticket.${logisticsState?.movements?.length?" MOVE status remains independent.":""}</div>
-    </div>`:logisticsState?.movements?.length?"":standaloneUnitStatuses.length?`<div class="field-status-layout-block card standalone-unit-status-card">
+    </div>`:currentMove?"":standaloneUnitStatuses.length?`<div class="field-status-layout-block card standalone-unit-status-card">
       <div class="row"><div class="section-title">UNIT AVAILABILITY</div><span class="badge status-${esc(fs.units?.status)}">${esc(String(fs.units?.status||"").replaceAll("_"," "))}</span></div>
       <div class="status-buttons">${standaloneUnitStatuses.map(status=>`<button class="btn field-status-button ${fieldStatusColorClass(status)} ${status===fs.units?.status?"field-status-active":""}" data-unit-status-option="${esc(status)}" aria-pressed="${status===fs.units?.status?"true":"false"}">${esc(status.replaceAll("_"," "))}</button>`).join("")}</div>
       <div class="small muted">CAD response statuses such as En Route and On Scene are available only while this unit is assigned to an active CAD ticket.</div>
@@ -8786,16 +8843,12 @@ async function fieldUnitCad(){
   };
 
   const enabledFieldBlocks=fieldLayout.blocks.filter(block=>block.enabled&&(fieldHasEms||!['ems_patient_flow','transport_destination'].includes(block.id)));
-  if(hasActiveMoves||hasMoves){
-    // The unit's CURRENT task card comes first, whatever its kind.
-    const first=cadIsCurrent?"current_call":"guest_logistics";
-    const second=cadIsCurrent?"guest_logistics":"current_call";
-    enabledFieldBlocks.sort((a,b)=>{
-      if(a.id===first&&b.id===second)return -1;
-      if(a.id===second&&b.id===first)return 1;
-      return 0;
-    });
-  }
+  // Current task card always precedes the queue, whatever the layout order says.
+  enabledFieldBlocks.sort((a,b)=>{
+    if(a.id==="current_call"&&b.id==="guest_logistics")return -1;
+    if(a.id==="guest_logistics"&&b.id==="current_call")return 1;
+    return 0;
+  });
   const fieldLayoutHtml=enabledFieldBlocks
     .map(block=>fieldBlocks[block.id]||"")
     .join("");
