@@ -8,7 +8,7 @@ import { pixelToGeo, pixelToLeaflet, leafletToPixel, geoToPixel, distanceMeters 
 import { saveOfflineEvent, getOfflineEvent } from "./offlineStore.js";
 import { renderEmsOps, renderEmsAdmin, renderTreatmentAreaFlow, loadFieldEmsState, fieldEmsPanelHtml, bindFieldEmsPanel, renderDispatchIncidentTreatmentPanel, TREATMENT_LAYOUT_BLOCKS, defaultTreatmentLayoutConfig, normalizeTreatmentLayoutConfig } from "./ems.js";
 import { loadVenueChoices, applyVenueVersionToEvent, saveEventToVenueLibrary, renderVenueLibrary } from "./venueLibrary.js";
-import { renderGuestLogistics, loadFieldLogisticsState, fieldLogisticsPanelHtml, bindFieldLogisticsPanel } from "./logistics.js";
+import { renderGuestLogistics, loadFieldLogisticsState, fieldLogisticsPanelHtml, bindFieldLogisticsPanel, movementRisk, movementStatusLabel } from "./logistics.js";
 import { renderUnitStaffing } from "./staffing.js";
 
 const app=document.querySelector("#app");
@@ -1584,7 +1584,7 @@ async function loadCommandDisplayOps(){
       .eq("active",true)
       .order("name"),
     supabase.from("guest_logistics_movements")
-      .select("id,event_id,department_id,movement_number,movement_type,guest_name,guest_group,status,scheduled_at,assigned_unit_id,assigned_at,driver_acknowledged_at,updated_at,origin,destination,airline,flight_number,airport,terminal")
+      .select("id,event_id,department_id,movement_number,movement_type,guest_name,guest_group,status,scheduled_at,assigned_unit_id,assigned_at,driver_acknowledged_at,updated_at,origin,destination,airline,flight_number,airport,terminal,held_from_status,held_at,held_by_incident_id")
       .eq("event_id",S.eventId)
       .not("status","in","(COMPLETE,NO_SHOW,CANCELLED)")
       .not("assigned_unit_id","is",null)
@@ -1622,7 +1622,7 @@ async function loadCommandDisplayOps(){
         .select("incident_id,department_id,event_departments(name,short_name)")
         .in("incident_id",incidentIds),
       supabase.from("incident_units")
-        .select("incident_id,unit_id,assigned_at,acknowledged_at,cleared_at,cad_status,cad_status_updated_at,units(name)")
+        .select("incident_id,unit_id,assigned_at,acknowledged_at,cleared_at,cad_status,cad_status_updated_at,cad_priority_override,cad_priority_set_at,cad_priority_acknowledged_at,units(name)")
         .in("incident_id",incidentIds)
     ]);
 
@@ -1692,7 +1692,7 @@ async function loadEventOps(){
     supabase.from("unit_locations").select("*").eq("event_id",S.eventId),
     supabase.from("operational_periods").select("*").eq("event_id",S.eventId).order("created_at"),
     supabase.from("event_dispositions").select("*").eq("event_id",S.eventId).eq("active",true).order("scope").order("sort_order").order("label"),
-    supabase.from("guest_logistics_movements").select("id,event_id,department_id,movement_number,movement_type,guest_name,guest_group,status,scheduled_at,assigned_unit_id,assigned_at,driver_acknowledged_at,updated_at,origin,destination,airline,flight_number,airport,terminal").eq("event_id",S.eventId).not("status","in","(COMPLETE,NO_SHOW,CANCELLED)").order("scheduled_at"),
+    supabase.from("guest_logistics_movements").select("id,event_id,department_id,movement_number,movement_type,guest_name,guest_group,status,scheduled_at,assigned_unit_id,assigned_at,driver_acknowledged_at,updated_at,origin,destination,airline,flight_number,airport,terminal,held_from_status,held_at,held_by_incident_id").eq("event_id",S.eventId).not("status","in","(COMPLETE,NO_SHOW,CANCELLED)").order("scheduled_at"),
     supabase.from("ems_treatment_areas").select("*").eq("event_id",S.eventId).eq("active",true).order("name")
   ]);
 
@@ -1756,7 +1756,7 @@ async function loadEventOps(){
         .select("incident_id,department_id,event_departments(name,short_name)")
         .in("incident_id",incidentIds),
       supabase.from("incident_units")
-        .select("incident_id,unit_id,assigned_at,acknowledged_at,cleared_at,cad_status,cad_status_updated_at,units(name)")
+        .select("incident_id,unit_id,assigned_at,acknowledged_at,cleared_at,cad_status,cad_status_updated_at,cad_priority_override,cad_priority_set_at,cad_priority_acknowledged_at,units(name)")
         .in("incident_id",incidentIds)
     ]);
 
@@ -2504,7 +2504,8 @@ function unitLocationTooltip(unit,location){
   const layer=unitLocationLayerId(unit);
   const cadStatus=dispatchCadStatusForUnit(unit);
   const move=underwayLogisticsMovementForUnit(unit.id)||logisticsMovementsForUnit(unit.id)[0]||null;
-  return `<strong>${esc(unit.name)}</strong><br>CAD ${esc(String(cadStatus||"").replaceAll("_"," "))}${move?`<br>MOVE ${esc(String(move.status||"").replaceAll("_"," "))}`:""}<br>${esc(age)}${esc(accuracy)}${layer?`<br>${esc(layerName(layer))}`:""}`;
+  const stack=unitTaskStack(unit.id);
+  return `<strong>${esc(unit.name)}</strong>${stack.diverted?"<br>⇅ DIVERTED":""}<br>CAD ${esc(String(cadStatus||"").replaceAll("_"," "))}${move?`<br>MOVE ${esc(movementStatusLabel(move.status))}`:""}<br>${esc(age)}${esc(accuracy)}${layer?`<br>${esc(layerName(layer))}`:""}`;
 }
 
 function removeUnitLocationMarker(unitId){
@@ -2668,6 +2669,31 @@ function dispatchCadStatusForUnit(unit){
   return active?cadAssignmentStatus(active,unit):(unit.status||"AVAILABLE");
 }
 
+/* Unit task stack. A Guest Logistics unit's MOVE is primary by default; a
+   dispatcher override on the active CAD link makes the ticket primary until the
+   ticket closes or the unit is cleared. Every screen derives priority here. */
+function unitTaskStack(unitId){
+  const active=activeAssignmentForUnit(unitId);
+  const moves=logisticsMovementsForUnit(unitId);
+  const override=!!(active?.link?.cad_priority_override);
+  const heldMoves=moves.filter(m=>m.status==="HELD");
+  const diverted=override&&moves.length>0;
+  return {
+    active,
+    moves,
+    override,
+    diverted,
+    heldMoves,
+    primaryKind:moves.length?(override?"CAD":"MOVE"):(active?"CAD":null),
+    priorityPendingAck:diverted&&!active.link.cad_priority_acknowledged_at
+  };
+}
+
+function moveLineHtml(m){
+  const risk=movementRisk(m);
+  return `<div class="small unit-task-move-line"><strong>${esc(m.movement_number)}</strong> · ${esc(m.guest_name||"Guest")} · <span class="move-status-${esc(String(m.status||"").toLowerCase())}">${esc(movementStatusLabel(m.status))}</span>${risk?` <span class="badge risk-badge risk-${risk.level}">${esc(risk.label)}</span>`:""}${m.origin||m.destination?` · ${esc([m.origin,m.destination].filter(Boolean).join(" → "))}`:""}</div>`;
+}
+
 function incidentList(){
   return S.incidents.filter(incidentInDispatchScope).map(i=>{
     const deps=(i.incident_departments||[]).map(d=>d.event_departments?.short_name||d.event_departments?.name).filter(Boolean).join("/");
@@ -2696,20 +2722,21 @@ function unitList(){
       const cadStatus=active?cadAssignmentStatus(active,u):(u.status||"AVAILABLE");
       const loc=unitLocation(u.id);
       const transportLabel=unitTransportDestinationLabel(u);
-      return `<button class="unit unit-button ${moves.length?"unit-has-moves":""}" data-unit-detail="${u.id}">
+      return `<button class="unit unit-button ${moves.length?"unit-has-moves":""} ${active?.link?.cad_priority_override&&moves.length?"unit-diverted":""}" data-unit-detail="${u.id}">
         <div class="row">
           <strong>${esc(u.name)}</strong>
           <span class="badge status-${esc(cadStatus)}" data-dispatch-unit-status="${u.id}">${active?"CAD ":""}${esc(String(cadStatus||"").replaceAll("_"," "))}</span>
         </div>
-        ${moves.length?`<div class="unit-task-primary">
-          <div class="small task-priority-label">PRIMARY · ${moves.length} MOVE${moves.length===1?"":"S"}</div>
-          ${moves.map(m=>`<div class="small unit-task-move-line"><strong>${esc(m.movement_number)}</strong> · ${esc(m.guest_name||"Guest")} · <span>${esc(String(m.status||"").replaceAll("_"," "))}</span>${m.origin||m.destination?` · ${esc([m.origin,m.destination].filter(Boolean).join(" → "))}`:""}</div>`).join("")}
-        </div>`:""}
-        <div class="small ${active?"":"muted"}">${active
-          ?`${moves.length?"SECONDARY CAD · ":"Assigned: "}${esc(active.incident.incident_number)} · ${esc(active.incident.call_type)} · ${esc(cadAssignmentStatus(active,u).replaceAll("_"," "))}`
-          :moves.length
-            ?"No secondary CAD assignment"
-            :"Unassigned"}</div>
+        ${(()=>{
+          const stack=unitTaskStack(u.id);
+          const cadLine=active?`<div class="small unit-task-cad-line ${stack.diverted?"unit-task-cad-primary":""}">${stack.diverted?`<span class="task-priority-label">PRIORITY CAD${stack.priorityPendingAck?" · AWAITING ACK":""}</span> · `:moves.length?"SECONDARY CAD · ":"Assigned: "}${esc(active.incident.incident_number)} · ${esc(active.incident.call_type)} · ${esc(cadAssignmentStatus(active,u).replaceAll("_"," "))}</div>`:"";
+          const moveBlock=moves.length?`<div class="unit-task-primary ${stack.diverted?"unit-task-held":""}">
+            <div class="small task-priority-label">${stack.diverted?`${stack.heldMoves.length?"ON HOLD":"SECONDARY"} · `:"PRIMARY · "}${moves.length} MOVE${moves.length===1?"":"S"}</div>
+            ${moves.map(moveLineHtml).join("")}
+          </div>`:"";
+          if(stack.diverted)return `<div class="unit-diverted-tag small">⇅ DIVERTED TO CAD</div>${cadLine}${moveBlock}`;
+          return `${moveBlock}${cadLine||`<div class="small muted">${moves.length?"No secondary CAD assignment":"Unassigned"}</div>`}`;
+        })()}
         ${transportLabel?`<div class="small transport-destination-readout">Transport → ${esc(transportLabel)}</div>`:""}
         <div class="small unit-gps-readout ${loc?`gps-${locationFreshness(loc)}`:"muted"}" data-unit-gps="${u.id}">${loc?`${locationAgeLabel(loc)}${loc.accuracy_m!=null?` · ±${Math.round(loc.accuracy_m)}m`:""}`:(S.event?.field_location_enabled?"GPS not shared":"GPS disabled")}</div>
       </button>`;
@@ -3739,14 +3766,17 @@ async function selectIncident(id,{silent=false}={}){
             return `<div class="assignment-unit-row">
               <div>
                 <strong>${esc(u.event_departments?.short_name||"")} · ${esc(u.name)}</strong><br>
-                <span class="badge cad-task-status-badge">CAD ${esc(cadAssignmentStatus({incident:current,link},u).replaceAll("_"," "))}</span>
-                ${moves.length?`<span class="badge">PRIMARY ${esc(String((underwayLogisticsMovementForUnit(u.id)||moves[0])?.status||"ASSIGNED").replaceAll("_"," "))}</span>`:""}
+                <span class="badge cad-task-status-badge">${link.cad_priority_override&&moves.length?"PRIORITY ":""}CAD ${esc(cadAssignmentStatus({incident:current,link},u).replaceAll("_"," "))}</span>
+                ${moves.length?(link.cad_priority_override
+                  ?`<span class="badge unit-diverted-badge">⇅ DIVERTED${link.cad_priority_acknowledged_at?"":" · AWAITING DRIVER ACK"}</span>`
+                  :`<span class="badge">PRIMARY ${esc(movementStatusLabel((underwayLogisticsMovementForUnit(u.id)||moves[0])?.status||"ASSIGNED"))}</span>`):""}
                 <span class="assignment-ack-badge ${link.acknowledged_at?"acknowledged":"pending"}" title="${link.acknowledged_at?`Acknowledged ${dateTime24(link.acknowledged_at,{seconds:true})}`:"Awaiting Field Unit acknowledgement"}">${link.acknowledged_at?`ACK ${time24(link.acknowledged_at)}`:"AWAITING ACK"}</span>
                 <span class="small ${unitLocation(u.id)?`gps-${locationFreshness(unitLocation(u.id))}`:"muted"}" data-unit-gps="${u.id}">${unitLocation(u.id)?`${locationAgeLabel(unitLocation(u.id))}${unitLocation(u.id).accuracy_m!=null?` · ±${Math.round(unitLocation(u.id).accuracy_m)}m`:""}`:(S.event?.field_location_enabled?"GPS not shared":"GPS disabled")}</span>
-                ${moves.length?`<div class="assignment-secondary-moves"><span class="small task-priority-label">PRIMARY MOVE${moves.length===1?"":"S"}</span>${moves.map(m=>`<span class="badge">${esc(m.movement_number)}</span>`).join("")}</div>`:""}
+                ${moves.length?`<div class="assignment-secondary-moves"><span class="small task-priority-label">${link.cad_priority_override?"MOVE":"PRIMARY MOVE"}${moves.length===1?"":"S"}</span>${moves.map(m=>`<span class="badge ${m.status==="HELD"?"logistics-status-held":""}">${esc(m.movement_number)}${m.status==="HELD"?" · HELD":""}</span>`).join("")}</div>`:""}
               </div>
               <div class="assignment-unit-actions">
                 ${unitTransportDestinationLabel(u)?`<span class="small transport-destination-readout">→ ${esc(unitTransportDestinationLabel(u))}</span>`:""}
+                ${moves.length?`<button class="btn ${link.cad_priority_override?"secondary":"warn"}" data-cad-priority-unit="${u.id}">${link.cad_priority_override?"Return Priority to MOVE":"Prioritize This Ticket"}</button>`:""}
                 <button class="btn secondary" data-open-unit-controls="${u.id}">Unit Controls</button>
                 <button class="btn danger" data-unassign-unit="${u.id}">Unassign</button>
               </div>
@@ -3826,6 +3856,7 @@ async function selectIncident(id,{silent=false}={}){
   };
 
   document.querySelectorAll("[data-open-unit-controls]").forEach(b=>b.onclick=()=>selectUnit(b.dataset.openUnitControls));
+  document.querySelectorAll("[data-cad-priority-unit]").forEach(b=>b.onclick=()=>openCadPriorityModal(current.id,b.dataset.cadPriorityUnit,{returnTo:"incident"}));
 
   document.querySelectorAll("[data-unassign-unit]").forEach(b=>b.onclick=async()=>{
     if(!confirm("Remove this unit from the incident?"))return;
@@ -4021,6 +4052,7 @@ function selectUnit(unitId,{silent=false}={}){
 
   const active=activeAssignmentForUnit(unitId);
   const moves=logisticsMovementsForUnit(unitId);
+  const stack=unitTaskStack(unitId);
   const primaryMove=moves[0]||null;
   const underwayMove=underwayLogisticsMovementForUnit(unitId);
   const currentCadStatus=active?cadAssignmentStatus(active,u):u.status;
@@ -4087,14 +4119,15 @@ function selectUnit(unitId,{silent=false}={}){
       </div>
 
       <div class="incident-info-section">
-        <div class="row"><div class="section-title">${moves.length?"Secondary CAD Assignment":"CAD Assignment"}</div>${active?`<span class="badge">COMMITTED</span>`:`<span class="badge">UNASSIGNED</span>`}</div>
+        <div class="row"><div class="section-title">${moves.length?(stack.diverted?"Priority CAD Assignment":"Secondary CAD Assignment"):"CAD Assignment"}</div>${active?`<span class="badge">${stack.diverted?"⇅ DIVERTED":"COMMITTED"}</span>`:`<span class="badge">UNASSIGNED</span>`}</div>
         ${active?`
           <div class="unit-current-assignment">
             <strong>${esc(active.incident.incident_number)} · ${esc(active.incident.call_type)}</strong>
-            <div class="small muted">${esc(active.incident.landmark||"")}${moves.length?" · This CAD ticket is secondary to the unit's assigned MOVE(s).":""}</div>
+            <div class="small muted">${esc(active.incident.landmark||"")}${moves.length?(stack.diverted?` · Dispatch prioritized this ticket over the unit's MOVE(s)${stack.priorityPendingAck?" — driver has not acknowledged yet":""}.`:" · This CAD ticket is secondary to the unit's assigned MOVE(s)."):""}</div>
           </div>
+          ${moves.length?`<button class="btn block ${stack.override?"secondary":"warn"}" id="toggleCadPriority">${stack.override?"Return Priority to MOVE":"Prioritize This Ticket Over MOVE"}</button>`:""}
           ${moves.length?`<div class="cad-task-status-panel">
-            <div class="row"><div class="section-title">SECONDARY CAD STATUS</div><span class="badge cad-task-status-badge">${esc(currentCadStatus.replaceAll("_"," "))}</span></div>
+            <div class="row"><div class="section-title">${stack.diverted?"PRIORITY CAD STATUS":"SECONDARY CAD STATUS"}</div><span class="badge cad-task-status-badge">${esc(currentCadStatus.replaceAll("_"," "))}</span></div>
             ${unitStatusButtonsHtml(u,active,currentCadStatus)}
             ${transportDestinationEditorHtml(u,currentCadStatus)}
           </div>`:""}
@@ -4279,6 +4312,7 @@ function selectUnit(unitId,{silent=false}={}){
   if(active){
     document.querySelector("#openAssignedIncident").onclick=()=>selectIncident(active.incident.id);
     document.querySelector("#removeAssignment").onclick=()=>dispatcherUnassign(active.incident.id,unitId);
+    document.querySelector("#toggleCadPriority")?.addEventListener("click",()=>openCadPriorityModal(active.incident.id,unitId,{returnTo:"unit"}));
   }else{
     document.querySelector("#assignFromUnit").onclick=()=>{
       const incidentId=document.querySelector("#unitIncident").value;
@@ -4286,6 +4320,91 @@ function selectUnit(unitId,{silent=false}={}){
       dispatcherAssign(incidentId,unitId);
     };
   }
+}
+
+/* Dispatcher chooses, every time, what happens to the unit's MOVE(s) when a
+   CAD ticket is prioritized. Guests already on board require typed confirmation. */
+function openCadPriorityModal(incidentId,unitId,{returnTo="incident"}={}){
+  const incident=idx().incidentsById.get(incidentId);
+  const unit=idx().unitsById.get(unitId);
+  if(!incident||!unit)return;
+  const stack=unitTaskStack(unitId);
+  const link=stack.active?.incident?.id===incidentId?stack.active.link:null;
+  if(!link)return alert("This unit is no longer assigned to that incident.");
+  const reopen=()=>returnTo==="unit"?selectUnit(unitId):selectIncident(incidentId);
+
+  const run=async(enabled,hold)=>{
+    const {data,error}=await supabase.rpc("dispatch_set_cad_priority",{
+      p_incident_id:incidentId,p_unit_id:unitId,p_enabled:enabled,p_hold_movements:hold
+    });
+    if(error)return alert(error.message);
+    await loadEventOps();
+    refreshDispatchBoards();
+    reopen();
+    return data;
+  };
+
+  if(link.cad_priority_override){
+    S.incidentModalMode="cad-priority";
+    const content=openIncidentModalShell();
+    content.__ccHtml=null;
+    content.innerHTML=`<div class="incident-modal-header">
+      <div><div class="incident-modal-eyebrow">TASK PRIORITY</div><h2 id="incidentModalTitle">Return priority to MOVE</h2>
+      <div class="incident-modal-nature">${esc(unit.name)} · ${esc(incident.incident_number)}</div></div>
+      <button class="incident-modal-close" id="closeIncidentModal" aria-label="Close">×</button></div>
+      <div class="stack" style="padding:18px">
+        <p>${esc(incident.incident_number)} stays assigned to ${esc(unit.name)} as a <strong>secondary</strong> task. ${stack.heldMoves.length?`${stack.heldMoves.length} held MOVE${stack.heldMoves.length===1?"":"S"} will resume automatically.`:"The unit's MOVE(s) become primary again."}</p>
+        <div class="grid2">
+          <button class="btn" id="cadPriorityConfirm">Return Priority to MOVE</button>
+          <button class="btn secondary" id="cadPriorityCancel">Cancel</button>
+        </div>
+      </div>`;
+    document.querySelector("#closeIncidentModal").onclick=reopen;
+    document.querySelector("#cadPriorityCancel").onclick=reopen;
+    document.querySelector("#cadPriorityConfirm").onclick=()=>run(false,false);
+    return;
+  }
+
+  const underway=stack.moves.filter(m=>["PASSENGER_ONBOARD","EN_ROUTE_DESTINATION"].includes(m.status));
+  const movesHtml=stack.moves.map(m=>`<li><strong>${esc(m.movement_number)}</strong> · ${esc(m.guest_name||"Guest")} · ${esc(movementStatusLabel(m.status))}${["PASSENGER_ONBOARD","EN_ROUTE_DESTINATION"].includes(m.status)?` <span class="badge danger-badge">GUEST ON BOARD</span>`:""}</li>`).join("");
+
+  S.incidentModalMode="cad-priority";
+  const content=openIncidentModalShell();
+  content.__ccHtml=null;
+  content.innerHTML=`<div class="incident-modal-header">
+    <div><div class="incident-modal-eyebrow">TASK PRIORITY</div><h2 id="incidentModalTitle">Prioritize ${esc(incident.incident_number)} for ${esc(unit.name)}</h2>
+    <div class="incident-modal-nature">${esc(incident.call_type)} · ${esc(incident.landmark||"")}</div></div>
+    <button class="incident-modal-close" id="closeIncidentModal" aria-label="Close">×</button></div>
+    <div class="stack" style="padding:18px">
+      <p>This unit currently has ${stack.moves.length} assigned MOVE${stack.moves.length===1?"":"S"}:</p>
+      <ul class="priority-move-list">${movesHtml}</ul>
+      ${underway.length?`<div class="notice error"><strong>A guest is on board.</strong> Diverting this vehicle now interrupts an active transport. Type <strong>DIVERT</strong> to confirm.</div>
+        <input id="cadPriorityConfirmText" placeholder="Type DIVERT" autocomplete="off">`:""}
+      <p class="small muted">The driver's phone will show a red alert until they acknowledge the change. Priority returns to the MOVE automatically when ${esc(incident.incident_number)} closes or the unit is cleared.</p>
+      <div class="section-title">What should happen to the MOVE(s)?</div>
+      <div class="priority-choice-grid">
+        <button class="btn block" id="cadPriorityHold">
+          <strong>Place MOVE${stack.moves.length===1?"":"S"} on HOLD</strong>
+          <span class="small">Status becomes HELD everywhere. Resumes automatically when the ticket closes${underway.length?"; a guest on board stays on board":""}.</span>
+        </button>
+        <button class="btn secondary block" id="cadPriorityKeep">
+          <strong>Keep MOVE status running</strong>
+          <span class="small">MOVE keeps its current status; the unit is simply shown as diverted.</span>
+        </button>
+      </div>
+      <button class="btn secondary block" id="cadPriorityCancel">Cancel</button>
+    </div>`;
+
+  const guard=()=>{
+    if(!underway.length)return true;
+    if((document.querySelector("#cadPriorityConfirmText")?.value||"").trim().toUpperCase()==="DIVERT")return true;
+    alert("Type DIVERT to confirm diverting a vehicle with a guest on board.");
+    return false;
+  };
+  document.querySelector("#closeIncidentModal").onclick=reopen;
+  document.querySelector("#cadPriorityCancel").onclick=reopen;
+  document.querySelector("#cadPriorityHold").onclick=()=>{if(guard())run(true,true);};
+  document.querySelector("#cadPriorityKeep").onclick=()=>{if(guard())run(true,false);};
 }
 
 async function setupDispatchMap(){
@@ -5016,11 +5135,14 @@ function commandMoveCardsHtml(){
     <div class="command-move-grid">${movements.map(m=>{
       const unit=idx().unitsById.get(m.assigned_unit_id);
       const cad=unit?activeAssignmentForUnit(unit.id):null;
-      return `<article class="command-move-card ${LOGISTICS_UNDERWAY_STATUSES.has(m.status)?"underway":""}">
-        <div class="row"><strong>${esc(m.movement_number)}</strong><span class="badge">${esc(String(m.status||"").replaceAll("_"," "))}</span></div>
+      const diverted=!!(cad?.link?.cad_priority_override);
+      const risk=movementRisk(m);
+      return `<article class="command-move-card ${LOGISTICS_UNDERWAY_STATUSES.has(m.status)?"underway":""} ${m.status==="HELD"?"held":""} ${diverted?"diverted":""}">
+        <div class="row"><strong>${esc(m.movement_number)}</strong><span><span class="badge">${esc(movementStatusLabel(m.status))}</span>${risk?` <span class="badge risk-badge risk-${risk.level}">${esc(risk.label)}</span>`:""}</span></div>
+        ${diverted?`<div class="small command-move-diverted">⇅ ${m.status==="HELD"?"HELD":"DIVERTED"} — unit on ${esc(cad.incident.incident_number)}</div>`:""}
         <div class="command-move-guest">${esc(m.guest_name||"Guest")}</div>
         <div class="small command-move-route">${esc([m.origin,m.destination].filter(Boolean).join(" → ")||"Route not entered")}</div>
-        <div class="small"><strong>${esc(unit?.name||"Unassigned unit")}</strong>${cad?` · Secondary CAD ${esc(cad.incident.incident_number)} · ${esc(cadAssignmentStatus(cad,unit).replaceAll("_"," "))}`:""}</div>
+        <div class="small"><strong>${esc(unit?.name||"Unassigned unit")}</strong>${cad?` · ${diverted?"Priority":"Secondary"} CAD ${esc(cad.incident.incident_number)} · ${esc(cadAssignmentStatus(cad,unit).replaceAll("_"," "))}`:""}</div>
       </article>`;
     }).join("")}</div>
   </section>`;
@@ -5043,7 +5165,7 @@ function commandCallCardsHtml(){
         const unit=S.units.find(u=>u.id===link.unit_id);
         if(!unit)return "";
         const moves=logisticsMovementsForUnit(unit.id);
-        return `<span class="command-unit-chip"><strong>${esc(unit.name)}</strong> · CAD ${esc(cadAssignmentStatus({incident:i,link},unit).replaceAll("_"," "))}${moves.length?` · PRIMARY ${esc(moves.map(m=>`${m.movement_number} ${String(m.status||"").replaceAll("_"," ")}`).join(", "))}`:""}${unitTransportDestinationLabel(unit)?` → ${esc(unitTransportDestinationLabel(unit))}`:""}</span>`;
+        return `<span class="command-unit-chip ${link.cad_priority_override&&moves.length?"command-unit-diverted":""}"><strong>${esc(unit.name)}</strong> · ${link.cad_priority_override&&moves.length?"PRIORITY ":""}CAD ${esc(cadAssignmentStatus({incident:i,link},unit).replaceAll("_"," "))}${moves.length?` · ${link.cad_priority_override?"MOVE":"PRIMARY"} ${esc(moves.map(m=>`${m.movement_number} ${movementStatusLabel(m.status)}`).join(", "))}`:""}${unitTransportDestinationLabel(unit)?` → ${esc(unitTransportDestinationLabel(unit))}`:""}</span>`;
       }).filter(Boolean).join("");
 
     return `<div class="command-call-card ${commandPriorityClass(i.priority)}">
@@ -8144,7 +8266,9 @@ function fieldAssignmentSignature(row){
     row.acknowledged_at||"",
     row.cad_status||"",
     row.cad_status_updated_at||"",
-    row.cleared_at||""
+    row.cleared_at||"",
+    row.cad_priority_override?"P":"",
+    row.cad_priority_acknowledged_at||""
   ].join("|");
 }
 
@@ -8160,7 +8284,7 @@ async function syncFieldAssignment(unitId){
   try{
     const [assignmentResult,moveResult]=await Promise.all([
       supabase.from("incident_units")
-        .select("incident_id,assigned_at,acknowledged_at,cleared_at,cad_status,cad_status_updated_at")
+        .select("incident_id,assigned_at,acknowledged_at,cleared_at,cad_status,cad_status_updated_at,cad_priority_override,cad_priority_acknowledged_at")
         .eq("unit_id",unitId)
         .is("cleared_at",null)
         .order("assigned_at",{ascending:false})
@@ -8310,10 +8434,15 @@ async function fieldUnitCad(){
     try{emsState=await loadFieldEmsState(S.eventId,fs.unit_id,incident?.id||null,{hasEms:true,areas:fieldTreatmentAreas});}catch(err){console.error("Field EMS panel failed to load",err);}
   }
 
-  const moveNeedsAck=!!logisticsState?.movements?.some(m=>!m.driver_acknowledged_at);
+  const moveNeedsAck=!!logisticsState?.movements?.some(m=>!m.driver_acknowledged_at&&m.status!=="HELD");
   const moveSignature=(logisticsState?.movements||[]).map(m=>[m.id,m.status,m.assigned_at,m.driver_acknowledged_at,m.updated_at].join("|")).join(";");
   S.fieldAssignmentSignature=`${fieldAssignmentSignature(a)}||${moveSignature}`;
-  setFieldTaskAlerts({cad:assignmentNeedsAck,move:moveNeedsAck});
+  const hasMoves=!!logisticsState?.movements?.length;
+  const cadIsPriority=!!(incident&&a?.cad_priority_override&&hasMoves);
+  const priorityNeedsAck=cadIsPriority&&!a.cad_priority_acknowledged_at;
+  const cadIsSecondary=hasMoves&&!cadIsPriority;
+  if(logisticsState)logisticsState.cadPriority=cadIsPriority?{incidentNumber:incident.incident_number}:null;
+  setFieldTaskAlerts({cad:assignmentNeedsAck||priorityNeedsAck,move:moveNeedsAck});
 
   const fieldIsAmbulance=!!(emsState?.config?.active&&(emsState.config.ems_role==="ambulance"||emsState.config.transport_capable));
   const cadTaskStatus=incident?(a?.cad_status||"ASSIGNED"):fs.units?.status;
@@ -8339,11 +8468,19 @@ async function fieldUnitCad(){
       <div class="small field-operational-period-line">Operational Period: <strong>${esc(fs.operational_periods?.name||"Active")}</strong>${fs.operational_periods?.incident_prefix?` · <span class="mono">${esc(fs.operational_periods.incident_prefix)}</span>`:""}</div>
     </div>`,
 
-    current_call:incident?`<div class="card assignment ${assignmentNeedsAck?"field-assignment-card-pending":""}">
-      ${logisticsState?.movements?.length?`<div class="small task-priority-label field-secondary-cad-label">SECONDARY CAD ASSIGNMENT</div>`:""}
+    current_call:incident?`<div class="card assignment ${assignmentNeedsAck||priorityNeedsAck?"field-assignment-card-pending":""}">
+      ${cadIsPriority?`<div class="small task-priority-label field-priority-cad-label">⇅ PRIORITY CAD ASSIGNMENT · DISPATCH DIVERTED YOU FROM YOUR MOVE</div>`:cadIsSecondary?`<div class="small task-priority-label field-secondary-cad-label">SECONDARY CAD ASSIGNMENT</div>`:""}
+      ${priorityNeedsAck&&!assignmentNeedsAck?`<div class="field-new-assignment" role="alert" aria-live="assertive">
+        <div>
+          <div class="field-new-assignment-kicker">PRIORITY CHANGE</div>
+          <strong>Dispatch prioritized ${esc(incident.incident_number)} over your MOVE${(logisticsState?.movements?.length||0)===1?"":"S"}</strong>
+          <div class="small">${a?.cad_priority_set_at?`Set ${dateTime24(a.cad_priority_set_at,{seconds:true})}. `:""}${logisticsState?.movements?.some(m=>m.status==="HELD")?"Your MOVE is on hold and will resume when this ticket closes.":"Your MOVE keeps its status; this ticket comes first."} Acknowledge the change.</div>
+        </div>
+        <button class="btn field-acknowledge-button" id="fieldAcknowledgePriority">ACKNOWLEDGE</button>
+      </div>`:""}
       ${assignmentNeedsAck?`<div class="field-new-assignment" role="alert" aria-live="assertive">
         <div>
-          <div class="field-new-assignment-kicker">${logisticsState?.movements?.length?"NEW SECONDARY CAD ASSIGNMENT":"NEW ASSIGNMENT"}</div>
+          <div class="field-new-assignment-kicker">${cadIsPriority?"NEW PRIORITY CAD ASSIGNMENT":cadIsSecondary?"NEW SECONDARY CAD ASSIGNMENT":"NEW ASSIGNMENT"}</div>
           <strong>${esc(incident.incident_number)} · ${esc(incident.call_type)}</strong>
           <div class="small">Assigned ${a?.assigned_at?dateTime24(a.assigned_at,{seconds:true}):"just now"}. Acknowledge receipt of this call.</div>
         </div>
@@ -8356,7 +8493,7 @@ async function fieldUnitCad(){
       <p>${esc(incident.notes||"")}</p>
       ${fieldLayer&&incident.map_x!=null&&incident.map_y!=null?`<button class="btn secondary block" id="viewFieldMap">View Call &amp; My Location</button>`:""}
       <div id="fieldMapHolder"></div>
-    </div>`:logisticsState?.movements?.length?`<div class="card"><div class="small task-priority-label">SECONDARY CAD ASSIGNMENT</div><strong>No CAD incident assigned</strong><p class="muted">The MOVE assignment(s) above remain this unit's primary task.</p></div>`:`<div class="card"><strong>No current CAD assignment</strong><p class="muted">Remain available for dispatch.</p></div>`,
+    </div>`:hasMoves?`<div class="card"><div class="small task-priority-label">SECONDARY CAD ASSIGNMENT</div><strong>No CAD incident assigned</strong><p class="muted">The MOVE assignment(s) above remain this unit's primary task.</p></div>`:`<div class="card"><strong>No current CAD assignment</strong><p class="muted">Remain available for dispatch.</p></div>`,
 
     guest_logistics:fieldLogisticsPanelHtml(logisticsState),
 
@@ -8389,7 +8526,7 @@ async function fieldUnitCad(){
     ems_patient_flow:fieldHasEms?fieldEmsPanelHtml(emsState,incident):"",
 
     status_controls:incident?`<div class="field-status-layout-block card cad-task-status-card">
-      <div class="row"><div class="section-title">${logisticsState?.movements?.length?"SECONDARY CAD STATUS":"CAD TICKET STATUS"}</div><span class="badge cad-task-status-badge">${esc(String(cadTaskStatus||"ASSIGNED").replaceAll("_"," "))}</span></div>
+      <div class="row"><div class="section-title">${cadIsPriority?"PRIORITY CAD STATUS":cadIsSecondary?"SECONDARY CAD STATUS":"CAD TICKET STATUS"}</div><span class="badge cad-task-status-badge">${esc(String(cadTaskStatus||"ASSIGNED").replaceAll("_"," "))}</span></div>
       <div class="status-buttons">${statuses.map(status=>`<button class="btn field-status-button ${fieldStatusColorClass(status)} ${status===cadTaskStatus?"field-status-active":""}" data-cad-status="${esc(status)}" aria-pressed="${status===cadTaskStatus?"true":"false"}">${esc(status.replaceAll("_"," "))}</button>`).join("")}</div>
       <div class="small muted">Available / Clear / Complete closes ${esc(incident.incident_number)} and releases all units still committed to the ticket.${logisticsState?.movements?.length?" MOVE status remains independent.":""}</div>
     </div>`:logisticsState?.movements?.length?"":standaloneUnitStatuses.length?`<div class="field-status-layout-block card standalone-unit-status-card">
@@ -8450,10 +8587,13 @@ async function fieldUnitCad(){
   };
 
   const enabledFieldBlocks=fieldLayout.blocks.filter(block=>block.enabled&&(fieldHasEms||!['ems_patient_flow','transport_destination'].includes(block.id)));
-  if(logisticsState?.movements?.length){
+  if(hasMoves){
+    // MOVE first by default; a dispatcher priority override flips the order.
+    const first=cadIsPriority?"current_call":"guest_logistics";
+    const second=cadIsPriority?"guest_logistics":"current_call";
     enabledFieldBlocks.sort((a,b)=>{
-      if(a.id==="guest_logistics"&&b.id==="current_call")return -1;
-      if(a.id==="current_call"&&b.id==="guest_logistics")return 1;
+      if(a.id===first&&b.id===second)return -1;
+      if(a.id===second&&b.id===first)return 1;
       return 0;
     });
   }
@@ -8561,6 +8701,20 @@ async function fieldUnitCad(){
     }
 
     setFieldTaskAlerts({cad:false,move:moveNeedsAck});
+    await fieldUnitCad();
+  });
+
+  document.querySelector("#fieldAcknowledgePriority")?.addEventListener("click",async()=>{
+    if(!incident||!a)return;
+    const button=document.querySelector("#fieldAcknowledgePriority");
+    button.disabled=true;
+    button.textContent="ACKNOWLEDGING…";
+    const {error}=await supabase.rpc("field_acknowledge_cad_priority",{p_field_session_id:fs.id,p_incident_id:incident.id});
+    if(error){
+      button.disabled=false;
+      button.textContent="ACKNOWLEDGE";
+      return alert(error.message);
+    }
     await fieldUnitCad();
   });
 
@@ -9376,7 +9530,10 @@ function dispatchTaskSnapshotSignature(rows){
     row.status||"",
     row.assigned_at||"",
     row.acknowledged_at||"",
-    row.updated_at||""
+    row.updated_at||"",
+    row.priority_override?"P":"",
+    row.priority_acknowledged_at||"",
+    row.held_from_status||""
   ].join("|")).sort().join("\n");
 }
 
@@ -9415,6 +9572,8 @@ function mergeDispatcherTaskSnapshot(rows){
       if((link.acknowledged_at||null)!==(row.acknowledged_at||null)){link.acknowledged_at=row.acknowledged_at||null;changed=true;}
       if((link.assigned_at||null)!==(row.assigned_at||null)){link.assigned_at=row.assigned_at||link.assigned_at;changed=true;}
       if((link.cad_status_updated_at||null)!==(row.updated_at||null)){link.cad_status_updated_at=row.updated_at||null;changed=true;}
+      if(!!link.cad_priority_override!==!!row.priority_override){link.cad_priority_override=!!row.priority_override;changed=true;}
+      if((link.cad_priority_acknowledged_at||null)!==(row.priority_acknowledged_at||null)){link.cad_priority_acknowledged_at=row.priority_acknowledged_at||null;changed=true;}
     }
   }
   for(const key of cadByKey.keys()){
@@ -9435,6 +9594,8 @@ function mergeDispatcherTaskSnapshot(rows){
     if((movement.assigned_at||null)!==(row.assigned_at||null)){movement.assigned_at=row.assigned_at||null;changed=true;}
     if((movement.driver_acknowledged_at||null)!==(row.acknowledged_at||null)){movement.driver_acknowledged_at=row.acknowledged_at||null;changed=true;}
     if((movement.updated_at||null)!==(row.updated_at||null)){movement.updated_at=row.updated_at||null;changed=true;}
+    if((movement.held_from_status||null)!==(row.held_from_status||null)){movement.held_from_status=row.held_from_status||null;changed=true;}
+    if((movement.held_by_incident_id||null)!==(row.held_by_incident_id||null)){movement.held_by_incident_id=row.held_by_incident_id||null;changed=true;}
   }
   for(const id of moveById.keys()){
     if(!localMoveIds.has(id)){structuralMismatch=true;break;}
@@ -9501,6 +9662,9 @@ function applyDispatcherIncidentUnitRealtime(payload){
     link.cad_status_updated_at=row.cad_status_updated_at||link.cad_status_updated_at||null;
     link.acknowledged_at=row.acknowledged_at||null;
     link.assigned_at=row.assigned_at||link.assigned_at;
+    if("cad_priority_override" in row)link.cad_priority_override=!!row.cad_priority_override;
+    if("cad_priority_acknowledged_at" in row)link.cad_priority_acknowledged_at=row.cad_priority_acknowledged_at||null;
+    if("cad_priority_set_at" in row)link.cad_priority_set_at=row.cad_priority_set_at||null;
     refreshDispatchBoards();
     refreshOpenDispatchTaskView();
     return;

@@ -90,7 +90,7 @@ function movementTypeLabel(type){
   })[type]||String(type||"Movement").replaceAll("_"," ");
 }
 
-function movementStatusLabel(status){
+export function movementStatusLabel(status){
   return ({
     SCHEDULED:"Scheduled",
     READY:"Ready",
@@ -99,10 +99,41 @@ function movementStatusLabel(status){
     AT_PICKUP:"At Pickup",
     PASSENGER_ONBOARD:"Guest On Board",
     EN_ROUTE_DESTINATION:"En Route to Destination",
+    HELD:"On Hold",
     COMPLETE:"Complete",
     NO_SHOW:"No Show",
     CANCELLED:"Cancelled"
   })[status]||String(status||"").replaceAll("_"," ");
+}
+
+const UNDERWAY_STATUSES=new Set(["EN_ROUTE_PICKUP","AT_PICKUP","PASSENGER_ONBOARD","EN_ROUTE_DESTINATION"]);
+const RISK_ACK_GRACE_MS=3*60*1000;
+const RISK_LEAD_MS=15*60*1000;
+
+/* LATE / AT-RISK evaluation for a MOVE. Returns null when on track.
+   - LATE: scheduled time has passed and the guest has not been picked up.
+   - AT RISK: pickup is within 15 minutes with no driver, the driver has not
+     acknowledged within 3 minutes of assignment, or the MOVE is on hold while
+     its pickup time is near/past. */
+export function movementRisk(m,now=Date.now()){
+  if(!m||TERMINAL_STATUSES.has(m.status))return null;
+  const scheduled=new Date(m.scheduled_at||0).getTime();
+  if(!Number.isFinite(scheduled)||!scheduled)return null;
+  const pickedUp=["PASSENGER_ONBOARD","EN_ROUTE_DESTINATION"].includes(m.status);
+  if(pickedUp)return null;
+  const minutesLate=Math.floor((now-scheduled)/60000);
+  if(now>scheduled){
+    if(m.status==="HELD")return {level:"late",label:`HELD · ${minutesLate}m LATE`};
+    if(m.status==="AT_PICKUP")return {level:"risk",label:"WAITING AT PICKUP"};
+    return {level:"late",label:minutesLate>=1?`${minutesLate}m LATE`:"LATE"};
+  }
+  const soon=scheduled-now<=RISK_LEAD_MS;
+  if(m.status==="HELD"&&soon)return {level:"risk",label:"HELD · PICKUP SOON"};
+  if(["SCHEDULED","READY"].includes(m.status)&&!m.assigned_unit_id&&soon)return {level:"risk",label:"NO DRIVER"};
+  if(m.assigned_unit_id&&!m.driver_acknowledged_at&&m.status!=="HELD"&&m.assigned_at&&now-new Date(m.assigned_at).getTime()>RISK_ACK_GRACE_MS){
+    return {level:"risk",label:"NO DRIVER ACK"};
+  }
+  return null;
 }
 
 function movementStatusClass(status){
@@ -322,22 +353,51 @@ function movementsForUnit(unitId,movements,currentId=null){
     .sort((a,b)=>new Date(a.scheduled_at||0).getTime()-new Date(b.scheduled_at||0).getTime());
 }
 
+function heldByLabel(movement,ctx){
+  const incident=(ctx?.incidents||[]).find(i=>i.id===movement.held_by_incident_id);
+  return incident?`HELD FOR ${incident.incident_number}`:"HELD";
+}
+
+/* Driver suggestion. Units are ranked for THIS movement's pickup time:
+   0 free now · 1 has a later MOVE that does not conflict · 2 has a CAD ticket
+   · 3 has a MOVE within 45 minutes of this pickup · 4 underway / out of
+   service / diverted. The dropdown is grouped so the best choices are first. */
+function rankDriverUnit(unit,ctx,movements,movement){
+  const cad=activeCadAssignment(unit.id,ctx);
+  const cadLink=cad?(cad.incident_units||[]).find(l=>l.unit_id===unit.id&&!l.cleared_at):null;
+  const otherMoves=movementsForUnit(unit.id,movements,movement.id);
+  const underway=otherMoves.find(m=>UNDERWAY_STATUSES.has(m.status));
+  const target=new Date(movement.scheduled_at||0).getTime();
+  const conflict=otherMoves.find(m=>Math.abs(new Date(m.scheduled_at||0).getTime()-target)<=45*60*1000);
+  const parts=[];
+  let rank=0,group="Free now";
+
+  if(unit.status==="OUT_OF_SERVICE"){rank=4;group="Not available";parts.push("OUT OF SERVICE");}
+  else if(underway){rank=4;group="Not available";parts.push(`underway on ${underway.movement_number}`);}
+  else if(cadLink?.cad_priority_override){rank=4;group="Not available";parts.push(`diverted to CAD ${cad.incident_number}`);}
+  else if(conflict){rank=3;group="Schedule conflict";parts.push(`${conflict.movement_number} at ${time24(conflict.scheduled_at)}`);}
+  else if(cad){rank=2;group="On a CAD ticket";parts.push(`CAD ${cad.incident_number} · ${String(cadLink?.cad_status||"ASSIGNED").replaceAll("_"," ")}`);}
+  else if(otherMoves.length){rank=1;group="Has later MOVEs";parts.push(`${otherMoves.length} other MOVE${otherMoves.length===1?"":"S"}`);}
+  else parts.push(String(unit.status||"AVAILABLE").replaceAll("_"," "));
+
+  if(unit.id===movement.assigned_unit_id){rank=-1;group="Current driver";}
+  return {rank,group,label:`${unit.name} · ${parts.join(" · ")}`};
+}
+
 function driverUnitOptions(ctx,movements,movement){
   const logisticsDeptIds=new Set(logisticsDepartments(ctx).map(d=>d.id));
-  return (ctx.units||[])
+  const ranked=(ctx.units||[])
     .filter(unit=>unit.active!==false&&logisticsDeptIds.has(unit.department_id))
-    .map(unit=>{
-      const cad=activeCadAssignment(unit.id,ctx);
-      const otherMoves=movementsForUnit(unit.id,movements,movement.id);
-      const underway=otherMoves.find(m=>["EN_ROUTE_PICKUP","AT_PICKUP","PASSENGER_ONBOARD","EN_ROUTE_DESTINATION"].includes(m.status));
-      const parts=[];
-      if(otherMoves.length)parts.push(`${otherMoves.length} other MOVE${otherMoves.length===1?"":"S"}${underway?` · underway ${underway.movement_number}`:""}`);
-      if(cad)parts.push(`secondary CAD ${cad.incident_number}`);
-      if(!parts.length)parts.push(String(unit.status||"").replaceAll("_"," "));
-      const suffix=` · ${parts.join(" · ")}`;
-      return `<option value="${unit.id}" ${unit.id===movement.assigned_unit_id?"selected":""}>${esc(unit.name)}${esc(suffix)}</option>`;
-    })
-    .join("");
+    .map(unit=>({unit,...rankDriverUnit(unit,ctx,movements,movement)}))
+    .sort((a,b)=>a.rank-b.rank||a.unit.name.localeCompare(b.unit.name));
+
+  const groups=[];
+  for(const row of ranked){
+    let g=groups.find(x=>x.group===row.group);
+    if(!g){g={group:row.group,rows:[]};groups.push(g);}
+    g.rows.push(row);
+  }
+  return groups.map(g=>`<optgroup label="${esc(g.group)}">${g.rows.map(r=>`<option value="${r.unit.id}" ${r.unit.id===movement.assigned_unit_id?"selected":""}>${esc(r.label)}</option>`).join("")}</optgroup>`).join("");
 }
 
 function ensureModal(){
@@ -426,9 +486,11 @@ function movementCard(movement,ctx){
   const unit=(ctx.units||[]).find(u=>u.id===movement.assigned_unit_id);
   const department=(ctx.departments||[]).find(d=>d.id===movement.department_id);
   const flight=[movement.airline,movement.flight_number].filter(Boolean).join(" ");
-  const overdue=!TERMINAL_STATUSES.has(movement.status)&&new Date(movement.scheduled_at).getTime()<Date.now()-15*60*1000;
+  const risk=movementRisk(movement);
+  const overdue=risk?.level==="late";
+  const held=movement.status==="HELD";
 
-  return `<article class="logistics-movement-card ${overdue?"logistics-overdue":""}" data-movement-card="${movement.id}">
+  return `<article class="logistics-movement-card ${overdue?"logistics-overdue":""} ${risk?.level==="risk"?"logistics-at-risk":""} ${held?"logistics-held":""}" data-movement-card="${movement.id}">
     <div class="logistics-movement-time">
       <strong>${esc(time24(movement.scheduled_at))}</strong>
       <span>${esc(new Date(movement.scheduled_at).toLocaleDateString([],{month:"2-digit",day:"2-digit"}))}</span>
@@ -439,7 +501,8 @@ function movementCard(movement,ctx){
         <strong>${esc(movement.movement_number)}</strong>
         <span class="badge ${movementStatusClass(movement.status)}">${esc(movementStatusLabel(movement.status))}</span>
         ${movement.driver_acknowledged_at?`<span class="badge logistics-ack-badge">ACK</span>`:""}
-        ${overdue?`<span class="badge logistics-overdue-badge">PAST DUE</span>`:""}
+        ${risk?`<span class="badge risk-badge risk-${risk.level}">${esc(risk.label)}</span>`:""}
+        ${held?`<span class="badge logistics-held-badge">⇅ ${esc(heldByLabel(movement,ctx))}</span>`:""}
       </div>
       <div class="logistics-guest-line">${esc(movement.guest_name)}${movement.guest_group?` · ${esc(movement.guest_group)}`:""} · ${movement.party_size} pax</div>
       <div class="small muted">${esc(movementTypeLabel(movement.movement_type))}${flight?` · ${esc(flight)}`:""}${movement.airport?` · ${esc(movement.airport)}`:""}</div>
@@ -790,7 +853,8 @@ async function movementDetailModal(ctx,state,movementId){
       <section class="incident-info-section">
         <div class="section-title">Movement Actions</div>
         <div class="logistics-action-grid">
-          ${actions.map(([status,label,kind])=>`<button class="btn ${kind==="danger"?"danger":kind==="good"?"good":"secondary"}" data-logistics-status="${status}">${esc(label)}</button>`).join("")||`<div class="small muted">Assign a driver to continue the movement.</div>`}
+          ${movement.status==="HELD"?`<div class="notice"><strong>⇅ ${esc(heldByLabel(movement,ctx))}.</strong><br>Dispatch prioritized a CAD ticket for this driver. The MOVE resumes automatically when that ticket closes, or you can resume it now.</div><button class="btn good" id="resumeHeldMovement">Resume MOVE Now</button><button class="btn danger" data-logistics-status="CANCELLED">Cancel</button>`:""}
+          ${actions.map(([status,label,kind])=>`<button class="btn ${kind==="danger"?"danger":kind==="good"?"good":"secondary"}" data-logistics-status="${status}">${esc(label)}</button>`).join("")||(movement.status==="HELD"?"":`<div class="small muted">Assign a driver to continue the movement.</div>`)}
         </div>
       </section>
     `:""}
@@ -867,6 +931,16 @@ async function movementDetailModal(ctx,state,movementId){
 
     closeModal();
     await state.reload();
+  });
+
+  document.querySelector("#resumeHeldMovement")?.addEventListener("click",async()=>{
+    const button=document.querySelector("#resumeHeldMovement");
+    button.disabled=true;
+    button.textContent="Resuming…";
+    const {error}=await supabase.rpc("guest_logistics_resume_movement",{p_movement_id:movement.id});
+    if(error){button.disabled=false;button.textContent="Resume MOVE Now";return alert(error.message);}
+    await state.reload?.();
+    movementDetailModal(ctx,state,movement.id);
   });
 
   document.querySelectorAll("[data-logistics-status]").forEach(button=>{
@@ -1371,10 +1445,12 @@ function fieldMovementTaskHtml(movement,state,index){
   const flight=[movement.airline,movement.flight_number].filter(Boolean).join(" ");
   const underway=state?.underwayMovement?.id===movement.id;
   const queuedBehindOther=!!state?.underwayMovement&&state.underwayMovement.id!==movement.id;
-  const pendingAck=!movement.driver_acknowledged_at;
+  const held=movement.status==="HELD";
+  const pendingAck=!movement.driver_acknowledged_at&&!held;
   const actions=fieldNextActions(movement);
+  const risk=movementRisk(movement);
 
-  return `<section class="field-logistics-task ${underway?"field-logistics-task-underway":""} ${pendingAck?"field-move-card-pending":""}">
+  return `<section class="field-logistics-task ${underway?"field-logistics-task-underway":""} ${pendingAck?"field-move-card-pending":""} ${held?"field-logistics-task-held":""}">
     ${pendingAck?`<div class="field-new-move" role="alert" aria-live="assertive">
       <div>
         <div class="field-new-move-kicker">NEW MOVE ASSIGNMENT</div>
@@ -1386,10 +1462,11 @@ function fieldMovementTaskHtml(movement,state,index){
 
     <div class="row">
       <div>
-        <div class="small task-priority-label">${underway?"ACTIVE PRIMARY MOVE":index===0?"PRIMARY MOVE":"QUEUED MOVE"}</div>
+        <div class="small task-priority-label">${held?"MOVE ON HOLD":state?.cadPriority?"NEXT MOVE (SECONDARY)":underway?"ACTIVE PRIMARY MOVE":index===0?"PRIMARY MOVE":"QUEUED MOVE"}</div>
         <div class="row start">
           <strong class="big">${esc(movement.movement_number)}</strong>
           <span class="badge ${movementStatusClass(movement.status)}">${esc(movementStatusLabel(movement.status))}</span>
+          ${risk?`<span class="badge risk-badge risk-${risk.level}">${esc(risk.label)}</span>`:""}
         </div>
       </div>
       <div class="field-logistics-scheduled">
@@ -1425,7 +1502,7 @@ function fieldMovementTaskHtml(movement,state,index){
 
     ${queuedBehindOther?`<div class="notice"><strong>Queued behind ${esc(state.underwayMovement.movement_number)}.</strong><br>Only one MOVE can be underway at a time. This assignment remains queued and visible.</div>`:""}
 
-    ${pendingAck?`<div class="small field-move-status-locked">Acknowledge this MOVE before using its Field Unit status controls.</div>`:`
+    ${held?`<div class="notice"><strong>On hold by Dispatch.</strong> Complete the CAD ticket; this MOVE resumes on its own.</div>`:pendingAck?`<div class="small field-move-status-locked">Acknowledge this MOVE before using its Field Unit status controls.</div>`:`
       <div class="field-task-status-head">
         <div class="section-title">MOVE STATUS</div>
         <span class="badge ${movementStatusClass(movement.status)}">${esc(movementStatusLabel(movement.status))}</span>
@@ -1441,21 +1518,43 @@ function fieldMovementTaskHtml(movement,state,index){
   </section>`;
 }
 
+function fieldQueuedMovementHtml(movement){
+  const risk=movementRisk(movement);
+  const pendingAck=!movement.driver_acknowledged_at&&movement.status!=="HELD";
+  return `<div class="field-logistics-queue-row ${pendingAck?"field-move-card-pending":""}" data-field-queue-row="${movement.id}">
+    <div class="field-logistics-queue-time"><strong class="mono">${esc(time24(movement.scheduled_at))}</strong><span class="small">${esc(new Date(movement.scheduled_at).toLocaleDateString([],{month:"2-digit",day:"2-digit"}))}</span></div>
+    <div class="field-logistics-queue-main">
+      <div class="row start"><strong>${esc(movement.movement_number)}</strong><span class="badge ${movementStatusClass(movement.status)}">${esc(movementStatusLabel(movement.status))}</span>${risk?`<span class="badge risk-badge risk-${risk.level}">${esc(risk.label)}</span>`:""}</div>
+      <div class="small">${esc(movement.guest_name)}${movement.guest_group?` · ${esc(movement.guest_group)}`:""} · ${movement.party_size} pax</div>
+      <div class="small muted">${esc(movement.origin)} → ${esc(movement.destination)}</div>
+    </div>
+    ${pendingAck?`<button class="btn compact field-move-acknowledge-button" data-field-logistics-ack="${movement.id}">ACK</button>`:""}
+  </div>`;
+}
+
 export function fieldLogisticsPanelHtml(state){
   const movements=state?.movements||state?.upcoming||[];
   if(!movements.length)return "";
+  const cadPriority=state?.cadPriority||null;
+  const allHeld=movements.every(m=>m.status==="HELD");
+  const [primary,...queued]=movements;
 
-  return `<div class="card field-logistics-card field-logistics-stack-card">
+  return `<div class="card field-logistics-card field-logistics-stack-card ${cadPriority?"field-logistics-secondary":""}">
     <div class="row">
       <div>
-        <div class="section-title">PRIMARY TASK · GUEST LOGISTICS</div>
+        <div class="section-title">${cadPriority?`SECONDARY TASK · GUEST LOGISTICS${allHeld?" · ON HOLD":""}`:"PRIMARY TASK · GUEST LOGISTICS"}</div>
         <strong>${movements.length} assigned MOVE${movements.length===1?"":"S"}</strong>
       </div>
-      ${state?.underwayMovement?`<span class="badge logistics-primary-badge">UNDERWAY</span>`:`<span class="badge">QUEUED</span>`}
+      ${allHeld?`<span class="badge logistics-held-badge">⇅ HELD</span>`:state?.underwayMovement?`<span class="badge logistics-primary-badge">UNDERWAY</span>`:`<span class="badge">QUEUED</span>`}
     </div>
+    ${cadPriority?`<div class="notice"><strong>Dispatch prioritized ${esc(cadPriority.incidentNumber)} over your MOVE${movements.length===1?"":"S"}.</strong><br>${allHeld?"Your MOVE is on hold and resumes automatically when that ticket closes.":"Your MOVE keeps its status, but the CAD ticket comes first."}</div>`:""}
     <div class="field-logistics-task-stack">
-      ${movements.map((movement,index)=>fieldMovementTaskHtml(movement,state,index)).join("")}
+      ${fieldMovementTaskHtml(primary,state,0)}
     </div>
+    ${queued.length?`<div class="field-logistics-queue">
+      <div class="section-title">UPCOMING · ${queued.length} MORE</div>
+      ${queued.map(fieldQueuedMovementHtml).join("")}
+    </div>`:""}
   </div>`;
 }
 
