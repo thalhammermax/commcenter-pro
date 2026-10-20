@@ -5494,3 +5494,20 @@ body.field-dual-task-alert::after{
 .priority-kind-move{border-color:#6366f1}
 .command-move-card.diverted{border-color:#f59e0b}
 @media (max-width:720px){.logistics-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}}
+
+/* ============================================================
+   v0.19.0 — Per-unit task queue
+   ============================================================ */
+.badge.queue-badge{background:#1f2937;border-color:#475569;color:#cbd5e1;letter-spacing:.05em}
+.badge.queue-badge.current{background:#14532d;border-color:#22c55e;color:#bbf7d0}
+.queue-pos{display:inline-block;min-width:1.8em;font-weight:700;color:#93c5fd;font-family:ui-monospace,monospace}
+.unit-queue{margin-top:6px;padding-top:6px;border-top:1px dashed var(--cc-line,#2c4258)}
+.unit-queue-row{display:flex;gap:6px;align-items:baseline;padding:2px 0;opacity:.9}
+.unit-button.unit-has-queue{box-shadow:inset 3px 0 0 #60a5fa}
+.queue-controls{display:inline-flex;gap:4px;align-items:center}
+.queue-controls .btn.compact{padding:4px 8px}
+.unit-queue-section .unit-move-row{align-items:center}
+.field-current-task-label{color:#bbf7d0;background:#14532d;border:1px solid #22c55e;border-radius:6px;padding:4px 8px;display:inline-block;margin-bottom:6px}
+.field-queued-task-label{color:#cbd5e1;background:#1f2937;border:1px solid #475569;border-radius:6px;padding:4px 8px;display:inline-block;margin-bottom:6px}
+.card.assignment.field-task-queued{opacity:.85;border-style:dashed}
+.command-unit-chip.command-unit-queued{opacity:.75;border-style:dashed}

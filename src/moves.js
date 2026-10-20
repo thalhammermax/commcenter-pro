@@ -99,6 +99,7 @@ export function moveFromIncident(incident){
     assigned_at:link?.assigned_at||null,
     driver_acknowledged_at:link?.acknowledged_at||null,
     is_primary:!!link?.is_primary,
+    queue_position:link?.queue_position||null,
     primary_acknowledged_at:link?.primary_acknowledged_at||null,
     updated_at:link?.cad_status_updated_at||incident.activated_at||incident.created_at
   };
@@ -368,7 +369,7 @@ function moveCard(m,ctx){
         ${m.incident_status==="OPEN"?`<span class="badge">ACTIVE</span>`:""}
         ${m.driver_acknowledged_at?`<span class="badge logistics-ack-badge">ACK</span>`:""}
         ${risk?`<span class="badge risk-badge risk-${risk.level}">${esc(risk.label)}</span>`:""}
-        ${m.link&&!m.is_primary?`<span class="badge unit-diverted-badge">SECONDARY</span>`:""}
+        ${m.link&&m.incident_status==="OPEN"?(m.is_primary?`<span class="badge queue-badge current">CURRENT</span>`:`<span class="badge queue-badge">QUEUED #${m.queue_position||"?"}</span>`):""}
       </div>
       <div class="logistics-guest-line">${esc(m.guest_name)}${m.guest_group?` · ${esc(m.guest_group)}`:""} · ${m.party_size} pax</div>
       <div class="small muted">${esc(movementTypeLabel(m.movement_type))}${flight?` · ${esc(flight)}`:""}${m.airport?` · ${esc(m.airport)}`:""}</div>
@@ -457,7 +458,7 @@ export async function renderGuestLogistics(app,ctx){
 
 export async function loadFieldLogisticsState(eventId,unitId){
   const {data,error}=await supabase.from("incident_units")
-    .select("id,incident_id,unit_id,assigned_at,acknowledged_at,cleared_at,cad_status,cad_status_updated_at,is_primary,primary_set_at,primary_acknowledged_at,incidents!inner(id,event_id,incident_number,incident_kind,call_type,priority,status,scheduled_at,activated_at,notes,landmark,incident_guest_details(*))")
+    .select("id,incident_id,unit_id,assigned_at,acknowledged_at,cleared_at,cad_status,cad_status_updated_at,is_primary,queue_position,primary_set_at,primary_acknowledged_at,incidents!inner(id,event_id,incident_number,incident_kind,call_type,priority,status,scheduled_at,activated_at,notes,landmark,incident_guest_details(*))")
     .eq("unit_id",unitId)
     .is("cleared_at",null)
     .eq("incidents.incident_kind","MOVE")
@@ -467,11 +468,11 @@ export async function loadFieldLogisticsState(eventId,unitId){
     const incident={...link.incidents,incident_units:[{...link,incidents:undefined}]};
     return moveFromIncident(incident);
   }).filter(Boolean).sort((a,b)=>{
-    const ud=Number(MOVE_UNDERWAY_STATUSES.has(b.status))-Number(MOVE_UNDERWAY_STATUSES.has(a.status));
-    if(ud)return ud;
+    const cur=Number(!!b.is_primary&&b.incident_status==="OPEN")-Number(!!a.is_primary&&a.incident_status==="OPEN");
+    if(cur)return cur;
     const ad=Number(b.incident_status==="OPEN")-Number(a.incident_status==="OPEN");
     if(ad)return ad;
-    return new Date(a.scheduled_at||0)-new Date(b.scheduled_at||0);
+    return (a.queue_position||999)-(b.queue_position||999)||(new Date(a.scheduled_at||0)-new Date(b.scheduled_at||0));
   });
   const underwayMovement=rows.find(m=>MOVE_UNDERWAY_STATUSES.has(m.status))||null;
   return {current:underwayMovement||rows[0]||null,underway:!!underwayMovement,underwayMovement,movements:rows,upcoming:rows};
@@ -483,12 +484,14 @@ function fieldMoveActions(move){
 
 function fieldMovementTaskHtml(move,state,index){
   const flight=[move.airline,move.flight_number].filter(Boolean).join(" ");
-  const underway=state?.underwayMovement?.id===move.id;
-  const queuedBehindOther=!!state?.underwayMovement&&state.underwayMovement.id!==move.id;
+  const isCurrent=!!move.is_primary&&move.incident_status==="OPEN";
+  const underway=isCurrent&&MOVE_UNDERWAY_STATUSES.has(move.status);
+  const queuedBehindOther=!isCurrent;
   const pendingAck=!move.driver_acknowledged_at;
   const actions=fieldMoveActions(move);
   const risk=movementRisk(move);
   const scheduledOnly=move.incident_status==="SCHEDULED";
+  const currentTask=state?.currentTask||null;
   return `<section class="field-logistics-task ${underway?"field-logistics-task-underway":""} ${pendingAck?"field-move-card-pending":""}">
     ${pendingAck?`<div class="field-new-move" role="alert" aria-live="assertive">
       <div><div class="field-new-move-kicker">NEW MOVE ASSIGNMENT</div>
@@ -498,7 +501,7 @@ function fieldMovementTaskHtml(move,state,index){
     </div>`:`<div class="field-move-acknowledged"><span class="badge">ACKNOWLEDGED${move.driver_acknowledged_at?` · ${esc(time24(move.driver_acknowledged_at))}`:""}</span></div>`}
     <div class="row">
       <div>
-        <div class="small task-priority-label">${state?.cadPriority?"NEXT MOVE (SECONDARY)":underway?"ACTIVE PRIMARY MOVE":scheduledOnly?"SCHEDULED MOVE":index===0?"PRIMARY MOVE":"QUEUED MOVE"}</div>
+        <div class="small task-priority-label ${isCurrent?"field-current-task-label":"field-queued-task-label"}">${isCurrent?"CURRENT TASK · MOVE":scheduledOnly?`SCHEDULED MOVE${move.queue_position?` · QUEUE #${move.queue_position}`:""}`:`QUEUED #${move.queue_position||"?"} · MOVE${currentTask&&currentTask.id!==move.id?` · current: ${esc(currentTask.number)}`:""}`}</div>
         <div class="row start"><strong class="big">${esc(move.movement_number)}</strong><span class="badge ${movementStatusClass(move.status)}">${esc(movementStatusLabel(move.status))}</span>${risk?`<span class="badge risk-badge risk-${risk.level}">${esc(risk.label)}</span>`:""}</div>
       </div>
       <div class="field-logistics-scheduled"><span>Scheduled</span><strong class="mono">${esc(dateTime24(move.scheduled_at))}</strong></div>
@@ -508,12 +511,12 @@ function fieldMovementTaskHtml(move,state,index){
     ${flight||move.airport||move.terminal?`<div class="small field-logistics-flight">${flight?`<strong>${esc(flight)}</strong>`:""}${move.airport?` · ${esc(move.airport)}`:""}${move.terminal?` · Terminal ${esc(move.terminal)}`:""}</div>`:""}
     ${move.contact_phone?`<a class="btn secondary compact field-logistics-contact" href="tel:${esc(move.contact_phone)}">Call Guest / Contact</a>`:""}
     ${move.notes?`<div class="notice">${esc(move.notes)}</div>`:""}
-    ${queuedBehindOther?`<div class="notice"><strong>Queued behind ${esc(state.underwayMovement.movement_number)}.</strong><br>Only one MOVE can be underway at a time.</div>`:""}
+    ${queuedBehindOther&&!scheduledOnly?`<div class="notice"><strong>Queued${currentTask?` behind ${esc(currentTask.number)}`:""}.</strong><br>Status controls unlock when this MOVE becomes your current task.</div>`:""}
     ${pendingAck?`<div class="small field-move-status-locked">Acknowledge this MOVE before using its status controls.</div>`:`
       <div class="field-task-status-head"><div class="section-title">MOVE STATUS</div><span class="badge ${movementStatusClass(move.status)}">${esc(movementStatusLabel(move.status))}</span></div>
       ${scheduledOnly?`<div class="small muted">This MOVE activates automatically before pickup. Starting En Route early activates it now.</div>`:""}
       <div class="logistics-action-grid field-logistics-actions">
-        ${queuedBehindOther?`<div class="small muted">Status controls become available when the active MOVE is completed.</div>`
+        ${queuedBehindOther?`<div class="small muted">Status controls become available when this MOVE is your current task.</div>`
           :actions.map(([status,label,kind])=>`<button class="btn ${kind==="danger"?"danger":"good"}" data-field-logistics-status="${status}" data-movement-id="${move.id}">${esc(label)}</button>`).join("")||`<div class="small muted">No MOVE status action is available.</div>`}
       </div>`}
   </section>`;
@@ -536,14 +539,13 @@ function fieldQueuedMovementHtml(move){
 export function fieldLogisticsPanelHtml(state){
   const movements=state?.movements||[];
   if(!movements.length)return "";
-  const cadPriority=state?.cadPriority||null;
   const [primary,...queued]=movements;
-  return `<div class="card field-logistics-card field-logistics-stack-card ${cadPriority?"field-logistics-secondary":""}">
+  const currentIsMove=!!primary.is_primary&&primary.incident_status==="OPEN";
+  return `<div class="card field-logistics-card field-logistics-stack-card ${currentIsMove?"":"field-logistics-secondary"}">
     <div class="row">
-      <div><div class="section-title">${cadPriority?"SECONDARY TASK · GUEST LOGISTICS":"PRIMARY TASK · GUEST LOGISTICS"}</div><strong>${movements.length} assigned MOVE${movements.length===1?"":"S"}</strong></div>
-      ${state?.underwayMovement?`<span class="badge logistics-primary-badge">UNDERWAY</span>`:`<span class="badge">QUEUED</span>`}
+      <div><div class="section-title">${currentIsMove?"CURRENT TASK · GUEST LOGISTICS":"GUEST LOGISTICS · QUEUED"}</div><strong>${movements.length} assigned MOVE${movements.length===1?"":"S"}</strong></div>
+      ${currentIsMove&&MOVE_UNDERWAY_STATUSES.has(primary.status)?`<span class="badge logistics-primary-badge">UNDERWAY</span>`:`<span class="badge">${currentIsMove?"CURRENT":"QUEUED"}</span>`}
     </div>
-    ${cadPriority?`<div class="notice"><strong>Dispatch prioritized ${esc(cadPriority.incidentNumber)} over your MOVE${movements.length===1?"":"S"}.</strong><br>Your MOVE keeps its status, but the CAD ticket comes first.</div>`:""}
     <div class="field-logistics-task-stack">${fieldMovementTaskHtml(primary,state,0)}</div>
     ${queued.length?`<div class="field-logistics-queue"><div class="section-title">UPCOMING · ${queued.length} MORE</div>${queued.map(fieldQueuedMovementHtml).join("")}</div>`:""}
   </div>`;
