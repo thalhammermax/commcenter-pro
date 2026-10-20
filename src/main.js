@@ -8,7 +8,7 @@ import { pixelToGeo, pixelToLeaflet, leafletToPixel, geoToPixel, distanceMeters 
 import { saveOfflineEvent, getOfflineEvent } from "./offlineStore.js";
 import { renderEmsOps, renderEmsAdmin, renderTreatmentAreaFlow, loadFieldEmsState, fieldEmsPanelHtml, bindFieldEmsPanel, renderDispatchIncidentTreatmentPanel, TREATMENT_LAYOUT_BLOCKS, defaultTreatmentLayoutConfig, normalizeTreatmentLayoutConfig } from "./ems.js";
 import { loadVenueChoices, applyVenueVersionToEvent, saveEventToVenueLibrary, renderVenueLibrary } from "./venueLibrary.js";
-import { renderGuestLogistics, loadFieldLogisticsState, fieldLogisticsPanelHtml, bindFieldLogisticsPanel, movementRisk, movementStatusLabel } from "./logistics.js";
+import { renderGuestLogistics, loadFieldLogisticsState, fieldLogisticsPanelHtml, bindFieldLogisticsPanel, movementRisk, movementStatusLabel, movementStatusClass, movementTypeLabel, moveFromIncident, moveStatusActions, setMoveStatus, moveFormModal } from "./moves.js";
 import { renderUnitStaffing } from "./staffing.js";
 
 const app=document.querySelector("#app");
@@ -93,6 +93,16 @@ const IDX={
 
 function markIndexesDirty(){IDX.dirty=true;}
 
+/* MOVE tickets are incidents; the flat "movement" shape every board renders
+   is derived here whenever incident data changes. */
+function refreshMoveAdapter(){
+  S.guestLogisticsMovements=(S.incidents||[])
+    .filter(i=>i.incident_kind==="MOVE"&&i.status!=="CLOSED")
+    .map(moveFromIncident)
+    .filter(Boolean);
+  markIndexesDirty();
+}
+
 function idx(){
   const r=IDX.refs;
   if(
@@ -115,17 +125,22 @@ function rebuildIndexes(){
   IDX.periodsById=byId(S.operationalPeriods);
   IDX.treatmentAreasById=byId(S.treatmentAreas);
   IDX.poisById=byId(S.pois);
+  IDX.movesById=byId(S.guestLogisticsMovements);
   IDX.locationsByUnit=byId(S.unitLocations,"unit_id");
 
+  IDX.movesById=byId(S.guestLogisticsMovements);
   IDX.emsConfigByUnit=new Map();
   for(const c of S.emsUnitConfigs||[])if(c?.unit_id&&c.active)IDX.emsConfigByUnit.set(c.unit_id,c);
 
-  // First open (not cleared) assignment per unit, in incident board order.
+  // The unit's open CAD-kind assignment (MOVE tickets are indexed separately
+  // through the move adapter). Primary first, then most recent.
   IDX.assignmentByUnit=new Map();
   for(const incident of S.incidents||[]){
+    if(incident.incident_kind==="MOVE"||incident.status!=="OPEN")continue;
     for(const link of incident.incident_units||[]){
-      if(link.cleared_at||IDX.assignmentByUnit.has(link.unit_id))continue;
-      IDX.assignmentByUnit.set(link.unit_id,{incident,link});
+      if(link.cleared_at)continue;
+      const existing=IDX.assignmentByUnit.get(link.unit_id);
+      if(!existing||(link.is_primary&&!existing.link.is_primary))IDX.assignmentByUnit.set(link.unit_id,{incident,link});
     }
   }
 
@@ -849,7 +864,28 @@ function dispatchPrimaryActionsHtml(){
   `;
 }
 
+function dispatchMoveStripHtml(){
+  if(!dispatchHasGuestLogisticsEnabled())return "";
+  const scope=new Set(S.dispatchDepartmentIds||[]);
+  const moves=(S.guestLogisticsMovements||[]).filter(m=>scope.has(m.department_id));
+  if(!moves.length)return "";
+  const scheduled=moves.filter(m=>m.incident_status==="SCHEDULED").sort((a,b)=>new Date(a.scheduled_at)-new Date(b.scheduled_at));
+  const active=moves.filter(m=>m.incident_status==="OPEN");
+  const risk=moves.filter(m=>movementRisk(m)).length;
+  const next=scheduled[0];
+  return `<button class="dispatch-move-strip" id="dispatchMoveStripBtn" title="Open Guest Logistics">
+    <span><strong>MOVES</strong> · ${active.length} active · ${scheduled.length} scheduled${risk?` · <span class="risk-risk-text">${risk} at risk</span>`:""}</span>
+    ${next?`<span class="small">Next ${esc(time24(next.scheduled_at))} ${esc(next.movement_number)} · ${esc(next.guest_name)}${next.assigned_unit_id?"":" · <em>no driver</em>"}</span>`:""}
+  </button>`;
+}
+
+function bindDispatchMoveStrip(){
+  const btn=document.querySelector("#dispatchMoveStripBtn");
+  if(btn)btn.onclick=()=>guestLogisticsPage();
+}
+
 function bindDispatchPrimaryActions(){
+  bindDispatchMoveStrip();
   document.querySelector("#newIncident")?.addEventListener("click",()=>{
     if(!S.activeOperationalPeriod)return alert("No Operational Period is active. Event Admin must activate one before creating a call.");
     incidentForm(null);
@@ -1538,8 +1574,7 @@ async function loadCommandDisplayOps(){
     zonesRes,
     unitLocationsRes,
     operationalPeriodsRes,
-    treatmentAreasRes,
-    guestLogisticsMovementsRes
+    treatmentAreasRes
   ]=await Promise.all([
     supabase.from("events")
       .select("id,name,event_code,active")
@@ -1556,7 +1591,7 @@ async function loadCommandDisplayOps(){
       .eq("active",true)
       .order("name"),
     supabase.from("incidents")
-      .select("id,event_id,incident_number,call_type,priority,status,created_at,landmark,map_layer_id,zone_id,map_x,map_y")
+      .select("id,event_id,incident_number,incident_kind,call_type,priority,status,created_at,activated_at,scheduled_at,landmark,map_layer_id,zone_id,map_x,map_y,notes,incident_guest_details(*)")
       .eq("event_id",S.eventId)
       .neq("status","CLOSED")
       .order("created_at",{ascending:false}),
@@ -1582,13 +1617,7 @@ async function loadCommandDisplayOps(){
       .select("id,event_id,name,status,active")
       .eq("event_id",S.eventId)
       .eq("active",true)
-      .order("name"),
-    supabase.from("guest_logistics_movements")
-      .select("id,event_id,department_id,movement_number,movement_type,guest_name,guest_group,status,scheduled_at,assigned_unit_id,assigned_at,driver_acknowledged_at,updated_at,origin,destination,airline,flight_number,airport,terminal,held_from_status,held_at,held_by_incident_id")
-      .eq("event_id",S.eventId)
-      .not("status","in","(COMPLETE,NO_SHOW,CANCELLED)")
-      .not("assigned_unit_id","is",null)
-      .order("scheduled_at")
+      .order("name")
   ]);
 
   const baseResults={
@@ -1600,8 +1629,7 @@ async function loadCommandDisplayOps(){
     zones:zonesRes,
     unitLocations:unitLocationsRes,
     operationalPeriods:operationalPeriodsRes,
-    treatmentAreas:treatmentAreasRes,
-    guestLogisticsMovements:guestLogisticsMovementsRes
+    treatmentAreas:treatmentAreasRes
   };
 
   const failed=Object.entries(baseResults).filter(([,result])=>result.error);
@@ -1622,7 +1650,7 @@ async function loadCommandDisplayOps(){
         .select("incident_id,department_id,event_departments(name,short_name)")
         .in("incident_id",incidentIds),
       supabase.from("incident_units")
-        .select("incident_id,unit_id,assigned_at,acknowledged_at,cleared_at,cad_status,cad_status_updated_at,cad_priority_override,cad_priority_set_at,cad_priority_acknowledged_at,units(name)")
+        .select("incident_id,unit_id,assigned_at,acknowledged_at,cleared_at,cad_status,cad_status_updated_at,is_primary,primary_set_at,primary_set_by,primary_acknowledged_at,units(name)")
         .in("incident_id",incidentIds)
     ]);
 
@@ -1649,7 +1677,7 @@ async function loadCommandDisplayOps(){
   S.operationalPeriods=operationalPeriodsRes.data||[];
   S.activeOperationalPeriod=S.operationalPeriods.find(op=>op.status==="ACTIVE")||null;
   S.treatmentAreas=treatmentAreasRes.data||[];
-  S.guestLogisticsMovements=guestLogisticsMovementsRes.data||[];
+  refreshMoveAdapter();
 
   const preferred=S.mapLayers.find(layer=>layer.id===S.commandActiveMapLayerId);
   const fallback=S.mapLayers.find(layer=>layer.is_default)||S.mapLayers[0]||null;
@@ -1670,7 +1698,6 @@ async function loadEventOps(){
     unitLocationsRes,
     operationalPeriodsRes,
     dispositionsRes,
-    guestLogisticsMovementsRes,
     treatmentAreasRes
   ] = await Promise.all([
     supabase.from("events").select("*").eq("id",S.eventId).single(),
@@ -1680,7 +1707,7 @@ async function loadEventOps(){
     // records are loaded separately below so a relationship/embed error
     // can never make the entire incident list disappear.
     supabase.from("incidents")
-      .select("*")
+      .select("*,incident_guest_details(*)")
       .eq("event_id",S.eventId)
       .neq("status","CLOSED")
       .order("created_at",{ascending:false}),
@@ -1692,7 +1719,6 @@ async function loadEventOps(){
     supabase.from("unit_locations").select("*").eq("event_id",S.eventId),
     supabase.from("operational_periods").select("*").eq("event_id",S.eventId).order("created_at"),
     supabase.from("event_dispositions").select("*").eq("event_id",S.eventId).eq("active",true).order("scope").order("sort_order").order("label"),
-    supabase.from("guest_logistics_movements").select("id,event_id,department_id,movement_number,movement_type,guest_name,guest_group,status,scheduled_at,assigned_unit_id,assigned_at,driver_acknowledged_at,updated_at,origin,destination,airline,flight_number,airport,terminal,held_from_status,held_at,held_by_incident_id").eq("event_id",S.eventId).not("status","in","(COMPLETE,NO_SHOW,CANCELLED)").order("scheduled_at"),
     supabase.from("ems_treatment_areas").select("*").eq("event_id",S.eventId).eq("active",true).order("name")
   ]);
 
@@ -1734,7 +1760,6 @@ async function loadEventOps(){
     unitLocations: unitLocationsRes,
     operationalPeriods: operationalPeriodsRes,
     dispositions: dispositionsRes,
-    guestLogisticsMovements: guestLogisticsMovementsRes,
     treatmentAreas: treatmentAreasRes
   };
 
@@ -1756,7 +1781,7 @@ async function loadEventOps(){
         .select("incident_id,department_id,event_departments(name,short_name)")
         .in("incident_id",incidentIds),
       supabase.from("incident_units")
-        .select("incident_id,unit_id,assigned_at,acknowledged_at,cleared_at,cad_status,cad_status_updated_at,cad_priority_override,cad_priority_set_at,cad_priority_acknowledged_at,units(name)")
+        .select("incident_id,unit_id,assigned_at,acknowledged_at,cleared_at,cad_status,cad_status_updated_at,is_primary,primary_set_at,primary_set_by,primary_acknowledged_at,units(name)")
         .in("incident_id",incidentIds)
     ]);
 
@@ -1812,7 +1837,7 @@ async function loadEventOps(){
   S.operationalPeriods=operationalPeriodsRes.data||[];
   S.activeOperationalPeriod=S.operationalPeriods.find(op=>op.status==="ACTIVE")||null;
   S.dispositions=dispositionsRes.data||[];
-  S.guestLogisticsMovements=guestLogisticsMovementsRes.data||[];
+  refreshMoveAdapter();
   S.emsUnitConfigs=S.units.map(u=>{
     const c=Array.isArray(u.ems_unit_config)?u.ems_unit_config[0]:u.ems_unit_config;
     return c?{...c,unit_id:c.unit_id||u.id}:null;
@@ -2312,6 +2337,7 @@ async function dispatchPage(){
           `}
         </div>
         <div id="dispatchPrimaryActions">${dispatchPrimaryActionsHtml()}</div>
+        <div id="dispatchMoveStrip">${dispatchMoveStripHtml()}</div>
         <button class="btn secondary block dispatch-scope-button" id="dispatchScopeBtn">Dispatching: ${esc(scopeLabel())}</button>
         <div class="section-title">Active incidents</div><div id="incidentList">${incidentList()}</div>
       </aside>
@@ -2410,15 +2436,8 @@ async function dispatchPage(){
 
 
 
-async function guestLogisticsPage({allDepartments=false}={}){
-  closeIncidentModal();
-  await loadEventOps();
-
-  const logisticsScope=allDepartments
-    ?S.departments.filter(d=>d.active!==false&&d.guest_logistics_enabled===true).map(d=>d.id)
-    :S.dispatchDepartmentIds;
-
-  return renderGuestLogistics(app,{
+function moveCtx(){
+  return {
     eventId:S.eventId,
     event:S.event,
     header,
@@ -2426,23 +2445,46 @@ async function guestLogisticsPage({allDepartments=false}={}){
     units:S.units,
     incidents:S.incidents,
     operationalPeriods:S.operationalPeriods,
-    dispatchDepartmentIds:logisticsScope,
-    onBack:()=>dispatchPage(),
-    onOpenIncident:id=>selectIncident(id),
-    onNewCadTask:(departmentId,movement=null)=>incidentForm(null,{
-      departmentIds:[departmentId],
-      callType:movement?"Guest Logistics Support":"Guest Logistics Task",
-      priority:"Standard",
-      landmark:movement?.origin||"",
-      notes:movement
-        ?`${movement.movement_number} · ${movement.guest_name} · ${movement.origin} → ${movement.destination}${movement.flight_number?` · Flight ${movement.flight_number}`:""}`
-        :"",
-      guestLogisticsMovementId:movement?.id||null,
-      guestLogisticsMovement:movement||null
-    })
-  });
+    movements:()=>S.guestLogisticsMovements||[],
+    reload:async()=>{await loadEventOps();},
+    openModal:mode=>{S.incidentModalMode=mode;S.openIncidentId=null;S.openUnitId=null;return openIncidentModalShell();},
+    closeModal:()=>closeIncidentModal(),
+    onOpenIncident:id=>selectIncident(id)
+  };
 }
 
+async function guestLogisticsPage({allDepartments=false}={}){
+  closeIncidentModal();
+  cleanupRealtime();
+  await loadEventOps();
+
+  const logisticsScope=allDepartments
+    ?S.departments.filter(d=>d.active!==false&&d.guest_logistics_enabled===true).map(d=>d.id)
+    :S.dispatchDepartmentIds;
+
+  let liveRender=null;
+  const refreshBoard=debounce(async()=>{
+    if(!document.querySelector("#moveBoard"))return;
+    try{await loadEventOps();}catch(error){console.warn("Guest Logistics refresh failed",error);return;}
+    liveRender?.();
+    if(S.openIncidentId&&S.incidentModalMode==="overview")selectIncident(S.openIncidentId,{silent:true});
+  },250);
+
+  const ch=supabase.channel(`moves-${S.eventId}-${Date.now()}`)
+    .on("postgres_changes",{event:"*",schema:"public",table:"incidents",filter:`event_id=eq.${S.eventId}`},refreshBoard)
+    .on("postgres_changes",{event:"*",schema:"public",table:"incident_guest_details",filter:`event_id=eq.${S.eventId}`},refreshBoard)
+    .on("postgres_changes",{event:"*",schema:"public",table:"incident_units"},refreshBoard)
+    .on("postgres_changes",{event:"UPDATE",schema:"public",table:"units",filter:`event_id=eq.${S.eventId}`},refreshBoard)
+    .subscribe();
+  S.realtime.push(ch);
+
+  return renderGuestLogistics(app,{
+    ...moveCtx(),
+    dispatchDepartmentIds:logisticsScope,
+    onBack:()=>dispatchPage(),
+    onLiveUpdate:fn=>{liveRender=fn;}
+  });
+}
 
 async function unitStaffingPage({allDepartments=false}={}){
   closeIncidentModal();
@@ -2505,7 +2547,9 @@ function unitLocationTooltip(unit,location){
   const cadStatus=dispatchCadStatusForUnit(unit);
   const move=underwayLogisticsMovementForUnit(unit.id)||logisticsMovementsForUnit(unit.id)[0]||null;
   const stack=unitTaskStack(unit.id);
-  return `<strong>${esc(unit.name)}</strong>${stack.diverted?"<br>⇅ DIVERTED":""}<br>CAD ${esc(String(cadStatus||"").replaceAll("_"," "))}${move?`<br>MOVE ${esc(movementStatusLabel(move.status))}`:""}<br>${esc(age)}${esc(accuracy)}${layer?`<br>${esc(layerName(layer))}`:""}`;
+  const primary=unitPrimaryStatus(unit);
+  const secondary=primary.kind==="MOVE"&&stack.active?`CAD ${String(cadStatus||"").replaceAll("_"," ")}`:(primary.kind!=="MOVE"&&move?`MOVE ${movementStatusLabel(move.status)}`:"");
+  return `<strong>${esc(unit.name)}</strong>${stack.diverted?"<br>⇅ DIVERTED":""}<br><strong>${esc(primary.label)}</strong>${secondary?`<br><span class="small">${esc(secondary)}</span>`:""}<br>${esc(age)}${esc(accuracy)}${layer?`<br>${esc(layerName(layer))}`:""}`;
 }
 
 function removeUnitLocationMarker(unitId){
@@ -2673,20 +2717,58 @@ function dispatchCadStatusForUnit(unit){
    dispatcher override on the active CAD link makes the ticket primary until the
    ticket closes or the unit is cleared. Every screen derives priority here. */
 function unitTaskStack(unitId){
-  const active=activeAssignmentForUnit(unitId);
-  const moves=logisticsMovementsForUnit(unitId);
-  const override=!!(active?.link?.cad_priority_override);
-  const heldMoves=moves.filter(m=>m.status==="HELD");
-  const diverted=override&&moves.length>0;
+  const active=activeAssignmentForUnit(unitId);           // CAD ticket (OPEN)
+  const moves=logisticsMovementsForUnit(unitId);          // MOVE tickets (OPEN or SCHEDULED)
+  const activeMoves=moves.filter(m=>m.incident_status==="OPEN");
+  const cadPrimary=!!(active?.link?.is_primary);
+  const diverted=cadPrimary&&activeMoves.length>0;
+  const primaryMove=moves.find(m=>m.is_primary)||activeMoves[0]||null;
   return {
     active,
     moves,
-    override,
+    activeMoves,
+    primaryMove,
+    override:diverted,
     diverted,
-    heldMoves,
-    primaryKind:moves.length?(override?"CAD":"MOVE"):(active?"CAD":null),
-    priorityPendingAck:diverted&&!active.link.cad_priority_acknowledged_at
+    primaryKind:activeMoves.length?(cadPrimary?"CAD":"MOVE"):(active?"CAD":(moves.length?"MOVE_SCHEDULED":null)),
+    priorityPendingAck:diverted&&!!active.link.primary_set_by&&!active.link.primary_acknowledged_at
   };
+}
+
+const MOVE_BADGE_CLASS={
+  SCHEDULED:"ASSIGNED",READY:"ASSIGNED",ASSIGNED:"ASSIGNED",
+  EN_ROUTE_PICKUP:"RESPONDING",AT_PICKUP:"ON_SCENE",
+  PASSENGER_ONBOARD:"TRANSPORTING",EN_ROUTE_DESTINATION:"TRANSPORTING"
+};
+const MOVE_BADGE_LABEL={
+  SCHEDULED:"COMMITTED",READY:"COMMITTED",ASSIGNED:"COMMITTED",
+  EN_ROUTE_PICKUP:"EN ROUTE PICKUP",AT_PICKUP:"AT PICKUP",
+  PASSENGER_ONBOARD:"GUEST ON BOARD",EN_ROUTE_DESTINATION:"EN ROUTE DEST"
+};
+function unitPrimaryStatus(unit){
+  if(!unit)return {kind:"UNIT",status:"AVAILABLE",cls:"AVAILABLE",label:"AVAILABLE"};
+  const stack=unitTaskStack(unit.id);
+  if(unit.status==="OUT_OF_SERVICE"&&!stack.active)return {kind:"UNIT",status:"OUT_OF_SERVICE",cls:"OUT_OF_SERVICE",label:"OUT OF SERVICE"};
+  if(stack.primaryKind==="MOVE"){
+    const m=underwayLogisticsMovementForUnit(unit.id)||stack.primaryMove||stack.activeMoves[0];
+    const st=m?.status||"ASSIGNED";
+    return {kind:"MOVE",status:st,cls:MOVE_BADGE_CLASS[st]||"ASSIGNED",label:`MOVE · ${MOVE_BADGE_LABEL[st]||st.replaceAll("_"," ")}`,movement:m};
+  }
+  if(stack.active){
+    const st=cadAssignmentStatus(stack.active,unit);
+    return {kind:"CAD",status:st,cls:st,label:`CAD · ${String(st||"").replaceAll("_"," ")}`};
+  }
+  const st=unit.status||"AVAILABLE";
+  if(stack.primaryKind==="MOVE_SCHEDULED"){
+    const next=stack.moves[0];
+    return {kind:"UNIT",status:st,cls:st,label:`${String(st).replaceAll("_"," ")} · NEXT MOVE ${time24(next.scheduled_at)}`};
+  }
+  return {kind:"UNIT",status:st,cls:st,label:String(st).replaceAll("_"," ")};
+}
+
+function unitStatusBadgeHtml(unit,extraAttrs=""){
+  const p=unitPrimaryStatus(unit);
+  return `<span class="badge status-${esc(p.cls)} primary-kind-${p.kind.toLowerCase()}" data-dispatch-unit-status="${unit.id}" ${extraAttrs}>${esc(p.label)}</span>`;
 }
 
 function moveLineHtml(m){
@@ -2695,14 +2777,19 @@ function moveLineHtml(m){
 }
 
 function incidentList(){
-  return S.incidents.filter(incidentInDispatchScope).map(i=>{
+  const rows=S.incidents.filter(i=>i.status==="OPEN"&&incidentInDispatchScope(i));
+  return rows.map(i=>{
     const deps=(i.incident_departments||[]).map(d=>d.event_departments?.short_name||d.event_departments?.name).filter(Boolean).join("/");
     const assigned=(i.incident_units||[]).filter(x=>!x.cleared_at).map(x=>x.units?.name).filter(Boolean);
-    return `<div class="incident" data-incident="${i.id}">
-      <div class="row"><strong>${esc(i.incident_number)}</strong><span class="incident-head-meta"><span class="call-timer" title="Elapsed call time" data-call-start="${esc(i.created_at)}">00:00</span><span class="badge">${esc(i.priority)}</span></span></div>
-      <div>${esc(i.call_type)}</div>
-      <div class="small muted">${i.operational_period_id?`${esc(operationalPeriodName(i.operational_period_id)||"Operational Period")} · `:""}${esc(deps)} · ${esc(layerName(i.map_layer_id))}${i.zone_id?` / ${esc(zoneName(i.zone_id))}`:""} · ${esc(i.landmark||"Mapped")}</div>
-      ${assigned.length?`<div class="small" style="margin-top:5px"><strong>${esc(assigned.join(", "))}</strong></div>`:""}
+    const isMove=i.incident_kind==="MOVE";
+    const move=isMove?idx().movesById.get(i.id):null;
+    const risk=move?movementRisk(move):null;
+    return `<div class="incident ${isMove?"incident-move":""}" data-incident="${i.id}">
+      <div class="row"><strong>${esc(i.incident_number)}</strong><span class="incident-head-meta">${isMove?`<span class="badge move-kind-badge">MOVE</span>`:""}${risk?`<span class="badge risk-badge risk-${risk.level}">${esc(risk.label)}</span>`:""}<span class="call-timer" title="${isMove?"Elapsed since activation":"Elapsed call time"}" data-call-start="${esc(isMove?(i.activated_at||i.created_at):i.created_at)}">00:00</span><span class="badge">${esc(i.priority)}</span></span></div>
+      <div>${isMove?`${esc(move?.guest_name||i.call_type)} · ${esc(movementTypeLabel(move?.movement_type))}`:esc(i.call_type)}</div>
+      ${isMove?`<div class="small muted">Pickup ${esc(time24(i.scheduled_at))} · ${esc(move?.origin||"")} → ${esc(move?.destination||"")} · ${esc(movementStatusLabel(move?.status))}</div>`
+        :`<div class="small muted">${i.operational_period_id?`${esc(operationalPeriodName(i.operational_period_id)||"Operational Period")} · `:""}${esc(deps)} · ${esc(layerName(i.map_layer_id))}${i.zone_id?` / ${esc(zoneName(i.zone_id))}`:""} · ${esc(i.landmark||"Mapped")}</div>`}
+      ${assigned.length?`<div class="small" style="margin-top:5px"><strong>${esc(assigned.join(", "))}</strong></div>`:isMove?`<div class="small risk-risk-text" style="margin-top:5px">No driver assigned</div>`:""}
     </div>`;
   }).join("")||`<div class="small muted">No active incidents.</div>`;
 }
@@ -2722,20 +2809,21 @@ function unitList(){
       const cadStatus=active?cadAssignmentStatus(active,u):(u.status||"AVAILABLE");
       const loc=unitLocation(u.id);
       const transportLabel=unitTransportDestinationLabel(u);
-      return `<button class="unit unit-button ${moves.length?"unit-has-moves":""} ${active?.link?.cad_priority_override&&moves.length?"unit-diverted":""}" data-unit-detail="${u.id}">
+      return `<button class="unit unit-button ${moves.length?"unit-has-moves":""} ${active?.link?.is_primary&&moves.some(m=>m.incident_status==="OPEN")?"unit-diverted":""}" data-unit-detail="${u.id}">
         <div class="row">
           <strong>${esc(u.name)}</strong>
-          <span class="badge status-${esc(cadStatus)}" data-dispatch-unit-status="${u.id}">${active?"CAD ":""}${esc(String(cadStatus||"").replaceAll("_"," "))}</span>
+          ${unitStatusBadgeHtml(u)}
         </div>
         ${(()=>{
           const stack=unitTaskStack(u.id);
-          const cadLine=active?`<div class="small unit-task-cad-line ${stack.diverted?"unit-task-cad-primary":""}">${stack.diverted?`<span class="task-priority-label">PRIORITY CAD${stack.priorityPendingAck?" · AWAITING ACK":""}</span> · `:moves.length?"SECONDARY CAD · ":"Assigned: "}${esc(active.incident.incident_number)} · ${esc(active.incident.call_type)} · ${esc(cadAssignmentStatus(active,u).replaceAll("_"," "))}</div>`:"";
+          const cadLine=active?`<div class="small unit-task-cad-line ${stack.diverted?"unit-task-cad-primary":""}">${stack.diverted?`<span class="task-priority-label">PRIORITY CAD${stack.priorityPendingAck?" · AWAITING ACK":""}</span> · `:stack.activeMoves.length?"SECONDARY CAD · ":"Assigned: "}${esc(active.incident.incident_number)} · ${esc(active.incident.call_type)} · ${esc(cadAssignmentStatus(active,u).replaceAll("_"," "))}</div>`:"";
           const moveBlock=moves.length?`<div class="unit-task-primary ${stack.diverted?"unit-task-held":""}">
-            <div class="small task-priority-label">${stack.diverted?`${stack.heldMoves.length?"ON HOLD":"SECONDARY"} · `:"PRIMARY · "}${moves.length} MOVE${moves.length===1?"":"S"}</div>
+            <div class="small task-priority-label">${stack.diverted?"SECONDARY · ":stack.activeMoves.length?"PRIMARY · ":"SCHEDULED · "}${moves.length} MOVE${moves.length===1?"":"S"}</div>
             ${moves.map(moveLineHtml).join("")}
           </div>`:"";
           if(stack.diverted)return `<div class="unit-diverted-tag small">⇅ DIVERTED TO CAD</div>${cadLine}${moveBlock}`;
-          return `${moveBlock}${cadLine||`<div class="small muted">${moves.length?"No secondary CAD assignment":"Unassigned"}</div>`}`;
+          if(!stack.activeMoves.length&&active)return `${cadLine}${moveBlock}`;
+          return `${moveBlock}${cadLine||`<div class="small muted">${stack.activeMoves.length?"No secondary CAD assignment":"Unassigned"}</div>`}`;
         })()}
         ${transportLabel?`<div class="small transport-destination-readout">Transport → ${esc(transportLabel)}</div>`:""}
         <div class="small unit-gps-readout ${loc?`gps-${locationFreshness(loc)}`:"muted"}" data-unit-gps="${u.id}">${loc?`${locationAgeLabel(loc)}${loc.accuracy_m!=null?` · ±${Math.round(loc.accuracy_m)}m`:""}`:(S.event?.field_location_enabled?"GPS not shared":"GPS disabled")}</div>
@@ -3011,13 +3099,7 @@ async function loadIncidentCommandData(incidentId,guestMovementId=null){
       .eq("event_id",S.eventId)
       .eq("active",true)
       .order("name"),
-    guestMovementId
-      ?supabase.from("guest_logistics_movements")
-        .select("id,event_id,department_id,movement_number,movement_type,guest_name,guest_group,status,scheduled_at,assigned_unit_id,assigned_at,driver_acknowledged_at,updated_at,origin,destination,airline,flight_number,airport,terminal")
-        .eq("event_id",S.eventId)
-        .eq("id",guestMovementId)
-        .maybeSingle()
-      :Promise.resolve({data:null,error:null})
+    Promise.resolve({data:guestMovementId?(idx().movesById.get(guestMovementId)||null):null,error:null})
   ]);
 
   if(activityRes.error)console.warn("Incident activity could not be loaded",activityRes.error);
@@ -3160,15 +3242,16 @@ function updateDispatcherUnitStatusUI(unitId,status){
   if(unit)unit.status=status;
   const activeAssignment=activeAssignmentForUnit(unitId);
   const displayStatus=activeAssignment?cadAssignmentStatus(activeAssignment,unit):(status||"AVAILABLE");
+  const primary=unitPrimaryStatus(unit);
 
   document.querySelectorAll(`[data-dispatch-unit-status="${unitId}"]`).forEach(badge=>{
-    [...badge.classList].filter(c=>c.startsWith("status-")).forEach(c=>badge.classList.remove(c));
-    badge.classList.add(`status-${displayStatus}`);
-    badge.textContent=`${activeAssignment?"CAD ":""}${String(displayStatus||"").replaceAll("_"," ")}`;
+    [...badge.classList].filter(c=>c.startsWith("status-")||c.startsWith("primary-kind-")).forEach(c=>badge.classList.remove(c));
+    badge.classList.add(`status-${primary.cls}`,`primary-kind-${primary.kind.toLowerCase()}`);
+    badge.textContent=primary.label;
   });
 
   document.querySelectorAll(`[data-create-unit-status="${unitId}"]`).forEach(el=>{
-    el.textContent=`${String(displayStatus||"").replaceAll("_"," ")}${activeAssignment?` · ${activeAssignment.incident.incident_number}`:""}`;
+    el.textContent=`${primary.label}${activeAssignment?` · ${activeAssignment.incident.incident_number}`:""}`;
   });
 
   document.querySelectorAll(`[data-status-unit="${unitId}"]`).forEach(select=>{
@@ -3683,7 +3766,7 @@ async function selectIncident(id,{silent=false}={}){
     content.innerHTML=`<div class="incident-modal-loading">Loading ${esc(i.incident_number)}…</div>`;
   }
 
-  const extra=await loadIncidentCommandData(id,i.guest_logistics_movement_id||null);
+  const extra=await loadIncidentCommandData(id,i.related_incident_id||null);
 
   // The dispatcher may have opened something else, or the incident may have
   // been closed, while detail was loading.
@@ -3697,15 +3780,18 @@ async function selectIncident(id,{silent=false}={}){
   const assignedLinks=(current.incident_units||[]).filter(x=>!x.cleared_at);
   const assignedIds=new Set(assignedLinks.map(x=>x.unit_id));
   const deps=incidentDepartmentNames(current);
-  const isEmsIncident=incidentHasEmsDepartment(current);
+  const isEmsIncident=incidentHasEmsDepartment(current)&&current.incident_kind!=="MOVE";
+  const isMove=current.incident_kind==="MOVE";
+  const isScheduled=current.status==="SCHEDULED";
 
   const incidentModalHtml=`<div class="incident-modal-header">
     <div>
-      <div class="incident-modal-eyebrow">ACTIVE INCIDENT</div>
+      <div class="incident-modal-eyebrow">${isMove?(isScheduled?"SCHEDULED MOVE":"ACTIVE MOVE"):"ACTIVE INCIDENT"}</div>
       <div class="incident-modal-title-row">
         <h2 id="incidentModalTitle">${esc(current.incident_number)}</h2>
+        ${isMove?`<span class="badge move-kind-badge">MOVE</span>`:""}
         <span class="badge">${esc(current.priority)}</span>
-        <span class="call-timer modal-call-timer" title="Elapsed call time" data-call-start="${esc(current.created_at)}">00:00</span>
+        ${isScheduled?`<span class="badge">PICKUP ${esc(time24(current.scheduled_at))}</span>`:`<span class="call-timer modal-call-timer" title="Elapsed call time" data-call-start="${esc(isMove?(current.activated_at||current.created_at):current.created_at)}">00:00</span>`}
       </div>
       <div class="incident-modal-nature">${esc(current.call_type)}</div>
     </div>
@@ -3713,17 +3799,19 @@ async function selectIncident(id,{silent=false}={}){
   </div>
 
   <div class="incident-modal-actions">
-    <button class="btn" id="editIncident">Edit Call Details</button>
+    <button class="btn" id="editIncident">${isMove?"Edit MOVE":"Edit Call Details"}</button>
+    ${isScheduled?`<button class="btn warn" id="activateIncident">Activate Now</button>`:""}
     ${current.map_x!=null&&current.map_y!=null&&current.map_layer_id?`<button class="btn secondary" id="showIncidentMap">Show on Map</button>`:""}
-    <button class="btn danger" id="closeIncident">Close Incident</button>
+    <button class="btn danger" id="closeIncident">${isMove?"Close MOVE":"Close Incident"}</button>
   </div>
 
   <div class="incident-command-grid">
     <div class="incident-command-main stack">
+      ${isMove?guestDetailsSectionHtml(current):""}
       <section class="incident-info-section">
         <div class="section-title">Call Information</div>
         <div class="incident-summary-grid">
-          <div><span class="small muted">Operational Period</span><strong>${esc(operationalPeriodName(current.operational_period_id)||"Legacy")}</strong></div>
+          <div><span class="small muted">Operational Period</span><strong>${esc(operationalPeriodName(current.operational_period_id)||(isScheduled?"Set at activation":"Legacy"))}</strong></div>
           <div><span class="small muted">Received</span><strong>${dateTime24(current.created_at,{seconds:true})}</strong></div>
           <div><span class="small muted">Elapsed</span><strong class="call-timer-text" data-call-start="${esc(current.created_at)}">00:00</strong></div>
           <div><span class="small muted">Departments</span><strong>${esc(deps.join(", ")||"None")}</strong></div>
@@ -3766,17 +3854,23 @@ async function selectIncident(id,{silent=false}={}){
             return `<div class="assignment-unit-row">
               <div>
                 <strong>${esc(u.event_departments?.short_name||"")} · ${esc(u.name)}</strong><br>
-                <span class="badge cad-task-status-badge">${link.cad_priority_override&&moves.length?"PRIORITY ":""}CAD ${esc(cadAssignmentStatus({incident:current,link},u).replaceAll("_"," "))}</span>
-                ${moves.length?(link.cad_priority_override
-                  ?`<span class="badge unit-diverted-badge">⇅ DIVERTED${link.cad_priority_acknowledged_at?"":" · AWAITING DRIVER ACK"}</span>`
-                  :`<span class="badge">PRIMARY ${esc(movementStatusLabel((underwayLogisticsMovementForUnit(u.id)||moves[0])?.status||"ASSIGNED"))}</span>`):""}
+                ${(()=>{
+                  const stack=unitTaskStack(u.id);
+                  const otherTask=isMove?stack.active:stack.activeMoves[0];
+                  const linkStatus=isMove?movementStatusLabel(link.cad_status||(isScheduled?"SCHEDULED":"ASSIGNED")):cadAssignmentStatus({incident:current,link},u).replaceAll("_"," ");
+                  return `<span class="badge cad-task-status-badge">${isMove?"MOVE":"CAD"} ${esc(linkStatus)}</span>
+                    ${otherTask?(link.is_primary
+                      ?`<span class="badge unit-diverted-badge">PRIMARY${!isMove&&link.primary_set_by&&!link.primary_acknowledged_at?" · AWAITING DRIVER ACK":""}</span><span class="badge">also on ${esc(isMove?otherTask.incident.incident_number:otherTask.movement_number)}</span>`
+                      :`<span class="badge">SECONDARY · primary ${esc(isMove?otherTask.incident.incident_number:otherTask.movement_number)}</span>`):""}`;
+                })()}
                 <span class="assignment-ack-badge ${link.acknowledged_at?"acknowledged":"pending"}" title="${link.acknowledged_at?`Acknowledged ${dateTime24(link.acknowledged_at,{seconds:true})}`:"Awaiting Field Unit acknowledgement"}">${link.acknowledged_at?`ACK ${time24(link.acknowledged_at)}`:"AWAITING ACK"}</span>
                 <span class="small ${unitLocation(u.id)?`gps-${locationFreshness(unitLocation(u.id))}`:"muted"}" data-unit-gps="${u.id}">${unitLocation(u.id)?`${locationAgeLabel(unitLocation(u.id))}${unitLocation(u.id).accuracy_m!=null?` · ±${Math.round(unitLocation(u.id).accuracy_m)}m`:""}`:(S.event?.field_location_enabled?"GPS not shared":"GPS disabled")}</span>
-                ${moves.length?`<div class="assignment-secondary-moves"><span class="small task-priority-label">${link.cad_priority_override?"MOVE":"PRIMARY MOVE"}${moves.length===1?"":"S"}</span>${moves.map(m=>`<span class="badge ${m.status==="HELD"?"logistics-status-held":""}">${esc(m.movement_number)}${m.status==="HELD"?" · HELD":""}</span>`).join("")}</div>`:""}
+                ${!isMove&&moves.length?`<div class="assignment-secondary-moves"><span class="small task-priority-label">MOVE${moves.length===1?"":"S"}</span>${moves.map(m=>`<span class="badge">${esc(m.movement_number)} · ${esc(movementStatusLabel(m.status))}</span>`).join("")}</div>`:""}
+                ${isMove?moveStatusButtonsHtml(current,link):""}
               </div>
               <div class="assignment-unit-actions">
                 ${unitTransportDestinationLabel(u)?`<span class="small transport-destination-readout">→ ${esc(unitTransportDestinationLabel(u))}</span>`:""}
-                ${moves.length?`<button class="btn ${link.cad_priority_override?"secondary":"warn"}" data-cad-priority-unit="${u.id}">${link.cad_priority_override?"Return Priority to MOVE":"Prioritize This Ticket"}</button>`:""}
+                ${(()=>{const stack=unitTaskStack(u.id);const other=isMove?stack.active:stack.activeMoves[0];if(!other||isScheduled)return "";return link.is_primary?(isMove?"":`<button class="btn secondary" data-primary-unit="${u.id}" data-primary-target="${other.incident.id}">Return Priority to MOVE</button>`):`<button class="btn warn" data-primary-unit="${u.id}" data-primary-target="${current.id}">${isMove?"Make MOVE Primary":"Prioritize This Ticket"}</button>`;})()}
                 <button class="btn secondary" data-open-unit-controls="${u.id}">Unit Controls</button>
                 <button class="btn danger" data-unassign-unit="${u.id}">Unassign</button>
               </div>
@@ -3790,7 +3884,8 @@ async function selectIncident(id,{silent=false}={}){
             ${S.units.filter(u=>!assignedIds.has(u.id)).map(u=>{
               const active=activeAssignmentForUnit(u.id);
               const moves=logisticsMovementsForUnit(u.id);
-              return `<option value="${u.id}" ${active?"disabled":""}>${esc(u.event_departments?.short_name||"")} · ${esc(u.name)} · ${esc(u.status)}${moves.length?` · ${moves.length} MOVE${moves.length===1?"":"S"}`:""}${active?` · ${esc(active.incident.incident_number)}`:""}</option>`;
+              const blocked=isMove?moves.some(m=>m.incident_status==="OPEN"&&current.status==="OPEN"):!!active;
+              return `<option value="${u.id}" ${blocked?"disabled":""}>${esc(u.event_departments?.short_name||"")} · ${esc(u.name)} · ${esc(unitPrimaryStatus(u).label)}${moves.length?` · ${moves.length} MOVE${moves.length===1?"":"S"}`:""}${active?` · ${esc(active.incident.incident_number)}`:""}</option>`;
             }).join("")}
           </select>
           <button class="btn" id="dispatchUnit">Assign Unit</button>
@@ -3818,7 +3913,9 @@ async function selectIncident(id,{silent=false}={}){
   ensureCallTimerTicker();
 
   document.querySelector("#closeIncidentModal").onclick=()=>closeIncidentModal();
-  document.querySelector("#editIncident").onclick=()=>editIncidentForm(current.id);
+  document.querySelector("#editIncident").onclick=()=>isMove
+    ?moveFormModal(moveCtx(),{move:idx().movesById.get(current.id),onSaved:async()=>{await loadEventOps();refreshDispatchBoards();selectIncident(current.id);}})
+    :editIncidentForm(current.id);
 
   if(isEmsIncident){
     renderDispatchIncidentTreatmentPanel(
@@ -3856,7 +3953,13 @@ async function selectIncident(id,{silent=false}={}){
   };
 
   document.querySelectorAll("[data-open-unit-controls]").forEach(b=>b.onclick=()=>selectUnit(b.dataset.openUnitControls));
-  document.querySelectorAll("[data-cad-priority-unit]").forEach(b=>b.onclick=()=>openCadPriorityModal(current.id,b.dataset.cadPriorityUnit,{returnTo:"incident"}));
+  document.querySelectorAll("[data-primary-unit]").forEach(b=>b.onclick=()=>openPrimaryTaskModal({unitId:b.dataset.primaryUnit,targetIncidentId:b.dataset.primaryTarget,returnTo:"incident",returnId:current.id}));
+  bindMoveStatusButtons(()=>selectIncident(current.id));
+  document.querySelector("#activateIncident")?.addEventListener("click",async()=>{
+    const {error}=await supabase.rpc("dispatch_activate_incident",{p_incident_id:current.id});
+    if(error)return alert(error.message);
+    await loadEventOps();refreshDispatchBoards();selectIncident(current.id);
+  });
 
   document.querySelectorAll("[data-unassign-unit]").forEach(b=>b.onclick=async()=>{
     if(!confirm("Remove this unit from the incident?"))return;
@@ -3872,6 +3975,7 @@ async function selectIncident(id,{silent=false}={}){
   });
 
   document.querySelector("#closeIncident").onclick=()=>{
+    if(isMove)return openCloseMoveModal(current);
     openCloseIncidentDispositionModal(current,{
       hasEms:incidentHasEmsDepartment(current)||!!extra.encounter
     });
@@ -3935,7 +4039,7 @@ function renderDispatchIncidentMarkers(){
   const incidentsById=idx().incidentsById;
   const rows=dispatchMapIncidentRows().filter(i=>{
     const local=incidentsById.get(i.id)||i;
-    return i.status!=="CLOSED"
+    return i.status==="OPEN"
       && incidentInDispatchScope(local)
       && (!i.map_layer_id||i.map_layer_id===layer.id)
       && i.map_x!=null
@@ -3984,6 +4088,7 @@ function refreshDispatchBoards(){
   const incidentsChanged=setHtmlIfChanged(incidentHost,incidentList());
   const unitsChanged=setHtmlIfChanged(unitHost,unitList());
   if(incidentsChanged)updateCallTimers();
+  if(setHtmlIfChanged(document.querySelector("#dispatchMoveStrip"),dispatchMoveStripHtml()))bindDispatchMoveStrip();
   updateOperationalPeriodDispatchUi();
   bindIncidentClicks();
   if(unitsChanged)refreshLocationAges();
@@ -4071,7 +4176,7 @@ function selectUnit(unitId,{silent=false}={}){
       <div class="incident-modal-eyebrow">${esc(u.event_departments?.name||"UNIT")}</div>
       <div class="incident-modal-title-row">
         <h2 id="incidentModalTitle">${esc(u.name)}</h2>
-        <span class="badge status-${esc(currentCadStatus)}" data-dispatch-unit-status="${u.id}" data-unit-current-status="${u.id}">${active?"CAD ":""}${esc(String(currentCadStatus||"").replaceAll("_"," "))}</span>
+        ${unitStatusBadgeHtml(u)}
       </div>
       <div class="incident-modal-nature">${primaryMove
         ?`Primary: ${esc(primaryMove.movement_number)}${moves.length>1?` +${moves.length-1} MOVE${moves.length-1===1?"":"S"}`:""}${active?` · Secondary CAD: ${esc(active.incident.incident_number)}`:""}`
@@ -4085,21 +4190,22 @@ function selectUnit(unitId,{silent=false}={}){
   <div class="unit-command-modal" data-unit-detail-id="${u.id}">
     <section class="unit-command-main stack">
       ${moves.length?`<div class="incident-info-section unit-move-section">
-        <div class="row"><div class="section-title">Primary Assignment · Guest Logistics</div><span class="badge">${moves.length} MOVE${moves.length===1?"":"S"}</span></div>
+        <div class="row"><div class="section-title">${stack.diverted?"Secondary":"Primary"} Assignment · Guest Logistics</div><span class="badge">${moves.length} MOVE${moves.length===1?"":"S"}</span></div>
         <div class="unit-move-stack">
-          ${moves.map(m=>`<div class="unit-move-row ${LOGISTICS_UNDERWAY_STATUSES.has(m.status)?"underway":""}">
-            <div><strong>${esc(m.movement_number)} · ${esc(m.guest_name||"Guest")}</strong><div class="small muted">${esc([m.origin,m.destination].filter(Boolean).join(" → ")||"Route not entered")}</div></div>
-            <span class="badge">${esc(String(m.status||"").replaceAll("_"," "))}</span>
-          </div>`).join("")}
+          ${moves.map(m=>{const risk=movementRisk(m);return `<div class="unit-move-row ${LOGISTICS_UNDERWAY_STATUSES.has(m.status)?"underway":""}" data-open-move="${m.id}">
+            <div><strong>${esc(m.movement_number)} · ${esc(m.guest_name||"Guest")}</strong><div class="small muted">${esc(time24(m.scheduled_at))} · ${esc([m.origin,m.destination].filter(Boolean).join(" → ")||"Route not entered")}</div></div>
+            <span><span class="badge ${movementStatusClass(m.status)}">${esc(movementStatusLabel(m.status))}</span>${risk?` <span class="badge risk-badge risk-${risk.level}">${esc(risk.label)}</span>`:""}</span>
+          </div>`;}).join("")}
         </div>
-        <button class="btn secondary block" id="openUnitGuestLogistics">Open Guest Logistics</button>
+        ${(()=>{const pm=stack.primaryMove||stack.activeMoves[0];return pm&&pm.link?`<div class="small muted" style="margin-top:6px">${esc(pm.movement_number)} driver status</div>${moveStatusButtonsHtml(pm.incident,pm.link)}`:"";})()}
+        <div class="grid2" style="margin-top:8px"><button class="btn secondary" id="openUnitGuestLogistics">Guest Logistics Board</button>${(stack.primaryMove||stack.activeMoves[0])?`<button class="btn secondary" id="openUnitMoveTicket">Open MOVE Ticket</button>`:""}</div>
       </div>`:""}
 
       <div class="incident-info-section">
         <div class="section-title">${moves.length?"Primary Operational Status":"Unit Status"}</div>
-        ${moves.length?`
+        ${moves.length&&!stack.diverted?`
           <div class="notice">
-            <strong>Primary status is driven by Guest Logistics.</strong><br>
+            <strong>Primary status is driven by the MOVE ticket.</strong><br>
             ${esc((underwayMove||primaryMove)?.movement_number||"Assigned MOVE")} · ${esc((underwayMove||primaryMove)?.guest_name||"Guest")}. CAD status is controlled separately below.
           </div>
         `:`
@@ -4123,9 +4229,9 @@ function selectUnit(unitId,{silent=false}={}){
         ${active?`
           <div class="unit-current-assignment">
             <strong>${esc(active.incident.incident_number)} · ${esc(active.incident.call_type)}</strong>
-            <div class="small muted">${esc(active.incident.landmark||"")}${moves.length?(stack.diverted?` · Dispatch prioritized this ticket over the unit's MOVE(s)${stack.priorityPendingAck?" — driver has not acknowledged yet":""}.`:" · This CAD ticket is secondary to the unit's assigned MOVE(s)."):""}</div>
+            <div class="small muted">${esc(active.incident.landmark||"")}${stack.activeMoves.length?(stack.diverted?` · Dispatch prioritized this ticket over the unit's MOVE${stack.priorityPendingAck?" — driver has not acknowledged yet":""}.`:" · This CAD ticket is secondary to the unit's active MOVE."):""}</div>
           </div>
-          ${moves.length?`<button class="btn block ${stack.override?"secondary":"warn"}" id="toggleCadPriority">${stack.override?"Return Priority to MOVE":"Prioritize This Ticket Over MOVE"}</button>`:""}
+          ${stack.activeMoves.length?`<button class="btn block ${stack.override?"secondary":"warn"}" id="toggleCadPriority">${stack.override?"Return Priority to MOVE":"Prioritize This Ticket Over MOVE"}</button>`:""}
           ${moves.length?`<div class="cad-task-status-panel">
             <div class="row"><div class="section-title">${stack.diverted?"PRIORITY CAD STATUS":"SECONDARY CAD STATUS"}</div><span class="badge cad-task-status-badge">${esc(currentCadStatus.replaceAll("_"," "))}</span></div>
             ${unitStatusButtonsHtml(u,active,currentCadStatus)}
@@ -4187,6 +4293,8 @@ function selectUnit(unitId,{silent=false}={}){
 
   document.querySelector("#closeIncidentModal").onclick=()=>closeIncidentModal();
   document.querySelector("#openUnitGuestLogistics")?.addEventListener("click",()=>{closeIncidentModal();guestLogisticsPage();});
+  document.querySelector("#openUnitMoveTicket")?.addEventListener("click",()=>{const pm=stack.primaryMove||stack.activeMoves[0];if(pm)selectIncident(pm.id);});
+  bindMoveStatusButtons(()=>selectUnit(unitId));
 
   document.querySelectorAll(`[data-dispatch-status-option="${u.id}"]`).forEach(btn=>btn.onclick=async()=>{
     const status=btn.dataset.status;
@@ -4312,7 +4420,7 @@ function selectUnit(unitId,{silent=false}={}){
   if(active){
     document.querySelector("#openAssignedIncident").onclick=()=>selectIncident(active.incident.id);
     document.querySelector("#removeAssignment").onclick=()=>dispatcherUnassign(active.incident.id,unitId);
-    document.querySelector("#toggleCadPriority")?.addEventListener("click",()=>openCadPriorityModal(active.incident.id,unitId,{returnTo:"unit"}));
+    document.querySelector("#toggleCadPriority")?.addEventListener("click",()=>openPrimaryTaskModal({unitId,targetIncidentId:stack.override?(stack.activeMoves[0]?.incident.id):active.incident.id,returnTo:"unit"}));
   }else{
     document.querySelector("#assignFromUnit").onclick=()=>{
       const incidentId=document.querySelector("#unitIncident").value;
@@ -4324,87 +4432,122 @@ function selectUnit(unitId,{silent=false}={}){
 
 /* Dispatcher chooses, every time, what happens to the unit's MOVE(s) when a
    CAD ticket is prioritized. Guests already on board require typed confirmation. */
-function openCadPriorityModal(incidentId,unitId,{returnTo="incident"}={}){
-  const incident=idx().incidentsById.get(incidentId);
+/* Dispatcher sets which of a unit's two tickets is PRIMARY. The change ends
+   automatically when the primary ticket closes. A guest already on board
+   requires typed confirmation before the driver is diverted. */
+function openPrimaryTaskModal({unitId,targetIncidentId,returnTo="incident",returnId=null}){
   const unit=idx().unitsById.get(unitId);
-  if(!incident||!unit)return;
+  const target=idx().incidentsById.get(targetIncidentId);
+  if(!unit||!target)return;
   const stack=unitTaskStack(unitId);
-  const link=stack.active?.incident?.id===incidentId?stack.active.link:null;
-  if(!link)return alert("This unit is no longer assigned to that incident.");
-  const reopen=()=>returnTo==="unit"?selectUnit(unitId):selectIncident(incidentId);
+  const targetIsMove=target.incident_kind==="MOVE";
+  const otherMove=!targetIsMove?stack.activeMoves[0]||null:null;
+  const guestOnBoard=!!otherMove&&["PASSENGER_ONBOARD","EN_ROUTE_DESTINATION"].includes(otherMove.status);
+  const reopen=()=>returnTo==="unit"?selectUnit(unitId):selectIncident(returnId||targetIncidentId);
 
-  const run=async(enabled,hold)=>{
-    const {data,error}=await supabase.rpc("dispatch_set_cad_priority",{
-      p_incident_id:incidentId,p_unit_id:unitId,p_enabled:enabled,p_hold_movements:hold
-    });
+  S.incidentModalMode="primary-task";
+  const content=openIncidentModalShell();
+  content.__ccHtml=null;
+  content.innerHTML=`<div class="incident-modal-header">
+    <div><div class="incident-modal-eyebrow">TASK PRIORITY</div><h2 id="incidentModalTitle">${targetIsMove?`Return priority to ${esc(target.incident_number)}`:`Prioritize ${esc(target.incident_number)} for ${esc(unit.name)}`}</h2>
+    <div class="incident-modal-nature">${esc(unit.name)} · ${esc(target.call_type)}</div></div>
+    <button class="incident-modal-close" id="closeIncidentModal" aria-label="Close">×</button></div>
+    <div class="stack" style="padding:18px">
+      ${targetIsMove
+        ?`<p>The MOVE becomes ${esc(unit.name)}'s primary task again. ${stack.active?`${esc(stack.active.incident.incident_number)} stays assigned as a <strong>secondary</strong> ticket.`:""}</p>`
+        :`<p>${esc(target.incident_number)} becomes the driver's primary task. ${otherMove?`<strong>${esc(otherMove.movement_number)} · ${esc(otherMove.guest_name)}</strong> (${esc(movementStatusLabel(otherMove.status))}) stays assigned as a secondary task and keeps its status.`:""}</p>
+          ${guestOnBoard?`<div class="notice error"><strong>A guest is on board.</strong> Diverting this vehicle now interrupts an active transport. Type <strong>DIVERT</strong> to confirm.</div><input id="primaryConfirmText" placeholder="Type DIVERT" autocomplete="off">`:""}
+          <p class="small muted">The driver's phone shows a red alert until they acknowledge the change. Priority returns to the MOVE automatically when ${esc(target.incident_number)} closes or the unit is cleared.</p>`}
+      <div class="grid2">
+        <button class="btn ${targetIsMove?"":"warn"}" id="primaryConfirm">${targetIsMove?"Return Priority to MOVE":"Make This Ticket Primary"}</button>
+        <button class="btn secondary" id="primaryCancel">Cancel</button>
+      </div>
+    </div>`;
+  document.querySelector("#closeIncidentModal").onclick=reopen;
+  document.querySelector("#primaryCancel").onclick=reopen;
+  document.querySelector("#primaryConfirm").onclick=async()=>{
+    if(guestOnBoard&&(document.querySelector("#primaryConfirmText")?.value||"").trim().toUpperCase()!=="DIVERT"){
+      return alert("Type DIVERT to confirm diverting a vehicle with a guest on board.");
+    }
+    const {error}=await supabase.rpc("dispatch_set_primary_assignment",{p_incident_id:targetIncidentId,p_unit_id:unitId});
     if(error)return alert(error.message);
     await loadEventOps();
     refreshDispatchBoards();
     reopen();
-    return data;
   };
+}
 
-  if(link.cad_priority_override){
-    S.incidentModalMode="cad-priority";
-    const content=openIncidentModalShell();
-    content.__ccHtml=null;
-    content.innerHTML=`<div class="incident-modal-header">
-      <div><div class="incident-modal-eyebrow">TASK PRIORITY</div><h2 id="incidentModalTitle">Return priority to MOVE</h2>
-      <div class="incident-modal-nature">${esc(unit.name)} · ${esc(incident.incident_number)}</div></div>
-      <button class="incident-modal-close" id="closeIncidentModal" aria-label="Close">×</button></div>
-      <div class="stack" style="padding:18px">
-        <p>${esc(incident.incident_number)} stays assigned to ${esc(unit.name)} as a <strong>secondary</strong> task. ${stack.heldMoves.length?`${stack.heldMoves.length} held MOVE${stack.heldMoves.length===1?"":"S"} will resume automatically.`:"The unit's MOVE(s) become primary again."}</p>
-        <div class="grid2">
-          <button class="btn" id="cadPriorityConfirm">Return Priority to MOVE</button>
-          <button class="btn secondary" id="cadPriorityCancel">Cancel</button>
-        </div>
-      </div>`;
-    document.querySelector("#closeIncidentModal").onclick=reopen;
-    document.querySelector("#cadPriorityCancel").onclick=reopen;
-    document.querySelector("#cadPriorityConfirm").onclick=()=>run(false,false);
-    return;
-  }
-
-  const underway=stack.moves.filter(m=>["PASSENGER_ONBOARD","EN_ROUTE_DESTINATION"].includes(m.status));
-  const movesHtml=stack.moves.map(m=>`<li><strong>${esc(m.movement_number)}</strong> · ${esc(m.guest_name||"Guest")} · ${esc(movementStatusLabel(m.status))}${["PASSENGER_ONBOARD","EN_ROUTE_DESTINATION"].includes(m.status)?` <span class="badge danger-badge">GUEST ON BOARD</span>`:""}</li>`).join("");
-
-  S.incidentModalMode="cad-priority";
+/* MOVE close uses its own disposition catalog (scope MOVE). */
+function openCloseMoveModal(incident){
+  const move=idx().movesById.get(incident.id);
+  const options=(S.dispositions||[]).filter(d=>d.scope==="MOVE"&&d.active!==false);
+  S.incidentModalMode="close-disposition";
   const content=openIncidentModalShell();
   content.__ccHtml=null;
   content.innerHTML=`<div class="incident-modal-header">
-    <div><div class="incident-modal-eyebrow">TASK PRIORITY</div><h2 id="incidentModalTitle">Prioritize ${esc(incident.incident_number)} for ${esc(unit.name)}</h2>
-    <div class="incident-modal-nature">${esc(incident.call_type)} · ${esc(incident.landmark||"")}</div></div>
+    <div><div class="incident-modal-eyebrow">CLOSE MOVE</div><h2 id="incidentModalTitle">${esc(incident.incident_number)}</h2>
+    <div class="incident-modal-nature">${esc(move?.guest_name||incident.call_type)}</div></div>
     <button class="incident-modal-close" id="closeIncidentModal" aria-label="Close">×</button></div>
     <div class="stack" style="padding:18px">
-      <p>This unit currently has ${stack.moves.length} assigned MOVE${stack.moves.length===1?"":"S"}:</p>
-      <ul class="priority-move-list">${movesHtml}</ul>
-      ${underway.length?`<div class="notice error"><strong>A guest is on board.</strong> Diverting this vehicle now interrupts an active transport. Type <strong>DIVERT</strong> to confirm.</div>
-        <input id="cadPriorityConfirmText" placeholder="Type DIVERT" autocomplete="off">`:""}
-      <p class="small muted">The driver's phone will show a red alert until they acknowledge the change. Priority returns to the MOVE automatically when ${esc(incident.incident_number)} closes or the unit is cleared.</p>
-      <div class="section-title">What should happen to the MOVE(s)?</div>
-      <div class="priority-choice-grid">
-        <button class="btn block" id="cadPriorityHold">
-          <strong>Place MOVE${stack.moves.length===1?"":"S"} on HOLD</strong>
-          <span class="small">Status becomes HELD everywhere. Resumes automatically when the ticket closes${underway.length?"; a guest on board stays on board":""}.</span>
-        </button>
-        <button class="btn secondary block" id="cadPriorityKeep">
-          <strong>Keep MOVE status running</strong>
-          <span class="small">MOVE keeps its current status; the unit is simply shown as diverted.</span>
-        </button>
-      </div>
-      <button class="btn secondary block" id="cadPriorityCancel">Cancel</button>
+      <label>MOVE disposition</label>
+      <select id="moveDisposition"><option value="">Choose disposition…</option>${options.map(d=>`<option value="${esc(d.code)}">${esc(d.label)}</option>`).join("")}</select>
+      <p class="small muted">Closing releases the assigned driver. If the driver also holds a CAD ticket, that ticket becomes their primary task.</p>
+      <div class="grid2"><button class="btn danger" id="confirmCloseMove">Close MOVE</button><button class="btn secondary" id="cancelCloseMove">Cancel</button></div>
     </div>`;
-
-  const guard=()=>{
-    if(!underway.length)return true;
-    if((document.querySelector("#cadPriorityConfirmText")?.value||"").trim().toUpperCase()==="DIVERT")return true;
-    alert("Type DIVERT to confirm diverting a vehicle with a guest on board.");
-    return false;
+  const back=()=>selectIncident(incident.id);
+  document.querySelector("#closeIncidentModal").onclick=back;
+  document.querySelector("#cancelCloseMove").onclick=back;
+  document.querySelector("#confirmCloseMove").onclick=async()=>{
+    const code=document.querySelector("#moveDisposition").value;
+    if(!code)return alert("Choose a MOVE disposition.");
+    const {error}=await supabase.rpc("close_move_incident",{p_incident_id:incident.id,p_disposition:code});
+    if(error)return alert(error.message);
+    closeIncidentModal();
+    await loadEventOps();
+    refreshDispatchBoards();
   };
-  document.querySelector("#closeIncidentModal").onclick=reopen;
-  document.querySelector("#cadPriorityCancel").onclick=reopen;
-  document.querySelector("#cadPriorityHold").onclick=()=>{if(guard())run(true,true);};
-  document.querySelector("#cadPriorityKeep").onclick=()=>{if(guard())run(true,false);};
+}
+
+function guestDetailsSectionHtml(incident){
+  const m=idx().movesById.get(incident.id);
+  if(!m)return "";
+  const risk=movementRisk(m);
+  const flight=[m.airline,m.flight_number].filter(Boolean).join(" ");
+  return `<section class="incident-info-section incident-guest-section">
+    <div class="row"><div class="section-title">Guest Movement</div><span>${risk?`<span class="badge risk-badge risk-${risk.level}">${esc(risk.label)}</span> `:""}<span class="badge ${movementStatusClass(m.status)}">${esc(movementStatusLabel(m.status))}</span></span></div>
+    <div class="incident-summary-grid">
+      <div><span class="small muted">Scheduled pickup</span><strong>${esc(dateTime24(m.scheduled_at))}</strong></div>
+      <div><span class="small muted">Type</span><strong>${esc(movementTypeLabel(m.movement_type))}</strong></div>
+      <div><span class="small muted">Guest</span><strong>${esc(m.guest_name)}${m.guest_group?` · ${esc(m.guest_group)}`:""}</strong></div>
+      <div><span class="small muted">Party size</span><strong>${m.party_size}</strong></div>
+      <div><span class="small muted">Pickup</span><strong>${esc(m.origin)}</strong></div>
+      <div><span class="small muted">Destination</span><strong>${esc(m.destination)}</strong></div>
+      ${flight||m.airport?`<div><span class="small muted">Flight</span><strong>${esc(flight||"—")}${m.airport?` · ${esc(m.airport)}`:""}${m.terminal?` T${esc(m.terminal)}`:""}</strong></div>`:""}
+      ${m.contact_phone?`<div><span class="small muted">Contact</span><strong><a href="tel:${esc(m.contact_phone)}">${esc(m.contact_phone)}</a></strong></div>`:""}
+      ${incident.status==="SCHEDULED"?`<div><span class="small muted">Activates</span><strong>${esc(time24(new Date(new Date(m.scheduled_at).getTime()-(incident.activate_lead_minutes||60)*60000)))} (${incident.activate_lead_minutes||60} min before)</strong></div>`:""}
+    </div>
+  </section>`;
+}
+
+function moveStatusButtonsHtml(incident,link){
+  const m=idx().movesById.get(incident.id);
+  if(!m||!link)return "";
+  const actions=moveStatusActions({...m,status:link.cad_status||(incident.status==="SCHEDULED"?"SCHEDULED":"ASSIGNED"),assigned_unit_id:link.unit_id});
+  if(!actions.length)return "";
+  return `<div class="status-buttons dispatcher-status-grid move-status-grid">${actions.map(([status,label,kind])=>`<button class="btn ${kind==="danger"?"danger":"field-status-button field-status-green"}" data-move-status="${esc(status)}" data-move-unit="${link.unit_id}" data-move-incident="${incident.id}">${esc(label)}</button>`).join("")}</div>`;
+}
+
+function bindMoveStatusButtons(onDone){
+  document.querySelectorAll("[data-move-status]").forEach(b=>b.onclick=async()=>{
+    const status=b.dataset.moveStatus;
+    if(status==="NO_SHOW"&&!confirm("Confirm the guest / party is a No Show?"))return;
+    b.disabled=true;
+    try{await setMoveStatus(b.dataset.moveIncident,b.dataset.moveUnit,status);}
+    catch(error){b.disabled=false;return alert(error.message);}
+    await loadEventOps();
+    refreshDispatchBoards();
+    onDone?.();
+  });
 }
 
 async function setupDispatchMap(){
@@ -4862,7 +5005,7 @@ function incidentForm(loc,draft=null){
       return `<label class="create-unit-option ${active?"disabled":""}">
         <input type="checkbox" name="initialUnit" value="${u.id}" ${active?"disabled":""} ${!active&&preservedUnitIds.has(u.id)?"checked":""}>
         <span><strong>${esc(u.event_departments?.short_name||"")} · ${esc(u.name)}</strong><br>
-        <span class="small muted" data-create-unit-status="${u.id}">${esc(dispatchCadStatusForUnit(u).replaceAll("_"," "))}${active?` · ${esc(active.incident.incident_number)}`:""}</span></span>
+        <span class="small muted" data-create-unit-status="${u.id}">${esc(unitPrimaryStatus(u).label)}${active?` · ${esc(active.incident.incident_number)}`:""}</span></span>
       </label>`;
     }).join("")||`<div class="small muted">No units are configured for the selected department(s).</div>`;
   };
@@ -4918,7 +5061,7 @@ function incidentForm(loc,draft=null){
     const buttons=[document.querySelector("#saveIncidentOnly"),document.querySelector("#saveAndDispatch")];
     buttons.forEach(b=>{if(b)b.disabled=true;});
 
-    const {data,error}=await supabase.rpc("create_incident_v5",{
+    const {data,error}=await supabase.rpc("create_incident_v6",{
       p_event_id:S.eventId,
       p_department_ids:deps,
       p_call_type:callType,
@@ -4935,7 +5078,7 @@ function incidentForm(loc,draft=null){
       p_create_poi:saveAsPoi,
       p_poi_category:saveAsPoi?document.querySelector("#incidentPoiCategory").value:null,
       p_poi_aliases:poiAliases,
-      p_guest_logistics_movement_id:linkedGuestMovement?.id||null
+      p_related_incident_id:linkedGuestMovement?.id||null
     });
 
     if(error){
@@ -5109,18 +5252,15 @@ function editIncidentForm(incidentId){
 /* ---------------- COMMAND CENTER DISPLAY ---------------- */
 
 function commandFilteredIncidents(){
-  return S.incidents.filter(i=>incidentMatchesDepartments(i,S.commandDepartmentIds));
+  return S.incidents.filter(i=>i.status==="OPEN"&&i.incident_kind!=="MOVE"&&incidentMatchesDepartments(i,S.commandDepartmentIds));
 }
 function commandFilteredUnits(){
   return S.units.filter(u=>S.commandDepartmentIds.includes(u.department_id));
 }
 function commandFilteredMovements(){
-  return (S.guestLogisticsMovements||[])
-    .filter(m=>{
-      if(!m.assigned_unit_id)return false;
-      const unit=S.units.find(u=>u.id===m.assigned_unit_id);
-      return !!unit&&S.commandDepartmentIds.includes(unit.department_id);
-    })
+  // Active MOVE tickets in the selected departments, including ones still
+  // waiting for a driver (those are exactly what a command board should see).
+  return (S.guestLogisticsMovements||[]).filter(m=>m.incident_status==="OPEN"&&S.commandDepartmentIds.includes(m.department_id))
     .sort((a,b)=>{
       const underwayDiff=Number(LOGISTICS_UNDERWAY_STATUSES.has(b.status))-Number(LOGISTICS_UNDERWAY_STATUSES.has(a.status));
       if(underwayDiff)return underwayDiff;
@@ -5135,11 +5275,11 @@ function commandMoveCardsHtml(){
     <div class="command-move-grid">${movements.map(m=>{
       const unit=idx().unitsById.get(m.assigned_unit_id);
       const cad=unit?activeAssignmentForUnit(unit.id):null;
-      const diverted=!!(cad?.link?.cad_priority_override);
+      const diverted=!!(cad?.link?.is_primary)&&m.incident_status==="OPEN";
       const risk=movementRisk(m);
-      return `<article class="command-move-card ${LOGISTICS_UNDERWAY_STATUSES.has(m.status)?"underway":""} ${m.status==="HELD"?"held":""} ${diverted?"diverted":""}">
+      return `<article class="command-move-card ${LOGISTICS_UNDERWAY_STATUSES.has(m.status)?"underway":""} ${diverted?"diverted":""}">
         <div class="row"><strong>${esc(m.movement_number)}</strong><span><span class="badge">${esc(movementStatusLabel(m.status))}</span>${risk?` <span class="badge risk-badge risk-${risk.level}">${esc(risk.label)}</span>`:""}</span></div>
-        ${diverted?`<div class="small command-move-diverted">⇅ ${m.status==="HELD"?"HELD":"DIVERTED"} — unit on ${esc(cad.incident.incident_number)}</div>`:""}
+        ${diverted?`<div class="small command-move-diverted">⇅ SECONDARY — driver prioritized on ${esc(cad.incident.incident_number)}</div>`:""}${m.incident_status==="SCHEDULED"?`<div class="small muted">Scheduled · activates before pickup</div>`:""}
         <div class="command-move-guest">${esc(m.guest_name||"Guest")}</div>
         <div class="small command-move-route">${esc([m.origin,m.destination].filter(Boolean).join(" → ")||"Route not entered")}</div>
         <div class="small"><strong>${esc(unit?.name||"Unassigned unit")}</strong>${cad?` · ${diverted?"Priority":"Secondary"} CAD ${esc(cad.incident.incident_number)} · ${esc(cadAssignmentStatus(cad,unit).replaceAll("_"," "))}`:""}</div>
@@ -5165,7 +5305,9 @@ function commandCallCardsHtml(){
         const unit=S.units.find(u=>u.id===link.unit_id);
         if(!unit)return "";
         const moves=logisticsMovementsForUnit(unit.id);
-        return `<span class="command-unit-chip ${link.cad_priority_override&&moves.length?"command-unit-diverted":""}"><strong>${esc(unit.name)}</strong> · ${link.cad_priority_override&&moves.length?"PRIORITY ":""}CAD ${esc(cadAssignmentStatus({incident:i,link},unit).replaceAll("_"," "))}${moves.length?` · ${link.cad_priority_override?"MOVE":"PRIMARY"} ${esc(moves.map(m=>`${m.movement_number} ${movementStatusLabel(m.status)}`).join(", "))}`:""}${unitTransportDestinationLabel(unit)?` → ${esc(unitTransportDestinationLabel(unit))}`:""}</span>`;
+        const isMoveCard=i.incident_kind==="MOVE";
+        const otherMoves=isMoveCard?[]:moves.filter(m=>m.incident_status==="OPEN");
+        return `<span class="command-unit-chip ${link.is_primary&&otherMoves.length?"command-unit-diverted":""}"><strong>${esc(unit.name)}</strong> · ${isMoveCard?"MOVE":"CAD"} ${esc(isMoveCard?movementStatusLabel(link.cad_status||"ASSIGNED"):cadAssignmentStatus({incident:i,link},unit).replaceAll("_"," "))}${otherMoves.length?` · ${link.is_primary?"PRIORITY · also":"SECONDARY to"} ${esc(otherMoves.map(m=>`${m.movement_number} ${movementStatusLabel(m.status)}`).join(", "))}`:""}${unitTransportDestinationLabel(unit)?` → ${esc(unitTransportDestinationLabel(unit))}`:""}</span>`;
       }).filter(Boolean).join("");
 
     return `<div class="command-call-card ${commandPriorityClass(i.priority)}">
@@ -5258,7 +5400,7 @@ function renderCommandUnitMarkers(){
       opacity:freshness==="live"?1:.6,
       className:`command-unit-marker command-unit-${freshness}`
     }).addTo(S.commandUnitLayer)
-      .bindTooltip(`<strong>${esc(unit.name)}</strong><br>CAD ${esc(String(dispatchCadStatusForUnit(unit)||"").replaceAll("_"," "))}${logisticsMovementsForUnit(unit.id).length?`<br>MOVE ${esc(String((underwayLogisticsMovementForUnit(unit.id)||logisticsMovementsForUnit(unit.id)[0])?.status||"").replaceAll("_"," "))}`:""}<br>${esc(locationAgeLabel(location))}${location.accuracy_m!=null?` · ±${Math.round(location.accuracy_m)}m`:""}`,{direction:"top"});
+      .bindTooltip(`<strong>${esc(unit.name)}</strong><br>${esc(unitPrimaryStatus(unit).label)}${unitTaskStack(unit.id).active&&unitPrimaryStatus(unit).kind==="MOVE"?`<br>CAD ${esc(String(dispatchCadStatusForUnit(unit)||"").replaceAll("_"," "))}`:""}<br>${esc(locationAgeLabel(location))}${location.accuracy_m!=null?` · ±${Math.round(location.accuracy_m)}m`:""}`,{direction:"top"});
   }
 }
 async function setupCommandDisplayMap(){
@@ -5469,7 +5611,7 @@ function subscribeCommandDisplay(){
   const ch=supabase.channel(`command-display-${S.eventId}-${Date.now()}`)
     .on("postgres_changes",{event:"*",schema:"public",table:"incidents",filter:`event_id=eq.${S.eventId}`},scheduleCommandDisplayRefresh)
     .on("postgres_changes",{event:"*",schema:"public",table:"operational_periods",filter:`event_id=eq.${S.eventId}`},scheduleCommandDisplayRefresh)
-    .on("postgres_changes",{event:"*",schema:"public",table:"guest_logistics_movements",filter:`event_id=eq.${S.eventId}`},scheduleCommandDisplayRefresh)
+    .on("postgres_changes",{event:"*",schema:"public",table:"incident_guest_details",filter:`event_id=eq.${S.eventId}`},scheduleCommandDisplayRefresh)
     .on("postgres_changes",{event:"*",schema:"public",table:"incident_units"},scheduleCommandDisplayRefresh)
     .on("postgres_changes",{event:"UPDATE",schema:"public",table:"units",filter:`event_id=eq.${S.eventId}`},payload=>{
       const unit=idx().unitsById.get(payload.new?.id);
@@ -8267,8 +8409,8 @@ function fieldAssignmentSignature(row){
     row.cad_status||"",
     row.cad_status_updated_at||"",
     row.cleared_at||"",
-    row.cad_priority_override?"P":"",
-    row.cad_priority_acknowledged_at||""
+    row.is_primary?"P":"",
+    row.primary_acknowledged_at||""
   ].join("|");
 }
 
@@ -8284,24 +8426,26 @@ async function syncFieldAssignment(unitId){
   try{
     const [assignmentResult,moveResult]=await Promise.all([
       supabase.from("incident_units")
-        .select("incident_id,assigned_at,acknowledged_at,cleared_at,cad_status,cad_status_updated_at,cad_priority_override,cad_priority_acknowledged_at")
+        .select("incident_id,assigned_at,acknowledged_at,cleared_at,cad_status,cad_status_updated_at,is_primary,primary_acknowledged_at,incidents!inner(incident_kind,status)")
         .eq("unit_id",unitId)
         .is("cleared_at",null)
+        .eq("incidents.incident_kind","CAD")
+        .eq("incidents.status","OPEN")
         .order("assigned_at",{ascending:false})
         .limit(1)
         .maybeSingle(),
-      supabase.from("guest_logistics_movements")
-        .select("id,status,assigned_at,driver_acknowledged_at,updated_at")
-        .eq("event_id",S.eventId)
-        .eq("assigned_unit_id",unitId)
-        .not("status","in","(COMPLETE,NO_SHOW,CANCELLED)")
-        .order("scheduled_at")
+      supabase.from("incident_units")
+        .select("incident_id,assigned_at,acknowledged_at,cad_status,cad_status_updated_at,is_primary,incidents!inner(incident_kind,status)")
+        .eq("unit_id",unitId)
+        .is("cleared_at",null)
+        .eq("incidents.incident_kind","MOVE")
+        .neq("incidents.status","CLOSED")
     ]);
 
     if(assignmentResult.error)throw assignmentResult.error;
     if(moveResult.error)throw moveResult.error;
 
-    const moveSignature=(moveResult.data||[]).map(m=>[m.id,m.status,m.assigned_at,m.driver_acknowledged_at,m.updated_at].join("|")).join(";");
+    const moveSignature=(moveResult.data||[]).map(m=>[m.incident_id,m.cad_status,m.incidents?.status,m.assigned_at,m.acknowledged_at,m.cad_status_updated_at,m.is_primary?"P":""].join("|")).sort().join(";");
     const signature=`${fieldAssignmentSignature(assignmentResult.data)}||${moveSignature}`;
     if(signature!==S.fieldAssignmentSignature){
       S.fieldAssignmentSignature=signature;
@@ -8406,8 +8550,8 @@ async function fieldUnitCad(){
   // data comes from the per-event cache and usually costs no network at all.
   let staticData;
   const [assignmentRes,staticRes,logisticsRes]=await Promise.allSettled([
-    supabase.from("incident_units").select("*,incidents(*)")
-      .eq("unit_id",fs.unit_id).is("cleared_at",null).order("assigned_at",{ascending:false}).limit(1).maybeSingle(),
+    supabase.from("incident_units").select("*,incidents!inner(*)")
+      .eq("unit_id",fs.unit_id).is("cleared_at",null).eq("incidents.incident_kind","CAD").eq("incidents.status","OPEN").order("assigned_at",{ascending:false}).limit(1).maybeSingle(),
     loadFieldStaticData(S.eventId),
     loadFieldLogisticsState(S.eventId,fs.unit_id)
   ]);
@@ -8434,13 +8578,14 @@ async function fieldUnitCad(){
     try{emsState=await loadFieldEmsState(S.eventId,fs.unit_id,incident?.id||null,{hasEms:true,areas:fieldTreatmentAreas});}catch(err){console.error("Field EMS panel failed to load",err);}
   }
 
-  const moveNeedsAck=!!logisticsState?.movements?.some(m=>!m.driver_acknowledged_at&&m.status!=="HELD");
-  const moveSignature=(logisticsState?.movements||[]).map(m=>[m.id,m.status,m.assigned_at,m.driver_acknowledged_at,m.updated_at].join("|")).join(";");
+  const moveNeedsAck=!!logisticsState?.movements?.some(m=>!m.driver_acknowledged_at);
+  const moveSignature=(logisticsState?.movements||[]).map(m=>[m.id,m.status,m.incident_status,m.assigned_at,m.driver_acknowledged_at,m.updated_at,m.is_primary?"P":""].join("|")).sort().join(";");
   S.fieldAssignmentSignature=`${fieldAssignmentSignature(a)}||${moveSignature}`;
   const hasMoves=!!logisticsState?.movements?.length;
-  const cadIsPriority=!!(incident&&a?.cad_priority_override&&hasMoves);
-  const priorityNeedsAck=cadIsPriority&&!a.cad_priority_acknowledged_at;
-  const cadIsSecondary=hasMoves&&!cadIsPriority;
+  const hasActiveMoves=!!logisticsState?.movements?.some(m=>m.incident_status==="OPEN");
+  const cadIsPriority=!!(incident&&a?.is_primary&&hasActiveMoves);
+  const priorityNeedsAck=cadIsPriority&&!!a.primary_set_by&&!a.primary_acknowledged_at;
+  const cadIsSecondary=hasActiveMoves&&!cadIsPriority;
   if(logisticsState)logisticsState.cadPriority=cadIsPriority?{incidentNumber:incident.incident_number}:null;
   setFieldTaskAlerts({cad:assignmentNeedsAck||priorityNeedsAck,move:moveNeedsAck});
 
@@ -8463,7 +8608,15 @@ async function fieldUnitCad(){
           <div class="small muted">Your unit</div>
           <div class="big">${esc(fs.units?.name)}</div>
         </div>
-        <span class="badge status-${esc(fs.units?.status)}" data-field-unit-status title="Primary operational status">${esc(fs.units?.status?.replaceAll("_"," "))}</span>
+        ${(()=>{
+          const primaryMove=(hasActiveMoves&&!cadIsPriority)?(logisticsState.underwayMovement||logisticsState.movements.find(m=>m.incident_status==="OPEN")):null;
+          if(primaryMove){
+            const st=primaryMove.status;
+            return `<span class="badge status-${esc(MOVE_BADGE_CLASS[st]||"ASSIGNED")} primary-kind-move" data-field-unit-status data-field-unit-status-locked="1" title="Primary task: Guest Logistics MOVE">MOVE · ${esc(MOVE_BADGE_LABEL[st]||st.replaceAll("_"," "))}</span>`;
+          }
+          if(incident)return `<span class="badge status-${esc(cadTaskStatus)}" data-field-unit-status data-field-unit-status-locked="1" title="Primary task: CAD ticket">CAD · ${esc(String(cadTaskStatus||"ASSIGNED").replaceAll("_"," "))}</span>`;
+          return `<span class="badge status-${esc(fs.units?.status)}" data-field-unit-status title="Unit availability">${esc(fs.units?.status?.replaceAll("_"," "))}</span>`;
+        })()}
       </div>
       <div class="small field-operational-period-line">Operational Period: <strong>${esc(fs.operational_periods?.name||"Active")}</strong>${fs.operational_periods?.incident_prefix?` · <span class="mono">${esc(fs.operational_periods.incident_prefix)}</span>`:""}</div>
     </div>`,
@@ -8474,7 +8627,7 @@ async function fieldUnitCad(){
         <div>
           <div class="field-new-assignment-kicker">PRIORITY CHANGE</div>
           <strong>Dispatch prioritized ${esc(incident.incident_number)} over your MOVE${(logisticsState?.movements?.length||0)===1?"":"S"}</strong>
-          <div class="small">${a?.cad_priority_set_at?`Set ${dateTime24(a.cad_priority_set_at,{seconds:true})}. `:""}${logisticsState?.movements?.some(m=>m.status==="HELD")?"Your MOVE is on hold and will resume when this ticket closes.":"Your MOVE keeps its status; this ticket comes first."} Acknowledge the change.</div>
+          <div class="small">${a?.primary_set_at?`Set ${dateTime24(a.primary_set_at,{seconds:true})}. `:""}Your MOVE keeps its status; this ticket comes first. Acknowledge the change.</div>
         </div>
         <button class="btn field-acknowledge-button" id="fieldAcknowledgePriority">ACKNOWLEDGE</button>
       </div>`:""}
@@ -8587,7 +8740,7 @@ async function fieldUnitCad(){
   };
 
   const enabledFieldBlocks=fieldLayout.blocks.filter(block=>block.enabled&&(fieldHasEms||!['ems_patient_flow','transport_destination'].includes(block.id)));
-  if(hasMoves){
+  if(hasActiveMoves){
     // MOVE first by default; a dispatcher priority override flips the order.
     const first=cadIsPriority?"current_call":"guest_logistics";
     const second=cadIsPriority?"guest_logistics":"current_call";
@@ -8709,7 +8862,7 @@ async function fieldUnitCad(){
     const button=document.querySelector("#fieldAcknowledgePriority");
     button.disabled=true;
     button.textContent="ACKNOWLEDGING…";
-    const {error}=await supabase.rpc("field_acknowledge_cad_priority",{p_field_session_id:fs.id,p_incident_id:incident.id});
+    const {error}=await supabase.rpc("field_acknowledge_primary_change",{p_field_session_id:fs.id,p_incident_id:incident.id});
     if(error){
       button.disabled=false;
       button.textContent="ACKNOWLEDGE";
@@ -8744,7 +8897,7 @@ async function fieldUnitCad(){
     bindFieldLocationControls(fs,fieldMapLayers||[],fieldZones||[]);
   }
   bindFieldEmsPanel(emsState,{eventId:S.eventId,unitId:fs.unit_id,incident,refresh:()=>fieldUnitCad()});
-  bindFieldLogisticsPanel(logisticsState,{refresh:()=>fieldUnitCad()});
+  bindFieldLogisticsPanel(logisticsState,{refresh:()=>fieldUnitCad(),fieldSessionId:fs.id,unitId:fs.unit_id});
   document.querySelector("#fieldCallTimes")?.addEventListener("click",()=>fieldCallTimesPage({
     unitId:fs.unit_id,
     standalone:false
@@ -8972,7 +9125,9 @@ function fieldStatusColorClass(status){
 
 function updateFieldUnitStatusUI(status){
   const badge=document.querySelector("[data-field-unit-status]");
-  if(badge){
+  // When a MOVE or CAD ticket is the primary task the badge shows that task;
+  // a general unit-status change must not overwrite it (the next render will).
+  if(badge&&!badge.dataset.fieldUnitStatusLocked){
     [...badge.classList].filter(c=>c.startsWith("status-")).forEach(c=>badge.classList.remove(c));
     badge.classList.add(`status-${status}`);
     badge.textContent=String(status||"").replaceAll("_"," ");
@@ -9549,63 +9704,37 @@ function refreshOpenDispatchTaskView(){
 }
 
 function mergeDispatcherTaskSnapshot(rows){
-  const cadRows=(rows||[]).filter(row=>row.task_kind==="CAD");
-  const moveRows=(rows||[]).filter(row=>row.task_kind==="MOVE");
-  const cadByKey=new Map(cadRows.map(row=>[`${row.incident_id}:${row.unit_id}`,row]));
-  const moveById=new Map(moveRows.map(row=>[row.movement_id,row]));
+  const byKey=new Map((rows||[]).map(row=>[`${row.incident_id}:${row.unit_id}`,row]));
   let changed=false;
   let structuralMismatch=false;
-
-  const localCadKeys=new Set();
+  const localKeys=new Set();
   for(const incident of S.incidents){
+    if(incident.status==="CLOSED")continue;
     for(const link of incident.incident_units||[]){
       if(link.cleared_at)continue;
       const key=`${incident.id}:${link.unit_id}`;
-      localCadKeys.add(key);
-      const row=cadByKey.get(key);
-      if(!row){
-        structuralMismatch=true;
-        continue;
-      }
+      localKeys.add(key);
+      const row=byKey.get(key);
+      if(!row){structuralMismatch=true;continue;}
       const nextStatus=row.status||"ASSIGNED";
       if((link.cad_status||"ASSIGNED")!==nextStatus){link.cad_status=nextStatus;changed=true;}
       if((link.acknowledged_at||null)!==(row.acknowledged_at||null)){link.acknowledged_at=row.acknowledged_at||null;changed=true;}
       if((link.assigned_at||null)!==(row.assigned_at||null)){link.assigned_at=row.assigned_at||link.assigned_at;changed=true;}
       if((link.cad_status_updated_at||null)!==(row.updated_at||null)){link.cad_status_updated_at=row.updated_at||null;changed=true;}
-      if(!!link.cad_priority_override!==!!row.priority_override){link.cad_priority_override=!!row.priority_override;changed=true;}
-      if((link.cad_priority_acknowledged_at||null)!==(row.priority_acknowledged_at||null)){link.cad_priority_acknowledged_at=row.priority_acknowledged_at||null;changed=true;}
+      if(!!link.is_primary!==!!row.is_primary){link.is_primary=!!row.is_primary;changed=true;}
+      if((link.primary_acknowledged_at||null)!==(row.primary_acknowledged_at||null)){link.primary_acknowledged_at=row.primary_acknowledged_at||null;changed=true;}
+      // A scheduled MOVE that activated (or vice versa) changes the board set.
+      if(row.incident_status&&incident.status!==row.incident_status){structuralMismatch=true;}
     }
   }
-  for(const key of cadByKey.keys()){
-    if(!localCadKeys.has(key)){structuralMismatch=true;break;}
+  for(const key of byKey.keys()){
+    if(!localKeys.has(key)){structuralMismatch=true;break;}
   }
-
-  const localMoveIds=new Set();
-  for(const movement of S.guestLogisticsMovements||[]){
-    if(["COMPLETE","NO_SHOW","CANCELLED"].includes(movement.status))continue;
-    localMoveIds.add(movement.id);
-    const row=moveById.get(movement.id);
-    if(!row){
-      structuralMismatch=true;
-      continue;
-    }
-    if((movement.status||"")!==(row.status||"")){movement.status=row.status;changed=true;}
-    if((movement.assigned_unit_id||null)!==(row.unit_id||null)){movement.assigned_unit_id=row.unit_id||null;changed=true;markIndexesDirty();}
-    if((movement.assigned_at||null)!==(row.assigned_at||null)){movement.assigned_at=row.assigned_at||null;changed=true;}
-    if((movement.driver_acknowledged_at||null)!==(row.acknowledged_at||null)){movement.driver_acknowledged_at=row.acknowledged_at||null;changed=true;}
-    if((movement.updated_at||null)!==(row.updated_at||null)){movement.updated_at=row.updated_at||null;changed=true;}
-    if((movement.held_from_status||null)!==(row.held_from_status||null)){movement.held_from_status=row.held_from_status||null;changed=true;}
-    if((movement.held_by_incident_id||null)!==(row.held_by_incident_id||null)){movement.held_by_incident_id=row.held_by_incident_id||null;changed=true;}
-  }
-  for(const id of moveById.keys()){
-    if(!localMoveIds.has(id)){structuralMismatch=true;break;}
-  }
-
   if(changed){
+    refreshMoveAdapter();
     refreshDispatchBoards();
     refreshOpenDispatchTaskView();
   }
-
   return {changed,structuralMismatch};
 }
 
@@ -9662,9 +9791,11 @@ function applyDispatcherIncidentUnitRealtime(payload){
     link.cad_status_updated_at=row.cad_status_updated_at||link.cad_status_updated_at||null;
     link.acknowledged_at=row.acknowledged_at||null;
     link.assigned_at=row.assigned_at||link.assigned_at;
-    if("cad_priority_override" in row)link.cad_priority_override=!!row.cad_priority_override;
-    if("cad_priority_acknowledged_at" in row)link.cad_priority_acknowledged_at=row.cad_priority_acknowledged_at||null;
-    if("cad_priority_set_at" in row)link.cad_priority_set_at=row.cad_priority_set_at||null;
+    if("is_primary" in row)link.is_primary=!!row.is_primary;
+    if("primary_acknowledged_at" in row)link.primary_acknowledged_at=row.primary_acknowledged_at||null;
+    if("primary_set_at" in row)link.primary_set_at=row.primary_set_at||null;
+    if("primary_set_by" in row)link.primary_set_by=row.primary_set_by||null;
+    refreshMoveAdapter();
     refreshDispatchBoards();
     refreshOpenDispatchTaskView();
     return;
@@ -9674,27 +9805,7 @@ function applyDispatcherIncidentUnitRealtime(payload){
   scheduleDispatchStructureRefresh();
 }
 
-function applyDispatcherMovementRealtime(payload){
-  const row=payload?.new||payload?.old;
-  if(!row?.id||row.event_id!==S.eventId)return;
-  const terminal=["COMPLETE","NO_SHOW","CANCELLED"].includes(row.status);
-  const index=(S.guestLogisticsMovements||[]).findIndex(m=>m.id===row.id);
-
-  if(payload.eventType==="DELETE"||terminal){
-    if(index>=0)S.guestLogisticsMovements.splice(index,1);
-  }else if(index>=0){
-    Object.assign(S.guestLogisticsMovements[index],row);
-  }else{
-    // New active MOVE: row data from Realtime is sufficient for the main board;
-    // a background structural refresh follows to load every optional field.
-    S.guestLogisticsMovements.push(row);
-  }
-  markIndexesDirty();
-
-  refreshDispatchBoards();
-  refreshOpenDispatchTaskView();
-  if(index<0&&payload.eventType!=="DELETE"&&!terminal)scheduleDispatchStructureRefresh();
-}
+// (legacy guest_logistics_movements Realtime handler removed in v0.18.0)
 
 function incidentSnapshotSignature(row){
   return [
@@ -9760,6 +9871,12 @@ const DISPATCH_HEARTBEAT_LIVE_MS=10000;
 const DISPATCH_HEARTBEAT_DEGRADED_MS=3000;
 
 async function runDispatchHeartbeat(){
+  // Scheduled MOVEs become active tickets about an hour before pickup. Any
+  // dispatcher heartbeat performs the activation server-side.
+  try{
+    const {data}=await supabase.rpc("activate_due_move_incidents",{p_event_id:S.eventId});
+    if(Number(data)>0)scheduleDispatchStructureRefresh();
+  }catch{}
   await Promise.all([
     syncDispatcherUnitStatuses(),
     syncDispatcherTaskState(),
@@ -9821,7 +9938,7 @@ function subscribeDispatch(){
       scheduleDispatchStructureRefresh();
     })
     .on("postgres_changes",{event:"*",schema:"public",table:"operational_periods",filter:`event_id=eq.${S.eventId}`},()=>scheduleDispatchStructureRefresh())
-    .on("postgres_changes",{event:"*",schema:"public",table:"guest_logistics_movements",filter:`event_id=eq.${S.eventId}`},payload=>applyDispatcherMovementRealtime(payload))
+    .on("postgres_changes",{event:"*",schema:"public",table:"incident_guest_details",filter:`event_id=eq.${S.eventId}`},()=>scheduleDispatchStructureRefresh())
     .on("postgres_changes",{event:"*",schema:"public",table:"incident_units"},payload=>applyDispatcherIncidentUnitRealtime(payload))
     // GPS changes update only the unit's map marker/readout.
     .on("postgres_changes",{event:"*",schema:"public",table:"unit_locations"},payload=>updateDispatcherUnitLocation(payload))
@@ -9910,11 +10027,8 @@ function subscribeField(unitId,sessionId){
     })
     .on("postgres_changes",{event:"*",schema:"public",table:"incident_units",filter:`unit_id=eq.${unitId}`},()=>fieldUnitCadSoon())
     .on("postgres_changes",{event:"*",schema:"public",table:"ems_encounters",filter:`event_id=eq.${S.eventId}`},()=>fieldUnitCadSoon())
-    .on("postgres_changes",{event:"*",schema:"public",table:"guest_logistics_movements",filter:`event_id=eq.${S.eventId}`},payload=>{
-      // Only this unit's MOVEs affect the field screen.
-      const row=payload?.new||payload?.old;
-      if(!row||row.assigned_unit_id===unitId||payload?.old?.assigned_unit_id===unitId)fieldUnitCadSoon();
-    })
+    .on("postgres_changes",{event:"*",schema:"public",table:"incidents",filter:`event_id=eq.${S.eventId}`},()=>fieldUnitCadSoon())
+    .on("postgres_changes",{event:"*",schema:"public",table:"incident_guest_details",filter:`event_id=eq.${S.eventId}`},()=>fieldUnitCadSoon())
     .subscribe(status=>{
       S.fieldRealtimeStatus=status;
       if(status==="SUBSCRIBED")syncFieldAssignment(unitId);

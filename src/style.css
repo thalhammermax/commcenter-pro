@@ -5457,23 +5457,40 @@ body.field-dual-task-alert::after{
 .badge.risk-badge.risk-late{background:#7f1d1d;border-color:#ef4444;color:#fecaca}
 .badge.risk-badge.risk-risk{background:#78350f;border-color:#f59e0b;color:#fde68a}
 .badge.danger-badge{background:#7f1d1d;border-color:#ef4444;color:#fecaca}
-.logistics-status-held,.logistics-held-badge{background:#312e81;border-color:#6366f1;color:#c7d2fe}
-.logistics-movement-card.logistics-held{border-color:#6366f1;opacity:.85}
 .logistics-movement-card.logistics-at-risk{border-color:#f59e0b}
-.move-status-held{color:#a5b4fc}
 .priority-move-list{margin:0 0 8px 18px;padding:0;line-height:1.6}
 .priority-choice-grid{display:grid;gap:10px}
 .priority-choice-grid .btn{display:grid;gap:4px;text-align:left;padding:12px 14px;white-space:normal}
 .priority-choice-grid .btn .small{opacity:.85;font-weight:400}
 #cadPriorityConfirmText{width:100%;text-transform:uppercase;letter-spacing:.08em}
 .command-unit-chip.command-unit-diverted{border-color:#f59e0b;color:#fde68a}
-.command-move-card.held{border-color:#6366f1;opacity:.8}
 .command-move-card.diverted{border-color:#f59e0b}
 .command-move-diverted{color:#fbbf24;font-weight:700}
 .field-priority-cad-label{color:#fde68a;background:#78350f;border:1px solid #f59e0b;border-radius:6px;padding:4px 8px;display:inline-block;margin-bottom:6px}
 .field-logistics-card.field-logistics-secondary{opacity:.92}
-.field-logistics-task-held{border-color:#6366f1;opacity:.85}
 .field-logistics-queue{margin-top:12px;display:grid;gap:8px}
 .field-logistics-queue-row{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:10px;align-items:center;padding:10px 12px;border:1px solid var(--cc-line,#2c4258);border-radius:10px;background:#0b1727}
 .field-logistics-queue-time{display:grid;text-align:center;min-width:52px}
 .field-logistics-queue-row.field-move-card-pending{border-color:#facc15;box-shadow:inset 3px 0 0 #facc15}
+
+/* ============================================================
+   v0.18.0 — Unified MOVE incidents
+   ============================================================ */
+.incident.incident-move{border-left:3px solid #6366f1}
+.badge.move-kind-badge{background:#312e81;border-color:#6366f1;color:#c7d2fe;letter-spacing:.06em}
+.risk-risk-text{color:#fbbf24;font-weight:600}
+.dispatch-move-strip{display:grid;gap:3px;width:100%;text-align:left;padding:10px 12px;margin-bottom:10px;border:1px solid #4f46e5;border-radius:10px;background:#1e1b4b;color:#e0e7ff;cursor:pointer;font:inherit}
+.dispatch-move-strip:hover{background:#27247a}
+.dispatch-move-strip .small{opacity:.9}
+.logistics-page{max-width:1200px;margin:0 auto}
+.logistics-metrics{grid-template-columns:repeat(4,minmax(0,1fr))}
+.logistics-toolbar{gap:10px;flex-wrap:wrap}
+.logistics-toolbar input{min-width:240px;flex:1}
+.logistics-board{display:grid;gap:10px}
+.logistics-movement-card.logistics-scheduled{opacity:.88;border-style:dashed}
+.incident-guest-section{border-left:3px solid #6366f1}
+.move-status-grid{margin-top:8px}
+.move-form .grid2{gap:10px}
+.priority-kind-move{border-color:#6366f1}
+.command-move-card.diverted{border-color:#f59e0b}
+@media (max-width:720px){.logistics-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}}

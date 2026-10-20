@@ -1,4 +1,4 @@
-# CommCenter Pro v0.17.0
+# CommCenter Pro v0.18.0
 
 CommCenter Pro is a cloud-hosted, multi-tenant, multi-department event operations CAD/PWA.
 
@@ -389,6 +389,6 @@ See `UPGRADE-TO-0.15.8.md`.
 Frontend-only. Adaptive Realtime-aware heartbeats replace per-second polling, structural reloads are coalesced, boards and modals render only on change, field devices load a fraction of the queries and keep their websocket channel and call map across refreshes, and PDF.js is split out of the main bundle. See `UPGRADE-TO-0.16.0.md`.
 
 
-## v0.17.0 — Guest Logistics Task Priority
+## v0.18.0 — Unified MOVE Incidents
 
-Dispatch can prioritize a CAD ticket over a Guest Logistics unit's MOVE (with or without placing the MOVE on HOLD); priority returns to the MOVE automatically when the ticket closes. Drivers must acknowledge the change. Adds LATE / AT-RISK badges, ranked driver suggestions and a compact upcoming-MOVE queue on the Field page. See `UPGRADE-TO-0.17.0.md`.
+Guest Logistics MOVEs are now CAD incidents of kind `MOVE`, created from a dedicated intake form or CSV import, scheduled ahead of time and auto-activated about an hour before pickup. One status engine, one assignment path, one acknowledgement flow, one audit log and one report pipeline for every ticket. A unit can hold one CAD ticket and one MOVE at once; the MOVE is primary by default and Dispatch can promote the CAD ticket. See `UPGRADE-TO-0.18.0.md`.
